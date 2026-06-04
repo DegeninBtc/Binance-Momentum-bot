@@ -1,8 +1,13 @@
 __pycache__/
 *.py[cod]
+node_modules/
+web/dist/
+package-lock.json
+npm-debug.log*
 dashboard.*.log
 bot_state.json
 bot_state.json.tmp
 skills/
 install_cautious_coding_skill.bat
+AGENTS.md
 AGENTS(1).md

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Local web dashboard for binance_square_momentum_bot.py.
 
@@ -20,6 +20,7 @@ from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -29,6 +30,7 @@ BOT_LOGGER = logging.getLogger("square-momentum-bot")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_BASE_URL = "https://api.binance.com"
+WEB_DIST_DIR = Path(__file__).resolve().parent / "web" / "dist"
 DEFAULT_SQUARE_URLS = (
     "https://www.binance.com/en/square",
     "https://www.binance.com/en/square/top",
@@ -141,6 +143,14 @@ class BotRunner:
         self.worker.start()
         return self.status()
 
+    def manual_close(self, config: Any) -> dict[str, Any]:
+        if not self._claim("manual-close-live" if not config.dry_run else "manual-close-dry-run", config):
+            LOGGER.info("manual close ignored because another bot task is already running")
+            return self.status()
+        self.worker = threading.Thread(target=self._manual_close_worker, args=(config,), daemon=True)
+        self.worker.start()
+        return self.status()
+
     def start_loop(self, config: Any) -> dict[str, Any]:
         if not self._claim("loop-live" if not config.dry_run else "loop-dry-run", config):
             LOGGER.info("start-loop ignored because another bot task is already running")
@@ -207,6 +217,15 @@ class BotRunner:
             return
         self._finish()
 
+    def _manual_close_worker(self, config: Any) -> None:
+        try:
+            bot_module().LongOnlyMomentumBot(config).manual_close_position()
+        except Exception as exc:
+            LOGGER.exception("manual close failed")
+            self._finish(str(exc))
+            return
+        self._finish()
+
     def _loop_worker(self, config: Any) -> None:
         try:
             bot = bot_module().LongOnlyMomentumBot(config)
@@ -235,6 +254,9 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
     hot_assets = candidates[: config.top_coin_limit]
     source = "综合评分：Binance Square + 24h 涨幅榜"
     notes: list[str] = []
+    market_guard = bot._market_filter_reason()
+    if market_guard:
+        notes.append(f"大盘过滤暂停新开仓：{market_guard}")
     if not mentions:
         LOGGER.warning("no valid long-only Binance Square mentions found; preview is using market momentum only")
         notes.append("广场没有有效做多提及，本次按 24h 市场动能排序。")
@@ -249,6 +271,10 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
     if bot.state.position and bot.state.position.symbol:
         prefix = "模拟" if config.dry_run else "实盘"
         notes.append(f"当前已有{prefix}仓位 {bot.state.position.symbol}，执行一次不会重复开新仓。")
+    if config.asset_whitelist:
+        notes.append("白名单：" + ", ".join(config.asset_whitelist))
+    if config.asset_blacklist:
+        notes.append("黑名单：" + ", ".join(config.asset_blacklist))
     return {
         "checked_at": now_text(),
         "source": source,
@@ -281,9 +307,9 @@ def build_square_diagnostics(config: Any) -> dict[str, Any]:
     diagnostics = bot.square.diagnose(config.top_post_limit, browser_mode=config.square_browser_mode)
     diagnostics["mode"] = "browser" if config.square_browser_mode else "static"
     if not config.square_browser_mode:
-        diagnostics["hint"] = "Browser mode is off. Enable it to render Binance Square like a real browser."
+        diagnostics["hint"] = "当前是静态抓取；Binance Square 可能返回空响应。到设置里开启“浏览器抓广场”后再诊断。"
     elif diagnostics.get("browser_error"):
-        diagnostics["hint"] = diagnostics.get("browser_hint", "") or "Run fix_playwright_browser.bat to install Chromium for Playwright."
+        diagnostics["hint"] = diagnostics.get("browser_hint", "") or "运行 fix_playwright_browser.bat 安装 Playwright Chromium。"
     else:
         diagnostics["hint"] = ""
     return stringify_decimals(diagnostics)
@@ -322,17 +348,148 @@ def safe_load_state(path: str) -> dict[str, Any]:
 
 
 def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunner) -> dict[str, Any]:
+    enriched = dict(state)
+    enriched["entry_guard_snapshot"] = stringify_decimals(build_entry_guard_snapshot(state, config))
+    enriched["performance_stats"] = stringify_decimals(build_performance_stats(state, config.quote_asset))
+
     position = state.get("position")
     if not isinstance(position, dict) or not position.get("symbol"):
-        return state
+        return enriched
 
     snapshot = build_position_snapshot(position, state, config, runner)
     if not snapshot:
-        return state
+        return enriched
 
-    enriched = dict(state)
     enriched["position_snapshot"] = stringify_decimals(snapshot)
     return enriched
+
+
+def build_performance_stats(state: dict[str, Any], quote_asset: str) -> dict[str, Any]:
+    module = bot_module()
+    completed: list[dict[str, Any]] = []
+    open_trade: dict[str, Any] | None = None
+
+    for item in state.get("trade_log") or []:
+        action = str(item.get("action", ""))
+        qty = decimal_from_state(item.get("quantity"))
+        price = decimal_from_state(item.get("price"))
+        if qty is None or price is None:
+            continue
+        amount = decimal_from_state(item.get("quote_amount")) or qty * price
+        ts = module.parse_timestamp(item.get("ts"))
+        if "BUY" in action:
+            open_trade = {
+                "symbol": item.get("symbol", ""),
+                "amount": amount,
+                "ts": ts,
+                "dry_run": bool(item.get("dry_run", True)),
+            }
+        elif "SELL" in action and open_trade is not None:
+            pnl = amount - open_trade["amount"]
+            return_pct = pnl / open_trade["amount"] * Decimal("100") if open_trade["amount"] > 0 else Decimal("0")
+            completed.append(
+                {
+                    "symbol": open_trade["symbol"],
+                    "pnl": pnl,
+                    "return_pct": return_pct,
+                    "entry_amount": open_trade["amount"],
+                    "exit_amount": amount,
+                    "opened_at": open_trade["ts"],
+                    "closed_at": ts,
+                    "dry_run": open_trade["dry_run"],
+                    "exit_action": action,
+                }
+            )
+            open_trade = None
+
+    total = len(completed)
+    wins = [item for item in completed if item["pnl"] > 0]
+    losses = [item for item in completed if item["pnl"] < 0]
+    total_pnl = sum((item["pnl"] for item in completed), Decimal("0"))
+    gross_profit = sum((item["pnl"] for item in wins), Decimal("0"))
+    gross_loss = sum((-item["pnl"] for item in losses), Decimal("0"))
+    avg_pnl = total_pnl / total if total else Decimal("0")
+    avg_return_pct = sum((item["return_pct"] for item in completed), Decimal("0")) / total if total else Decimal("0")
+    win_rate = Decimal(len(wins)) / Decimal(total) * Decimal("100") if total else Decimal("0")
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+    best_trade = max((item["pnl"] for item in completed), default=Decimal("0"))
+    worst_trade = min((item["pnl"] for item in completed), default=Decimal("0"))
+
+    equity = Decimal("0")
+    peak = Decimal("0")
+    max_drawdown = Decimal("0")
+    current_streak = 0
+    current_streak_type = ""
+    for item in completed:
+        equity += item["pnl"]
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+        if item["pnl"] > 0:
+            current_streak = current_streak + 1 if current_streak_type == "win" else 1
+            current_streak_type = "win"
+        elif item["pnl"] < 0:
+            current_streak = current_streak + 1 if current_streak_type == "loss" else 1
+            current_streak_type = "loss"
+
+    return {
+        "quote_asset": quote_asset,
+        "completed_trades": total,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "avg_pnl": avg_pnl,
+        "avg_return_pct": avg_return_pct,
+        "profit_factor": profit_factor,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "max_drawdown": max_drawdown,
+        "current_streak": current_streak,
+        "current_streak_type": current_streak_type,
+    }
+
+
+def build_entry_guard_snapshot(state: dict[str, Any], config: Any) -> dict[str, Any]:
+    module = bot_module()
+    today = module.datetime.now(module.timezone.utc).date()
+    buy_count = 0
+    realized_pnl = Decimal("0")
+    open_cost: Decimal | None = None
+
+    for item in state.get("trade_log") or []:
+        action = str(item.get("action", ""))
+        ts = module.parse_timestamp(item.get("ts"))
+        qty = decimal_from_state(item.get("quantity"))
+        price = decimal_from_state(item.get("price"))
+        if qty is None or price is None:
+            continue
+        amount = decimal_from_state(item.get("quote_amount")) or qty * price
+        if "BUY" in action:
+            open_cost = amount
+            if ts and ts.date() == today:
+                buy_count += 1
+        elif "SELL" in action:
+            if ts and ts.date() == today and open_cost is not None:
+                realized_pnl += amount - open_cost
+            open_cost = None
+
+    trade_limit_hit = config.max_daily_trades > 0 and buy_count >= config.max_daily_trades
+    loss_limit_hit = config.max_daily_loss_usdt > 0 and realized_pnl <= -config.max_daily_loss_usdt
+    return {
+        "buy_count": buy_count,
+        "realized_pnl": realized_pnl,
+        "max_daily_trades": config.max_daily_trades,
+        "max_daily_loss_usdt": config.max_daily_loss_usdt,
+        "cooldown_minutes": config.cooldown_minutes,
+        "trade_limit_hit": trade_limit_hit,
+        "loss_limit_hit": loss_limit_hit,
+        "entry_blocked": trade_limit_hit or loss_limit_hit,
+    }
 
 
 def build_position_snapshot(
@@ -349,12 +506,22 @@ def build_position_snapshot(
     quote_spent = decimal_from_state(position.get("quote_spent")) or quantity * entry_price
     symbol = str(position.get("symbol") or "")
     current_price, price_error = runner.ticker_price_for_status(config, symbol)
+    highest_price = decimal_from_state(position.get("highest_price")) or entry_price
+    if current_price is not None and current_price > highest_price:
+        highest_price = current_price
     is_dry_run = position_is_dry_run(position, state, config)
     fixed_stop_enabled = (
         bool(config.fixed_stop_after_first_round_trip)
         and int(state.get("completed_round_trips") or 0) > 0
     )
     stop_price = entry_price * (Decimal("1") - config.initial_stop_loss_pct / Decimal("100"))
+    dynamic_stop_price, dynamic_stop_mode = bot_module().dynamic_stop_price(
+        config,
+        entry_price,
+        highest_price,
+        stop_price,
+    )
+    take_profit_price = entry_price * (Decimal("1") + config.take_profit_pct / Decimal("100"))
 
     snapshot: dict[str, Any] = {
         "symbol": symbol,
@@ -364,14 +531,23 @@ def build_position_snapshot(
         "mode_label": "模拟" if is_dry_run else "实盘",
         "quantity": quantity,
         "entry_price": entry_price,
+        "highest_price": highest_price,
         "quote_spent": quote_spent,
         "opened_at": position.get("opened_at", ""),
         "current_price": current_price,
         "price_error": price_error,
-        "active_stop_mode": "fixed-usdt" if fixed_stop_enabled else "percent",
+        "active_stop_mode": "fixed-usdt+" + dynamic_stop_mode if fixed_stop_enabled else dynamic_stop_mode,
         "stop_price": stop_price,
+        "dynamic_stop_price": dynamic_stop_price,
+        "dynamic_stop_mode": dynamic_stop_mode,
+        "take_profit_price": take_profit_price,
         "fixed_stop_loss_usdt": config.fixed_stop_loss_usdt,
         "initial_stop_loss_pct": config.initial_stop_loss_pct,
+        "take_profit_pct": config.take_profit_pct,
+        "breakeven_trigger_pct": config.breakeven_trigger_pct,
+        "breakeven_offset_pct": config.breakeven_offset_pct,
+        "trailing_start_pct": config.trailing_start_pct,
+        "trailing_stop_pct": config.trailing_stop_pct,
     }
 
     if current_price is None:
@@ -384,9 +560,16 @@ def build_position_snapshot(
     stop_triggered = (
         unrealized_loss >= config.fixed_stop_loss_usdt
         if fixed_stop_enabled
-        else current_price <= stop_price
+        else current_price <= dynamic_stop_price
     )
-    stop_distance_pct = (current_price - stop_price) / current_price * Decimal("100") if current_price > 0 else None
+    stop_triggered = stop_triggered or current_price <= dynamic_stop_price
+    take_profit_triggered = config.take_profit_pct > 0 and current_price >= take_profit_price
+    stop_distance_pct = (current_price - dynamic_stop_price) / current_price * Decimal("100") if current_price > 0 else None
+    take_profit_distance_pct = (
+        (take_profit_price - current_price) / current_price * Decimal("100")
+        if current_price > 0 and not take_profit_triggered
+        else Decimal("0")
+    )
     snapshot.update(
         {
             "market_value": market_value,
@@ -395,6 +578,8 @@ def build_position_snapshot(
             "unrealized_loss": unrealized_loss,
             "stop_distance_pct": stop_distance_pct,
             "stop_triggered": stop_triggered,
+            "take_profit_distance_pct": take_profit_distance_pct,
+            "take_profit_triggered": take_profit_triggered,
         }
     )
     return snapshot
@@ -440,13 +625,17 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
     )
     testnet = bool(payload.get("testnet"))
     base_url = "https://testnet.binance.vision" if testnet else os.getenv("BINANCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    order_quote_amount = decimal_value(payload, "order_quote_amount", "ORDER_QUOTE_USDT", "50")
+    fixed_stop_loss_usdt = optional_decimal(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT")
+    if fixed_stop_loss_usdt is None:
+        fixed_stop_loss_usdt = module.default_fixed_stop_loss_usdt(order_quote_amount)
 
     return module.BotConfig(
         api_key=os.getenv("BINANCE_API_KEY", ""),
         api_secret=os.getenv("BINANCE_API_SECRET", ""),
         base_url=base_url,
         quote_asset=str(payload.get("quote_asset") or os.getenv("QUOTE_ASSET", "USDT")).upper(),
-        order_quote_amount=decimal_value(payload, "order_quote_amount", "ORDER_QUOTE_USDT", "50"),
+        order_quote_amount=order_quote_amount,
         min_quote_volume=decimal_value(payload, "min_quote_volume", "MIN_QUOTE_VOLUME_USDT", "5000000"),
         min_price_change_percent=decimal_value(payload, "min_price_change_percent", "MIN_PRICE_CHANGE_PERCENT", "3"),
         min_volatility_percent=decimal_value(payload, "min_volatility_percent", "MIN_VOLATILITY_PERCENT", "5"),
@@ -455,9 +644,26 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         poll_seconds=int_value(payload, "poll_seconds", "POLL_SECONDS", 300),
         recv_window_ms=int_value(payload, "recv_window_ms", "RECV_WINDOW_MS", 5000),
         initial_stop_loss_pct=decimal_value(payload, "initial_stop_loss_pct", "INITIAL_STOP_LOSS_PCT", "20"),
-        fixed_stop_loss_usdt=decimal_value(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT", "200"),
-        fixed_stop_after_first_round_trip=bool_value(payload, "fixed_stop_after_first_round_trip", True),
+        take_profit_pct=decimal_value(payload, "take_profit_pct", "TAKE_PROFIT_PCT", "12"),
+        breakeven_trigger_pct=decimal_value(payload, "breakeven_trigger_pct", "BREAKEVEN_TRIGGER_PCT", "6"),
+        breakeven_offset_pct=decimal_value(payload, "breakeven_offset_pct", "BREAKEVEN_OFFSET_PCT", "0"),
+        trailing_start_pct=decimal_value(payload, "trailing_start_pct", "TRAILING_START_PCT", "8"),
+        trailing_stop_pct=decimal_value(payload, "trailing_stop_pct", "TRAILING_STOP_PCT", "5"),
+        fixed_stop_loss_usdt=fixed_stop_loss_usdt,
+        fixed_stop_after_first_round_trip=bool_value(payload, "fixed_stop_after_first_round_trip", False),
         fixed_stop_equity_usdt=optional_decimal(payload, "fixed_stop_equity_usdt", "FIXED_STOP_EQUITY_USDT"),
+        cooldown_minutes=int_value(payload, "cooldown_minutes", "COOLDOWN_MINUTES", 30),
+        max_daily_trades=int_value(payload, "max_daily_trades", "MAX_DAILY_TRADES", 5),
+        max_daily_loss_usdt=decimal_value(payload, "max_daily_loss_usdt", "MAX_DAILY_LOSS_USDT", "25"),
+        fee_rate_pct=decimal_value(payload, "fee_rate_pct", "FEE_RATE_PCT", "0.1"),
+        slippage_pct=decimal_value(payload, "slippage_pct", "SLIPPAGE_PCT", "0.05"),
+        asset_whitelist=symbol_list_value(payload, "asset_whitelist", "ASSET_WHITELIST"),
+        asset_blacklist=symbol_list_value(payload, "asset_blacklist", "ASSET_BLACKLIST"),
+        market_filter_enabled=bool_value(payload, "market_filter_enabled", False),
+        market_filter_assets=symbol_list_value(payload, "market_filter_assets", "MARKET_FILTER_ASSETS", "BTC,ETH"),
+        market_filter_min_change_pct=decimal_value(payload, "market_filter_min_change_pct", "MARKET_FILTER_MIN_CHANGE_PCT", "-1"),
+        market_filter_require_all=bool_value(payload, "market_filter_require_all", False),
+        account_sync_enabled=bool_value(payload, "account_sync_enabled", True),
         state_file=str(payload.get("state_file") or os.getenv("STATE_FILE", "bot_state.json")),
         dry_run=not bool(payload.get("live")),
         square_urls=square_urls,
@@ -485,6 +691,13 @@ def optional_decimal(payload: dict[str, Any], key: str, env_name: str) -> Decima
         return Decimal(str(raw))
     except InvalidOperation as exc:
         raise ValueError(f"{key} must be a decimal number") from exc
+
+
+def symbol_list_value(payload: dict[str, Any], key: str, env_name: str, default: str = "") -> tuple[str, ...]:
+    raw = payload.get(key)
+    if raw in (None, ""):
+        raw = os.getenv(env_name, default)
+    return bot_module().parse_symbol_list(str(raw or ""))
 
 
 def int_value(payload: dict[str, Any], key: str, env_name: str, default: int) -> int:
@@ -528,9 +741,6 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:
             route = urlparse(self.path).path
-            if route == "/":
-                self._send_html(DASHBOARD_HTML)
-                return
             if route == "/api/status":
                 self._send_json(runner.status())
                 return
@@ -541,6 +751,8 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.send_header("Cache-Control", "max-age=86400")
                 self.end_headers()
+                return
+            if self._send_static(route):
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -558,6 +770,8 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
                     self._send_json(runner.diagnose_square(config))
                 elif route == "/api/run-once":
                     self._send_json(runner.run_once(config))
+                elif route == "/api/manual-close":
+                    self._send_json(runner.manual_close(config))
                 elif route == "/api/start-loop":
                     self._send_json(runner.start_loop(config))
                 elif route == "/api/reset-dry-run-state":
@@ -600,8 +814,36 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_html(self, html: str) -> None:
-            body = html.encode("utf-8")
+        def _send_static(self, route: str) -> bool:
+            if route == "/":
+                target = WEB_DIST_DIR / "index.html"
+            else:
+                target = WEB_DIST_DIR / route.lstrip("/")
+            try:
+                resolved = target.resolve()
+                resolved.relative_to(WEB_DIST_DIR.resolve())
+            except ValueError:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return True
+            if not resolved.is_file():
+                if route == "/":
+                    self._send_frontend_missing()
+                    return True
+                return False
+            content_type = content_type_for(resolved)
+            self._send_file(resolved, content_type, no_store=route == "/")
+            return True
+
+        def _send_frontend_missing(self) -> None:
+            message = (
+                "<!doctype html><meta charset='utf-8'>"
+                "<title>Dashboard frontend missing</title>"
+                "<body style='font-family:system-ui;padding:32px'>"
+                "<h1>Web frontend has not been built.</h1>"
+                "<p>Run <code>npm install</code> and <code>npm run build</code> in the project root.</p>"
+                "</body>"
+            )
+            body = message.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -609,647 +851,31 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_file(self, path: Path, content_type: str, no_store: bool = False) -> None:
+            body = path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store" if no_store else "max-age=31536000, immutable")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
     return DashboardHandler
 
 
-DASHBOARD_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Binance Momentum 控制台</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    :root{
-      --mono:'SFMono-Regular',ui-monospace,Menlo,Consolas,monospace;
-      --sans:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-      --radius:10px;--radius-sm:6px;
-      --green:#22c55e;--green-dim:rgba(34,197,94,.12);--green-glow:rgba(34,197,94,.25);
-      --red:#ef4444;--red-dim:rgba(239,68,68,.12);
-      --amber:#f59e0b;--amber-dim:rgba(245,158,11,.12);
-      --blue:#3b82f6;--blue-dim:rgba(59,130,246,.12);
-      --purple:#a78bfa;
-    }
-    [data-theme=dark]{
-      --bg:#0b0e14;--bg2:#111621;--card:#171c28;--card-hover:#1c2233;
-      --border:#252d3d;--border-light:#2e3850;
-      --text:#e2e8f0;--text-muted:#7b8ba5;--text-dim:#4a5672;
-      --topbar-bg:rgba(11,14,20,.85);--th-bg:rgba(0,0,0,.15);
-      --row-hover:rgba(255,255,255,.02);--log-color:var(--green);
-    }
-    [data-theme=light]{
-      --bg:#f4f6f9;--bg2:#ebeef3;--card:#ffffff;--card-hover:#f9fafb;
-      --border:#dce1e8;--border-light:#c9d0da;
-      --text:#1a1d24;--text-muted:#5f6b7a;--text-dim:#9ca3af;
-      --topbar-bg:rgba(255,255,255,.88);--th-bg:rgba(0,0,0,.03);
-      --row-hover:rgba(0,0,0,.02);--log-color:#1a6b3c;
-    }
-    html{font-size:14px}
-    body{font-family:var(--sans);background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased;transition:background .25s,color .25s}
-
-    /* ── Header ── */
-    .topbar{
-      position:sticky;top:0;z-index:10;
-      display:flex;align-items:center;justify-content:space-between;gap:12px;
-      padding:0 28px;height:56px;
-      background:var(--topbar-bg);backdrop-filter:blur(16px);
-      border-bottom:1px solid var(--border);
-    }
-    .topbar h1{font-size:16px;font-weight:700;letter-spacing:0;display:flex;align-items:center;gap:10px}
-    .topbar h1 .logo{width:22px;height:22px;border-radius:5px;background:linear-gradient(135deg,#f0b90b,#d4a20a);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#111}
-    .badges{display:flex;gap:8px;align-items:center}
-    .badge{
-      display:inline-flex;align-items:center;gap:6px;
-      height:28px;padding:0 10px;border-radius:999px;
-      font-size:12px;font-weight:500;
-      border:1px solid var(--border);color:var(--text-muted);background:var(--bg2);
-    }
-    .badge .dot{width:7px;height:7px;border-radius:50%}
-    .badge.ok .dot{background:var(--green);box-shadow:0 0 6px var(--green-glow)}
-    .badge.warn .dot{background:var(--amber)}
-    .badge.err .dot{background:var(--red)}
-    .badge.ok{color:var(--green);border-color:rgba(34,197,94,.2)}
-    .badge.warn{color:var(--amber);border-color:rgba(245,158,11,.2)}
-    .badge.err{color:var(--red);border-color:rgba(239,68,68,.2)}
-    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-    .badge.running .dot{animation:pulse 1.6s ease-in-out infinite}
-
-    /* ── Layout ── */
-    .shell{max-width:1400px;margin:0 auto;padding:20px 24px 40px}
-    .kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
-    .kpi{
-      background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
-      padding:16px 18px;display:flex;flex-direction:column;gap:6px;
-      transition:border-color .2s;
-    }
-    .kpi:hover{border-color:var(--border-light)}
-    .kpi .label{font-size:12px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0}
-    .kpi .value{font-size:20px;font-weight:700;font-family:var(--mono);color:var(--text);overflow-wrap:anywhere;line-height:1.25}
-    .kpi .value.small{font-size:16px}
-    .kpi .meta{font-size:12px;color:var(--text-muted);line-height:1.45;min-height:18px}
-    .kpi .meta strong{color:var(--text);font-weight:600}
-    .kpi.loss{border-color:rgba(239,68,68,.28)}
-    .kpi.profit{border-color:rgba(34,197,94,.28)}
-
-    /* ── Action bar ── */
-    .action-bar{
-      display:flex;gap:8px;flex-wrap:wrap;align-items:center;
-      padding:14px 18px;margin-bottom:18px;
-      background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
-    }
-    .action-bar .sep{width:1px;height:28px;background:var(--border);margin:0 4px}
-    .btn{
-      display:inline-flex;align-items:center;justify-content:center;gap:6px;
-      height:36px;padding:0 16px;border-radius:var(--radius-sm);
-      font-size:13px;font-weight:600;font-family:var(--sans);
-      border:1px solid var(--border);background:var(--bg2);color:var(--text-muted);
-      cursor:pointer;transition:all .15s;white-space:nowrap;
-    }
-    .btn:hover{background:var(--card-hover);color:var(--text);border-color:var(--border-light)}
-    .btn:active{transform:scale(.97)}
-    .btn:disabled{opacity:.4;cursor:wait;transform:none}
-    .btn.primary{background:var(--green);color:#fff;border-color:var(--green)}
-    .btn.primary:hover{background:#16a34a;border-color:#16a34a}
-    .btn.danger{color:var(--red);border-color:rgba(239,68,68,.3)}
-    .btn.danger:hover{background:var(--red-dim);border-color:rgba(239,68,68,.5)}
-    .btn .icon{font-size:15px;line-height:1}
-    .source-bar{
-      display:flex;align-items:center;justify-content:space-between;gap:12px;
-      padding:10px 16px;margin-bottom:18px;
-      border-radius:var(--radius-sm);
-      background:var(--bg2);border:1px solid var(--border);
-      font-size:12px;color:var(--text-muted);
-    }
-    .source-bar strong{color:var(--text);font-weight:600}
-
-    /* ── Tabs ── */
-    .tabs-header{
-      display:flex;gap:0;border-bottom:2px solid var(--border);margin-bottom:0;
-    }
-    .tab-btn{
-      padding:10px 20px;font-size:13px;font-weight:600;color:var(--text-muted);
-      background:none;border:none;border-bottom:2px solid transparent;
-      margin-bottom:-2px;cursor:pointer;transition:all .15s;font-family:var(--sans);
-    }
-    .tab-btn:hover{color:var(--text)}
-    .tab-btn.active{color:var(--green);border-bottom-color:var(--green)}
-    .tab-panel{display:none;background:var(--card);border:1px solid var(--border);border-top:none;border-radius:0 0 var(--radius) var(--radius);min-height:200px}
-    .tab-panel.active{display:block}
-
-    /* ── Tables ── */
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:10px 14px;text-align:left;font-size:13px;border-bottom:1px solid var(--border)}
-    th{color:var(--text-muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0;background:var(--th-bg)}
-    td{color:var(--text)}
-    tbody tr{transition:background .12s}
-    tbody tr:hover{background:var(--row-hover)}
-    tbody tr:first-child{background:rgba(34,197,94,.04)}
-    .mono{font-family:var(--mono)}
-    .c-green{color:var(--green)}
-    .c-red{color:var(--red)}
-    .c-amber{color:var(--amber)}
-    .tag{
-      display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;
-      font-size:11px;font-weight:600;
-    }
-    .tag-buy{background:var(--green-dim);color:var(--green)}
-    .tag-sell{background:var(--red-dim);color:var(--red)}
-    .tag-dry{background:var(--amber-dim);color:var(--amber)}
-    .tag-live{background:var(--red-dim);color:var(--red)}
-
-    /* ── Settings panel ── */
-    .settings-grid{padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
-    .settings-grid .full{grid-column:1/-1}
-    .field{display:flex;flex-direction:column;gap:5px}
-    .field-label{font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0}
-    .field input[type=number],.field input[type=text],.field input:not([type]){
-      height:36px;padding:0 12px;border-radius:var(--radius-sm);
-      border:1px solid var(--border);background:var(--bg);color:var(--text);
-      font-size:13px;font-family:var(--mono);transition:border-color .15s;width:100%;
-    }
-    .field input:focus{outline:none;border-color:var(--green);box-shadow:0 0 0 2px rgba(34,197,94,.12)}
-    .switches-row{display:flex;gap:10px;flex-wrap:wrap}
-    .switch-item{
-      display:flex;align-items:center;gap:8px;
-      padding:8px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);
-      font-size:13px;color:var(--text-muted);cursor:pointer;transition:all .15s;
-    }
-    .switch-item:hover{border-color:var(--border-light);color:var(--text)}
-    .switch-item input[type=checkbox]{
-      width:16px;height:16px;accent-color:var(--green);cursor:pointer;
-    }
-
-    /* ── Diagnostics ── */
-    .diag-content{padding:16px;font-size:13px;color:var(--text-muted);line-height:1.7}
-    .diag-content strong{color:var(--text)}
-    .sample-post{border-top:1px solid var(--border);padding:12px 0;display:grid;gap:4px}
-    .sample-post strong{color:var(--text);font-size:13px}
-    .sample-post span{color:var(--text-muted);font-size:12px}
-
-    /* ── Logs ── */
-    .log-pre{
-      margin:0;padding:16px 18px;
-      max-height:420px;overflow:auto;
-      background:var(--bg);color:var(--log-color);
-      font-family:var(--mono);font-size:12px;line-height:1.65;
-      border-radius:0 0 var(--radius) var(--radius);
-    }
-
-    /* ── Empty state ── */
-    .empty-state{padding:32px 20px;text-align:center;color:var(--text-dim);font-size:13px}
-
-    /* ── Responsive ── */
-    @media(max-width:900px){
-      .kpi-row{grid-template-columns:1fr 1fr}
-      .settings-grid{grid-template-columns:1fr}
-      .shell{padding:14px 14px 32px}
-    }
-    @media(max-width:560px){
-      .topbar{padding:0 14px;height:48px}
-      .topbar h1{font-size:14px}
-      .kpi-row{grid-template-columns:1fr}
-      .action-bar{padding:10px 12px}
-      .tab-btn{padding:8px 14px;font-size:12px}
-    }
-    /* ── Theme toggle ── */
-    .theme-toggle{
-      width:32px;height:32px;border-radius:50%;border:1px solid var(--border);
-      background:var(--bg2);color:var(--text-muted);cursor:pointer;
-      display:flex;align-items:center;justify-content:center;font-size:16px;
-      transition:all .2s;flex-shrink:0;
-    }
-    .theme-toggle:hover{border-color:var(--border-light);color:var(--text);background:var(--card-hover)}
-  </style>
-  <script>document.documentElement.dataset.theme=localStorage.getItem('theme')||'dark'</script>
-</head>
-<body>
-
-<div class="topbar">
-  <h1><span class="logo">B</span>Momentum 控制台</h1>
-  <div class="badges">
-    <span id="runStatus" class="badge ok"><span class="dot"></span>idle</span>
-    <span id="keyStatus" class="badge warn"><span class="dot"></span>keys</span>
-    <span id="updatedAt" class="badge">--</span>
-    <button id="themeToggle" class="theme-toggle" title="切换主题">🌙</button>
-  </div>
-</div>
-
-<div class="shell">
-  <!-- KPI Cards -->
-  <div class="kpi-row">
-    <div class="kpi">
-      <span class="label">候选标的</span>
-      <span class="value" id="candidate">--</span>
-      <span class="meta" id="candidateMeta">点击刷新信号后生成</span>
-    </div>
-    <div class="kpi">
-      <span class="label">当前仓位</span>
-      <span class="value" id="position">--</span>
-      <span class="meta" id="positionMeta">暂无持仓</span>
-    </div>
-    <div class="kpi" id="pnlCard">
-      <span class="label">浮动盈亏</span>
-      <span class="value" id="positionPnl">--</span>
-      <span class="meta" id="positionValue">等待当前价格</span>
-    </div>
-    <div class="kpi">
-      <span class="label">运行 / 风控</span>
-      <span class="value" id="mode">idle</span>
-      <span class="meta" id="riskMeta">交易回合 <strong id="roundTrips">0</strong></span>
-    </div>
-  </div>
-
-  <!-- Action Bar -->
-  <div class="action-bar">
-    <button type="button" id="preview" class="btn"><span class="icon">⟳</span>刷新信号</button>
-    <button type="button" id="diagnose" class="btn"><span class="icon">⚙</span>诊断广场</button>
-    <div class="sep"></div>
-    <button type="button" id="runOnce" class="btn primary"><span class="icon">▶</span>执行一次</button>
-    <button type="button" id="startLoop" class="btn"><span class="icon">⏵⏵</span>启动循环</button>
-    <div class="sep"></div>
-    <button type="button" id="stopLoop" class="btn danger"><span class="icon">■</span>停止</button>
-    <button type="button" id="resetState" class="btn danger"><span class="icon">↺</span>清空模拟仓位</button>
-  </div>
-
-  <!-- Source info -->
-  <div class="source-bar">
-    <span id="signalSource"><strong>数据源</strong> --</span>
-    <span id="signalChecked">--</span>
-  </div>
-
-  <!-- Tabs -->
-  <div class="tabs-header">
-    <button class="tab-btn active" data-tab="hot">热门币种</button>
-    <button class="tab-btn" data-tab="trades">交易记录</button>
-    <button class="tab-btn" data-tab="diag">广场诊断</button>
-    <button class="tab-btn" data-tab="logs">日志</button>
-    <button class="tab-btn" data-tab="settings">⚙ 设置</button>
-  </div>
-
-  <!-- Tab: Hot Assets -->
-  <div class="tab-panel active" id="panel-hot">
-    <div id="hotAssets" class="empty-state">点击「刷新信号」查看热门币种排行</div>
-  </div>
-
-  <!-- Tab: Trades -->
-  <div class="tab-panel" id="panel-trades">
-    <div id="trades" class="empty-state">暂无交易记录</div>
-  </div>
-
-  <!-- Tab: Diagnostics -->
-  <div class="tab-panel" id="panel-diag">
-    <div id="diagnostics" class="empty-state">点击「诊断广场」检查数据抓取状态</div>
-  </div>
-
-  <!-- Tab: Logs -->
-  <div class="tab-panel" id="panel-logs">
-    <pre class="log-pre" id="logs">等待日志...</pre>
-  </div>
-
-  <!-- Tab: Settings -->
-  <div class="tab-panel" id="panel-settings">
-    <form id="settings" class="settings-grid">
-      <div class="field"><span class="field-label">计价币种</span><input name="quote_asset" value="USDT"></div>
-      <div class="field"><span class="field-label">单笔金额</span><input name="order_quote_amount" type="number" min="1" step="1" value="50"></div>
-      <div class="field"><span class="field-label">最低涨幅 %</span><input name="min_price_change_percent" type="number" step="0.1" value="3"></div>
-      <div class="field"><span class="field-label">最低波动 %</span><input name="min_volatility_percent" type="number" step="0.1" value="5"></div>
-      <div class="field full"><span class="field-label">最低成交额</span><input name="min_quote_volume" type="number" min="0" step="100000" value="5000000"></div>
-      <div class="field"><span class="field-label">热门帖子数</span><input name="top_post_limit" type="number" min="1" step="1" value="25"></div>
-      <div class="field"><span class="field-label">热门币种数</span><input name="top_coin_limit" type="number" min="1" step="1" value="10"></div>
-      <div class="field"><span class="field-label">轮询秒数</span><input name="poll_seconds" type="number" min="5" step="1" value="300"></div>
-      <div class="field"><span class="field-label">签名窗口 ms</span><input name="recv_window_ms" type="number" min="1000" step="100" value="5000"></div>
-      <div class="field"><span class="field-label">初始止损 %</span><input name="initial_stop_loss_pct" type="number" min="0.1" step="0.1" value="20"></div>
-      <div class="field"><span class="field-label">固定止损 USDT</span><input name="fixed_stop_loss_usdt" type="number" min="1" step="1" value="200"></div>
-      <div class="field"><span class="field-label">权益触发 USDT</span><input name="fixed_stop_equity_usdt" type="number" min="0" step="1" placeholder=""></div>
-      <div class="field"><span class="field-label">状态文件</span><input name="state_file" value="bot_state.json"></div>
-      <div class="full switches-row">
-        <label class="switch-item"><input name="testnet" type="checkbox">Testnet</label>
-        <label class="switch-item"><input name="live" type="checkbox">Live 实盘</label>
-        <label class="switch-item"><input name="square_browser_mode" type="checkbox">浏览器抓广场</label>
-        <label class="switch-item"><input name="fixed_stop_after_first_round_trip" type="checkbox" checked>首回合后固定止损</label>
-      </div>
-    </form>
-  </div>
-</div>
-
-<script>
-const $ = (id) => document.getElementById(id);
-const form = $("settings");
-const buttons = ["preview","diagnose","runOnce","startLoop","stopLoop","resetState"].map($);
-
-/* ── Theme toggle ── */
-function applyThemeIcon() {
-  const isDark = document.documentElement.dataset.theme === 'dark';
-  $("themeToggle").textContent = isDark ? '☀️' : '🌙';
-  $("themeToggle").title = isDark ? '切换亮色' : '切换暗色';
-}
-$("themeToggle").addEventListener("click", () => {
-  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-  document.documentElement.dataset.theme = next;
-  localStorage.setItem('theme', next);
-  applyThemeIcon();
-});
-applyThemeIcon();
-
-/* ── Tabs ── */
-document.querySelectorAll(".tab-btn").forEach(btn => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
-    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
-    btn.classList.add("active");
-    $("panel-" + btn.dataset.tab).classList.add("active");
-  });
-});
-
-function payload() {
-  const data = Object.fromEntries(new FormData(form).entries());
-  for (const name of ["testnet","live","square_browser_mode","fixed_stop_after_first_round_trip"]) {
-    data[name] = form.elements[name].checked;
-  }
-  return data;
-}
-
-async function post(path) {
-  setBusy(true);
-  try {
-    const res = await fetch(path, {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify(payload())
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || res.statusText);
-    render(data);
-  } catch(err) {
-    renderError(err.message);
-  } finally {
-    setBusy(false);
-    setTimeout(refresh, 800);
-  }
-}
-
-async function refresh() {
-  try {
-    const res = await fetch("/api/status",{cache:"no-store"});
-    render(await res.json());
-  } catch(err) {
-    renderError(err.message);
-  }
-}
-
-function setBusy(busy) {
-  buttons.forEach(b => b.disabled = busy);
-}
-
-function render(data) {
-  const running = Boolean(data.running);
-  const status = $("runStatus");
-  const hasError = Boolean(data.last_error);
-  status.textContent = running ? "running" : (hasError ? "error" : "idle");
-  status.className = "badge " + (hasError ? "err" : running ? "warn running" : "ok");
-
-  $("mode").textContent = data.mode || "idle";
-  $("updatedAt").textContent = data.last_finished_at || data.last_started_at || "--";
-
-  const cfg = data.config || {};
-  const keysOk = cfg.api_key_loaded && cfg.api_secret_loaded;
-  $("keyStatus").textContent = keysOk ? "Keys ✓" : "Keys ✗";
-  $("keyStatus").className = "badge " + (keysOk ? "ok" : "warn");
-
-  const signal = data.last_signal || {};
-  const candidate = signal.candidate;
-  renderCandidate(candidate);
-
-  $("signalSource").innerHTML = '<strong>数据源</strong> ' + esc(signal.source || "--") + (signal.note ? " · " + esc(signal.note) : "");
-  $("signalChecked").textContent = signal.checked_at ? "检查于 " + signal.checked_at : "--";
-  renderHotAssets(signal.hot_assets || []);
-
-  const state = data.state || {};
-  const pos = state.position;
-  const snapshot = state.position_snapshot || null;
-  const trades = state.trade_log || [];
-  renderPosition(pos, snapshot);
-  $("roundTrips").textContent = state.completed_round_trips ?? 0;
-  renderTrades(trades);
-  renderDiagnostics(data.last_diagnostics);
-  $("logs").textContent = (data.logs || []).join("\n") || "--";
-}
-
-function renderError(msg) {
-  $("runStatus").textContent = "error";
-  $("runStatus").className = "badge err";
-  $("mode").textContent = "error";
-  $("signalSource").innerHTML = '<strong>数据源</strong> 请求失败';
-  $("signalChecked").textContent = "--";
-  $("logs").textContent = msg || "Request failed";
-}
-
-function renderCandidate(candidate) {
-  const el = $("candidate");
-  const meta = $("candidateMeta");
-  if (!candidate) {
-    el.textContent = "--";
-    el.classList.remove("c-green");
-    meta.textContent = "点击刷新信号后生成";
-    return;
-  }
-  el.textContent = candidate.symbol || "--";
-  el.classList.add("c-green");
-  meta.innerHTML =
-    "涨幅 <strong>" + formatPercent(candidate.price_change_percent) + "</strong>" +
-    " · 分数 <strong>" + formatScore(candidate.combined_score) + "</strong>" +
-    " · 波动 " + formatPercent(candidate.volatility_percent);
-}
-
-function renderPosition(pos, snapshot) {
-  const positionEl = $("position");
-  const metaEl = $("positionMeta");
-  const pnlEl = $("positionPnl");
-  const valueEl = $("positionValue");
-  const riskEl = $("riskMeta");
-  const pnlCard = $("pnlCard");
-  pnlCard.classList.remove("profit", "loss");
-
-  if (!pos || !pos.symbol) {
-    positionEl.textContent = "--";
-    positionEl.classList.remove("small");
-    metaEl.textContent = "暂无持仓";
-    pnlEl.textContent = "--";
-    pnlEl.className = "value";
-    valueEl.textContent = "等待模拟或实盘买入";
-    riskEl.innerHTML = '交易回合 <strong id="roundTrips">' + esc($("roundTrips")?.textContent || "0") + "</strong>";
-    return;
-  }
-
-  const mode = snapshot?.mode_label || "持仓";
-  positionEl.textContent = mode + " " + pos.symbol;
-  positionEl.classList.remove("small");
-  const qty = snapshot?.quantity ?? pos.quantity;
-  const entry = snapshot?.entry_price ?? pos.entry_price;
-  const current = snapshot?.current_price;
-  metaEl.innerHTML =
-    "数量 <strong>" + formatQty(qty) + "</strong>" +
-    " · 成本 <strong>" + formatPrice(entry) + "</strong>" +
-    (current ? " · 现价 <strong>" + formatPrice(current) + "</strong>" : "");
-
-  if (!snapshot || !snapshot.market_value) {
-    pnlEl.textContent = "--";
-    pnlEl.className = "value";
-    valueEl.textContent = snapshot?.price_error ? "当前价获取失败：" + snapshot.price_error : "等待当前价格";
-  } else {
-    const pnl = Number(snapshot.unrealized_pnl);
-    pnlEl.textContent = signedMoney(snapshot.unrealized_pnl, snapshot.quote_asset) + " · " + signedPercent(snapshot.unrealized_pnl_pct);
-    pnlEl.className = "value " + (pnl >= 0 ? "c-green" : "c-red");
-    pnlCard.classList.add(pnl >= 0 ? "profit" : "loss");
-    valueEl.innerHTML =
-      "市值 <strong>" + formatMoney(snapshot.market_value, snapshot.quote_asset) + "</strong>" +
-      " · 本金 " + formatMoney(snapshot.quote_spent, snapshot.quote_asset);
-  }
-
-  const stopMode = snapshot?.active_stop_mode === "fixed-usdt" ? "固定金额止损" : "百分比止损";
-  const stopText = snapshot?.stop_price ? "止损价 " + formatPrice(snapshot.stop_price) : "止损价 --";
-  const distanceText = snapshot?.stop_distance_pct ? " · 距止损 " + formatPercent(snapshot.stop_distance_pct) : "";
-  const triggered = snapshot?.stop_triggered;
-  riskEl.innerHTML =
-    (triggered ? '<span class="c-red">已触发止损</span>' : '<span class="c-green">风控正常</span>') +
-    " · " + stopMode + " · " + stopText + distanceText +
-    ' · 交易回合 <strong id="roundTrips">' + esc($("roundTrips")?.textContent || "0") + "</strong>";
-}
-
-function renderHotAssets(items) {
-  const el = $("hotAssets");
-  if (!items.length) { el.className = "empty-state"; el.textContent = "点击「刷新信号」查看热门币种排行"; return; }
-  el.className = "";
-  el.innerHTML = '<table><thead><tr><th>#</th><th>币种</th><th>综合分</th><th>市场分</th><th>广场分</th><th>24h 涨幅</th><th>波动率</th></tr></thead><tbody>' +
-    items.map((item, i) => '<tr>' +
-      '<td class="mono" style="color:var(--text-dim)">' + (i+1) + '</td>' +
-      '<td class="mono" style="font-weight:600">' + esc(item.symbol || item.asset) + '</td>' +
-      '<td class="mono" style="font-weight:700;color:var(--purple)">' + formatScore(item.score) + '</td>' +
-      '<td class="mono">' + formatScore(item.market_score) + '</td>' +
-      '<td class="mono">' + formatScore(item.square_score) + (item.mentions ? ' <span style="color:var(--text-dim)">(' + esc(item.mentions) + ')</span>' : '') + '</td>' +
-      '<td class="mono c-green">' + formatPercent(item.price_change_percent) + '</td>' +
-      '<td class="mono c-amber">' + formatPercent(item.volatility_percent) + '</td>' +
-    '</tr>').join("") +
-  '</tbody></table>';
-}
-
-function renderTrades(items) {
-  const recent = items.slice(-10).reverse();
-  const el = $("trades");
-  if (!recent.length) { el.className = "empty-state"; el.textContent = "暂无交易记录"; return; }
-  el.className = "";
-  el.innerHTML = '<table><thead><tr><th>时间</th><th>模式</th><th>动作</th><th>标的</th><th>数量</th><th>价格</th><th>成交额</th></tr></thead><tbody>' +
-    recent.map(item => {
-      const action = (item.action || "");
-      const isBuy = action.includes("BUY");
-      const isDry = Boolean(item.dry_run);
-      const tagClass = isBuy ? "tag tag-buy" : "tag tag-sell";
-      return '<tr>' +
-        '<td>' + esc(formatTime(item.ts)) + '</td>' +
-        '<td><span class="tag ' + (isDry ? "tag-dry" : "tag-live") + '">' + (isDry ? "模拟" : "实盘") + '</span></td>' +
-        '<td><span class="' + tagClass + '">' + esc(actionLabel(action)) + '</span></td>' +
-        '<td class="mono" style="font-weight:600">' + esc(item.symbol || "") + '</td>' +
-        '<td class="mono">' + formatQty(item.quantity) + '</td>' +
-        '<td class="mono">' + formatPrice(item.price) + '</td>' +
-        '<td class="mono">' + formatMoney(tradeAmount(item), "") + '</td>' +
-      '</tr>';
-    }).join("") +
-  '</tbody></table>';
-}
-
-function renderDiagnostics(diagnostics) {
-  const el = $("diagnostics");
-  if (!diagnostics) { el.className = "empty-state"; el.textContent = "点击「诊断广场」检查数据抓取状态"; return; }
-  el.className = "diag-content";
-  const urls = diagnostics.urls || [];
-  const samples = diagnostics.samples || [];
-  const urlRows = urls.map(item => {
-    const d = [
-      'HTTP ' + esc(item.status_code ?? "--"),
-      '页面 ' + esc(item.content_length ?? 0) + ' 字符',
-      'JSON ' + esc(item.json_posts ?? 0),
-      'HTML ' + esc(item.html_posts ?? 0)
-    ].join(' · ');
-    return '<tr><td style="word-break:break-all">' + esc(item.url || "") + '</td><td>' + d + (item.error ? ' · <span class="c-red">' + esc(item.error) + '</span>' : '') + '</td></tr>';
-  }).join("");
-  const sampleHtml = samples.length ? samples.map(p =>
-    '<div class="sample-post"><strong>' + esc(p.title||"帖子样例") + '</strong><span>' + esc(p.text||"") + '</span></div>'
-  ).join("") : '<div class="empty-state">没有解析到帖子样例</div>';
-  el.innerHTML =
-    '<div style="margin-bottom:12px">' +
-      '<strong>模式</strong> ' + esc(diagnostics.mode||"--") + ' · <strong>有效帖子</strong> ' + esc(diagnostics.total_posts??0) +
-      (diagnostics.raw_posts!==undefined ? ' · <strong>原始</strong> '+esc(diagnostics.raw_posts) : '') +
-      (diagnostics.filtered_out_posts!==undefined ? ' · <strong>过滤</strong> '+esc(diagnostics.filtered_out_posts) : '') +
-      (diagnostics.browser_posts_raw!==undefined ? ' · <strong>浏览器</strong> '+esc(diagnostics.browser_posts_raw) : '') +
-      (diagnostics.browser_error ? '<br><span class="c-red">浏览器错误：'+esc(diagnostics.browser_error)+'</span>' : '') +
-      (diagnostics.hint ? '<br><span class="c-amber">'+esc(diagnostics.hint)+'</span>' : '') +
-    '</div>' +
-    '<table><thead><tr><th>URL</th><th>结果</th></tr></thead><tbody>'+urlRows+'</tbody></table>' +
-    sampleHtml;
-}
-
-function esc(v){return String(v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
-function asNumber(v){const n=Number(v);return Number.isFinite(n)?n:null}
-function trimNumber(v, maxDigits, minDigits=0){
-  const n=asNumber(v);
-  if(n===null)return esc(v ?? "--");
-  return n.toLocaleString("en-US",{minimumFractionDigits:minDigits,maximumFractionDigits:maxDigits});
-}
-function formatScore(v){if(v==null||v==="")return"--";return trimNumber(v,1,1)}
-function formatPercent(v){if(v==null||v==="")return"--";return trimNumber(v,2,2)+"%"}
-function signedPercent(v){
-  const n=asNumber(v);
-  if(n===null)return"--";
-  const sign=n>0?"+":"";
-  return sign+trimNumber(n,2,2)+"%";
-}
-function formatQty(v){if(v==null||v==="")return"--";return trimNumber(v,6)}
-function formatPrice(v){if(v==null||v==="")return"--";return trimNumber(v,8)}
-function formatMoney(v, quoteAsset){
-  if(v==null||v==="")return"--";
-  const text=trimNumber(v,2,2);
-  return quoteAsset ? text+" "+esc(quoteAsset) : text;
-}
-function signedMoney(v, quoteAsset){
-  const n=asNumber(v);
-  if(n===null)return"--";
-  const sign=n>0?"+":n<0?"-":"";
-  return sign+formatMoney(Math.abs(n), quoteAsset);
-}
-function tradeAmount(item){
-  const qty=asNumber(item.quantity);
-  const price=asNumber(item.price);
-  return qty!==null&&price!==null ? qty*price : null;
-}
-function actionLabel(action){
-  if(action.includes("BUY"))return"买入";
-  if(action.includes("SELL"))return action.includes("STOP") ? "止损卖出" : "卖出";
-  return action || "--";
-}
-function formatTime(value){
-  if(!value)return"";
-  const d=new Date(value);
-  if(Number.isNaN(d.getTime()))return value;
-  return d.toLocaleString("zh-CN",{hour12:false});
-}
-
-$("preview").addEventListener("click", () => post("/api/preview"));
-$("diagnose").addEventListener("click", () => post("/api/square-diagnose"));
-$("runOnce").addEventListener("click", () => post("/api/run-once"));
-$("startLoop").addEventListener("click", () => post("/api/start-loop"));
-$("stopLoop").addEventListener("click", () => post("/api/stop"));
-$("resetState").addEventListener("click", () => {
-  if (confirm("清空 bot_state.json 中的模拟仓位和交易记录？")) post("/api/reset-dry-run-state");
-});
-refresh();
-setInterval(refresh, 2500);
-</script>
-</body>
-</html>
-"""
+def content_type_for(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".html":
+        return "text/html; charset=utf-8"
+    if suffix == ".js":
+        return "text/javascript; charset=utf-8"
+    if suffix == ".css":
+        return "text/css; charset=utf-8"
+    if suffix == ".svg":
+        return "image/svg+xml"
+    if suffix == ".json":
+        return "application/json; charset=utf-8"
+    return "application/octet-stream"
 
 
 def parse_args() -> argparse.Namespace:
@@ -1288,3 +914,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
