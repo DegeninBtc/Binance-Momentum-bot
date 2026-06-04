@@ -5,6 +5,7 @@ export type ConfigPayload = Record<string, Primitive | string[]>;
 export type SettingsState = {
   quote_asset: string;
   order_quote_amount: string;
+  max_open_positions: string;
   state_file: string;
   min_price_change_percent: string;
   min_volatility_percent: string;
@@ -33,6 +34,9 @@ export type SettingsState = {
   testnet: boolean;
   live: boolean;
   square_browser_mode: boolean;
+  telegram_bot_token: string;
+  telegram_chat_id: string;
+  telegram_enabled: boolean;
   fixed_stop_after_first_round_trip: boolean;
   market_filter_enabled: boolean;
   market_filter_require_all: boolean;
@@ -171,7 +175,9 @@ export type Diagnostics = {
 
 export type BotState = {
   position?: Position | null;
+  positions?: Position[];
   position_snapshot?: PositionSnapshot | null;
+  position_snapshots?: PositionSnapshot[];
   entry_guard_snapshot?: EntryGuardSnapshot | null;
   performance_stats?: PerformanceStats | null;
   trade_log?: TradeItem[];
@@ -194,4 +200,4 @@ export type DashboardStatus = {
 
 export type TabKey = "hot" | "trades" | "diag" | "logs" | "settings";
 
-export type SettingsTabKey = "basic" | "signal" | "scope" | "risk" | "cost" | "runtime";
+export type SettingsTabKey = "basic" | "signal" | "scope" | "risk" | "cost" | "runtime" | "notify";

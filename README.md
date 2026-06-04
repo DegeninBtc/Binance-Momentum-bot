@@ -69,10 +69,14 @@ npm run build
 $env:BINANCE_API_KEY="你的 API Key"
 $env:BINANCE_API_SECRET="你的 API Secret"
 $env:ORDER_QUOTE_USDT="50"
+$env:MAX_OPEN_POSITIONS="1"
 $env:MIN_PRICE_CHANGE_PERCENT="3"
 $env:MIN_VOLATILITY_PERCENT="5"
 $env:MIN_QUOTE_VOLUME_USDT="5000000"
 $env:POLL_SECONDS="300"
+$env:TELEGRAM_ENABLED="false"
+$env:TELEGRAM_BOT_TOKEN=""
+$env:TELEGRAM_CHAT_ID=""
 ```
 
 ### 运行一次模拟
@@ -112,6 +116,21 @@ http://127.0.0.1:8787/
 - `执行一次`：执行一个完整周期；dry-run 模式只记录模拟交易。
 - `启动循环`：按轮询间隔持续执行。
 - `清空模拟仓位`：只在 dry-run 模式下清空本地 `bot_state.json`。
+
+设置页支持策略参数预设：
+
+- `保守`：提高入场门槛、收紧日内限制，默认只允许 1 个仓位。
+- `标准`：沿用当前默认参数，适合先做模拟观察。
+- `激进`：降低入场门槛、放宽持仓和日内限制，默认最多 3 个仓位。
+
+首页持仓区域会展示当前持仓的入场价、动态止损价、止盈价和现价价格线；多仓位时，状态卡会显示主仓位并标记额外仓位数量。
+
+通知页支持 Telegram 推送：
+
+- `启用 Telegram 通知`：开启后，买入、平仓、风控跳过和循环异常会推送到 Telegram。
+- `Bot Token`：从 `@BotFather` 获取；后端不会在状态接口回显 Token。
+- `Chat ID`：目标个人或群组 ID。
+- `测试通知`：发送一条测试消息，用于确认 Token 和 Chat ID 是否可用。
 
 浏览器抓取模式需要 Playwright Chromium：
 
@@ -157,6 +176,7 @@ http://127.0.0.1:8787/
 - 每日开仓上限：默认每天最多开仓 `5` 次，可通过 `MAX_DAILY_TRADES` 或网页设置调整；设为 `0` 可关闭。
 - 每日亏损上限：默认当天已实现亏损达到 `25 USDT` 后停止新开仓，可通过 `MAX_DAILY_LOSS_USDT` 或网页设置调整；设为 `0` 可关闭。
 - 绩效统计：网页交易记录页会基于已完成的买入-卖出回合统计胜率、总盈亏、平均盈亏、盈亏比、最大回撤和当前连胜/连亏；未平仓浮盈浮亏不计入已实现绩效。
+- 多仓位管理：默认 `MAX_OPEN_POSITIONS=1`，可在网页设置最大持仓数；系统会跳过已持有币种，直到持仓数量低于上限才继续扫描新开仓。
 - 订单安全检查：买入/卖出前会检查 Binance 交易规则中的最小数量、步进精度和最小成交额，避免明显不满足规则的实盘订单被拒绝。
 - dry-run 成本估算：默认按 `0.1%` 手续费和 `0.05%` 滑点估算，买入价格上浮、卖出价格下调，绩效统计使用扣费后的净额；可通过 `FEE_RATE_PCT` / `SLIPPAGE_PCT` 或网页设置调整。
 - 手动平仓：网页提供手动平仓按钮，模拟模式记录 `DRY_RUN_MANUAL_SELL`，实盘模式会二次确认后市价卖出现有仓位。
@@ -184,6 +204,23 @@ http://127.0.0.1:8787/
 - `node_modules/`
 - `package-lock.json`
 - `web/dist/`
+
+## 编码说明
+
+**仓库文件统一按 UTF-8 维护。**
+
+如果 Windows 终端里 README 中文显示乱码，通常是当前控制台编码不是 UTF-8，而不是文件损坏。可用下面方式确认：
+
+```powershell
+Get-Content .\README.md -Encoding UTF8
+```
+
+如需让当前 PowerShell 会话按 UTF-8 输出，可执行：
+
+```powershell
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+```
 
 ---
 

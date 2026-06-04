@@ -268,9 +268,11 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
             f"波动≥{config.min_volatility_percent}%、"
             f"成交额≥{config.min_quote_volume} {config.quote_asset}。"
         )
-    if bot.state.position and bot.state.position.symbol:
+    open_positions = bot._active_positions()
+    if open_positions:
         prefix = "模拟" if config.dry_run else "实盘"
-        notes.append(f"当前已有{prefix}仓位 {bot.state.position.symbol}，执行一次不会重复开新仓。")
+        symbols_text = ", ".join(item.symbol for item in open_positions)
+        notes.append(f"当前已有{prefix}仓位 {symbols_text}；最多允许 {config.max_open_positions} 个仓位。")
     if config.asset_whitelist:
         notes.append("白名单：" + ", ".join(config.asset_whitelist))
     if config.asset_blacklist:
@@ -331,6 +333,18 @@ def reset_dry_run_state(runner: BotRunner, config: Any) -> dict[str, Any]:
     return runner.status()
 
 
+def test_telegram(config: Any) -> dict[str, Any]:
+    module = bot_module()
+    if not config.telegram_bot_token or not config.telegram_chat_id:
+        return {"ok": False, "error": "Telegram Bot Token 和 Chat ID 不能为空"}
+    notifier = module.TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
+    try:
+        notifier.send("Binance Momentum Bot 测试通知")
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def safe_load_state(path: str) -> dict[str, Any]:
     try:
         if not os.path.exists(path):
@@ -338,6 +352,7 @@ def safe_load_state(path: str) -> dict[str, Any]:
                 "first_buy_done": False,
                 "completed_round_trips": 0,
                 "position": None,
+                "positions": [],
                 "updated_at": "",
                 "trade_log": [],
             }
@@ -352,16 +367,33 @@ def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunne
     enriched["entry_guard_snapshot"] = stringify_decimals(build_entry_guard_snapshot(state, config))
     enriched["performance_stats"] = stringify_decimals(build_performance_stats(state, config.quote_asset))
 
-    position = state.get("position")
-    if not isinstance(position, dict) or not position.get("symbol"):
+    positions = active_positions_from_state(state)
+    enriched["positions"] = positions
+    if not positions:
+        enriched["position"] = None
         return enriched
 
-    snapshot = build_position_snapshot(position, state, config, runner)
-    if not snapshot:
+    snapshots = [
+        snapshot
+        for snapshot in (build_position_snapshot(position, state, config, runner) for position in positions)
+        if snapshot
+    ]
+    if not snapshots:
         return enriched
 
-    enriched["position_snapshot"] = stringify_decimals(snapshot)
+    enriched["position"] = positions[0]
+    enriched["position_snapshot"] = stringify_decimals(snapshots[0])
+    enriched["position_snapshots"] = stringify_decimals(snapshots)
     return enriched
+
+
+def active_positions_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+    positions = [item for item in state.get("positions") or [] if isinstance(item, dict) and item.get("symbol")]
+    legacy = state.get("position")
+    if isinstance(legacy, dict) and legacy.get("symbol"):
+        if all(item.get("symbol") != legacy.get("symbol") for item in positions):
+            positions.insert(0, legacy)
+    return positions
 
 
 def build_performance_stats(state: dict[str, Any], quote_asset: str) -> dict[str, Any]:
@@ -611,8 +643,10 @@ def sanitize_config(config: Any | None) -> dict[str, Any]:
     data = stringify_decimals(asdict(config))
     data.pop("api_key", None)
     data.pop("api_secret", None)
+    data.pop("telegram_bot_token", None)
     data["api_key_loaded"] = bool(config.api_key)
     data["api_secret_loaded"] = bool(config.api_secret)
+    data["telegram_token_loaded"] = bool(config.telegram_bot_token)
     return data
 
 
@@ -636,6 +670,7 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         base_url=base_url,
         quote_asset=str(payload.get("quote_asset") or os.getenv("QUOTE_ASSET", "USDT")).upper(),
         order_quote_amount=order_quote_amount,
+        max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 1),
         min_quote_volume=decimal_value(payload, "min_quote_volume", "MIN_QUOTE_VOLUME_USDT", "5000000"),
         min_price_change_percent=decimal_value(payload, "min_price_change_percent", "MIN_PRICE_CHANGE_PERCENT", "3"),
         min_volatility_percent=decimal_value(payload, "min_volatility_percent", "MIN_VOLATILITY_PERCENT", "5"),
@@ -668,6 +703,9 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         dry_run=not bool(payload.get("live")),
         square_urls=square_urls,
         square_browser_mode=bool_value(payload, "square_browser_mode", False),
+        telegram_bot_token=str(payload.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")),
+        telegram_chat_id=str(payload.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID", "")),
+        telegram_enabled=bool_value(payload, "telegram_enabled", False),
     )
 
 
@@ -776,6 +814,8 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
                     self._send_json(runner.start_loop(config))
                 elif route == "/api/reset-dry-run-state":
                     self._send_json(reset_dry_run_state(runner, config))
+                elif route == "/api/test-telegram":
+                    self._send_json(test_telegram(config))
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
             except (ValueError, RuntimeError) as exc:

@@ -156,6 +156,7 @@ class BotConfig:
     base_url: str = DEFAULT_BASE_URL
     quote_asset: str = "USDT"
     order_quote_amount: Decimal = Decimal("50")
+    max_open_positions: int = 1
     min_quote_volume: Decimal = Decimal("5000000")
     min_price_change_percent: Decimal = Decimal("3")
     min_volatility_percent: Decimal = Decimal("5")
@@ -188,6 +189,9 @@ class BotConfig:
     dry_run: bool = True
     square_urls: tuple[str, ...] = DEFAULT_SQUARE_URLS
     square_browser_mode: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_enabled: bool = False
 
 
 @dataclass
@@ -238,6 +242,7 @@ class BotState:
     first_buy_done: bool = False
     completed_round_trips: int = 0
     position: PositionState | None = None
+    positions: list[PositionState] = field(default_factory=list)
     updated_at: str = ""
     trade_log: list[dict[str, Any]] = field(default_factory=list)
 
@@ -353,6 +358,26 @@ class BinanceSpotClient:
         if response.status_code >= 400:
             raise BinanceAPIError(f"HTTP {response.status_code}: {data}")
         return data
+
+
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str) -> None:
+        self.chat_id = chat_id
+        self._url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    def send(self, text: str) -> None:
+        response = requests.post(
+            self._url,
+            json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=5,
+        )
+        data: Any
+        try:
+            data = response.json()
+        except ValueError:
+            data = response.text
+        if response.status_code >= 400 or (isinstance(data, dict) and not data.get("ok", True)):
+            raise BinanceAPIError(f"Telegram HTTP {response.status_code}: {data}")
 
 
 class BinanceSquareScraper:
@@ -581,10 +606,24 @@ class LongOnlyMomentumBot:
         self.client = BinanceSpotClient(config)
         self.square = BinanceSquareScraper(build_retry_session(), config.square_urls)
         self.state = load_state(config.state_file)
+        self._sync_legacy_position()
         self.stop_requested = False
+        self.notifier: TelegramNotifier | None = (
+            TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
+            if config.telegram_enabled and config.telegram_bot_token and config.telegram_chat_id
+            else None
+        )
 
     def request_stop(self, *_: Any) -> None:
         self.stop_requested = True
+
+    def _notify(self, text: str) -> None:
+        if not self.notifier:
+            return
+        try:
+            self.notifier.send(text)
+        except Exception as exc:
+            LOGGER.warning("telegram send failed: %s", exc)
 
     def run_forever(self) -> None:
         signal.signal(signal.SIGINT, self.request_stop)
@@ -601,15 +640,58 @@ class LongOnlyMomentumBot:
             self.client.sync_time()
             self._sync_open_position_with_account()
             self._manage_open_position()
-            if self.state.position is None:
+            if len(self._active_positions()) < max(1, self.config.max_open_positions):
                 self._scan_and_enter()
             save_state(self.config.state_file, self.state)
         except Exception:
             LOGGER.exception("cycle failed")
+            self._notify("Cycle failed. Check dashboard logs.")
+
+    def _active_positions(self) -> list[PositionState]:
+        positions = [item for item in self.state.positions if item and item.symbol]
+        if self.state.position and self.state.position.symbol:
+            if all(item.symbol != self.state.position.symbol for item in positions):
+                positions.insert(0, self.state.position)
+        return positions
+
+    def _set_positions(self, positions: list[PositionState]) -> None:
+        self.state.positions = [item for item in positions if item and item.symbol]
+        self.state.position = self.state.positions[0] if self.state.positions else None
+
+    def _sync_legacy_position(self) -> None:
+        self.state.position = self.state.positions[0] if self.state.positions else self.state.position
+        if self.state.position and not self.state.position.symbol:
+            self.state.position = None
+        if self.state.position is None and self.state.positions:
+            self.state.position = self.state.positions[0]
+        if self.state.position and all(item.symbol != self.state.position.symbol for item in self.state.positions):
+            self.state.positions.insert(0, self.state.position)
+
+    def _remove_position(self, symbol: str) -> None:
+        self._set_positions([item for item in self._active_positions() if item.symbol != symbol])
+
+    def _replace_position(self, position: PositionState) -> None:
+        replaced = False
+        positions: list[PositionState] = []
+        for item in self._active_positions():
+            if item.symbol == position.symbol:
+                positions.append(position)
+                replaced = True
+            else:
+                positions.append(item)
+        if not replaced:
+            positions.append(position)
+        self._set_positions(positions)
+
+    def _held_symbols(self) -> set[str]:
+        return {item.symbol for item in self._active_positions()}
 
     def _manage_open_position(self) -> None:
-        position = self.state.position
-        if position is None or not position.symbol:
+        for position in list(self._active_positions()):
+            self._manage_single_position(position)
+
+    def _manage_single_position(self, position: PositionState) -> None:
+        if not position.symbol:
             return
 
         symbol = position.symbol
@@ -663,11 +745,12 @@ class LongOnlyMomentumBot:
         self._close_position(position, last_price, dry_action, live_action, exit_label)
 
     def manual_close_position(self) -> None:
-        position = self.state.position
-        if position is None or not position.symbol:
+        positions = list(self._active_positions())
+        if not positions:
             raise BinanceAPIError("no open position to close")
-        last_price = self.client.ticker_price(position.symbol)
-        self._close_position(position, last_price, "DRY_RUN_MANUAL_SELL", "MANUAL_SELL", "manual close")
+        for position in positions:
+            last_price = self.client.ticker_price(position.symbol)
+            self._close_position(position, last_price, "DRY_RUN_MANUAL_SELL", "MANUAL_SELL", "manual close")
 
     def _close_position(
         self,
@@ -707,8 +790,10 @@ class LongOnlyMomentumBot:
                 quote_amount=quote_received,
             )
             self.state.completed_round_trips += 1
-            self.state.position = None
+            self._remove_position(symbol)
             self._touch_state()
+            mode = "[dry-run] " if self.config.dry_run else ""
+            self._notify(f"{mode}{exit_label} {symbol} qty={sell_qty} price={fill_price}")
             return
 
         order = self.client.market_sell_quantity(symbol, sell_qty)
@@ -724,15 +809,21 @@ class LongOnlyMomentumBot:
             LOGGER.warning("account sync kept residual %s quantity after sell: %s", symbol, remaining_qty)
             position.quantity = format_decimal(remaining_qty)
             position.quote_spent = format_decimal(remaining_qty * Decimal(position.entry_price))
+            self._replace_position(position)
         else:
             self.state.completed_round_trips += 1
-            self.state.position = None
+            self._remove_position(symbol)
         self._touch_state()
+        self._notify(f"{exit_label} {symbol} qty={sell_qty} price={avg_price}")
 
     def _scan_and_enter(self) -> None:
         daily_guard = self._daily_entry_guard_reason()
         if daily_guard:
             LOGGER.warning("entry skipped: %s", daily_guard)
+            self._notify(f"Entry skipped: {daily_guard}")
+            return
+        if len(self._active_positions()) >= max(1, self.config.max_open_positions):
+            LOGGER.info("entry skipped: max open positions reached (%s)", self.config.max_open_positions)
             return
         market_guard = self._market_filter_reason()
         if market_guard:
@@ -809,6 +900,8 @@ class LongOnlyMomentumBot:
 
         for ticker in tickers:
             symbol = ticker.get("symbol", "")
+            if symbol in self._held_symbols():
+                continue
             symbol_info = symbols.get(symbol)
             if symbol_info is None:
                 continue
@@ -904,7 +997,7 @@ class LongOnlyMomentumBot:
         fee_amount: Decimal | None = None,
     ) -> None:
         spent = quote_spent if quote_spent is not None else quantity * entry_price
-        self.state.position = PositionState(
+        new_position = PositionState(
             symbol=candidate.symbol,
             base_asset=candidate.base_asset,
             quantity=format_decimal(quantity),
@@ -914,9 +1007,14 @@ class LongOnlyMomentumBot:
             opened_at=utc_now(),
             order_id=int(order["orderId"]) if order and "orderId" in order else None,
         )
+        positions = [item for item in self._active_positions() if item.symbol != candidate.symbol]
+        positions.append(new_position)
+        self._set_positions(positions)
         self.state.first_buy_done = True
         self._append_trade("BUY", candidate.symbol, quantity, entry_price, order, fee_amount=fee_amount, quote_amount=spent)
         self._touch_state()
+        mode = "[dry-run] " if self.config.dry_run else ""
+        self._notify(f"{mode}BUY {candidate.symbol} qty={quantity} price={entry_price} spent={spent}")
 
     def _dynamic_stop_price(self, entry_price: Decimal, highest_price: Decimal, pct_stop: Decimal) -> tuple[Decimal, str]:
         return dynamic_stop_price(self.config, entry_price, highest_price, pct_stop)
@@ -984,24 +1082,30 @@ class LongOnlyMomentumBot:
     def _sync_open_position_with_account(self) -> None:
         if self.config.dry_run or not self.config.account_sync_enabled:
             return
-        position = self.state.position
-        if position is None or not position.symbol:
+        positions = self._active_positions()
+        if not positions:
             return
+        updated_positions: list[PositionState] = []
+        changed = False
         try:
-            account_qty = self._account_asset_balance(position.base_asset)
-            wanted_qty = Decimal(position.quantity)
-            step_size = symbol_step_size(self.client.exchange_info(), position.symbol)
-            synced_qty = round_down_to_step(account_qty, step_size)
-            if synced_qty <= 0:
-                LOGGER.warning("account sync cleared local position %s; no %s balance found", position.symbol, position.base_asset)
-                self._append_trade("ACCOUNT_SYNC_CLEAR", position.symbol, wanted_qty, Decimal(position.entry_price), None)
-                self.state.position = None
-                self._touch_state()
-                return
-            if synced_qty < wanted_qty:
-                LOGGER.warning("account sync reduced %s local quantity from %s to %s", position.symbol, wanted_qty, synced_qty)
-                position.quantity = format_decimal(synced_qty)
-                position.quote_spent = format_decimal(synced_qty * Decimal(position.entry_price))
+            for position in positions:
+                account_qty = self._account_asset_balance(position.base_asset)
+                wanted_qty = Decimal(position.quantity)
+                step_size = symbol_step_size(self.client.exchange_info(), position.symbol)
+                synced_qty = round_down_to_step(account_qty, step_size)
+                if synced_qty <= 0:
+                    LOGGER.warning("account sync cleared local position %s; no %s balance found", position.symbol, position.base_asset)
+                    self._append_trade("ACCOUNT_SYNC_CLEAR", position.symbol, wanted_qty, Decimal(position.entry_price), None)
+                    changed = True
+                    continue
+                if synced_qty < wanted_qty:
+                    LOGGER.warning("account sync reduced %s local quantity from %s to %s", position.symbol, wanted_qty, synced_qty)
+                    position.quantity = format_decimal(synced_qty)
+                    position.quote_spent = format_decimal(synced_qty * Decimal(position.entry_price))
+                    changed = True
+                updated_positions.append(position)
+            if changed:
+                self._set_positions(updated_positions)
                 self._touch_state()
         except Exception:
             LOGGER.exception("account sync failed; keeping local position state")
@@ -1066,9 +1170,9 @@ class LongOnlyMomentumBot:
             balances = {item["asset"]: Decimal(item["free"]) + Decimal(item["locked"]) for item in account["balances"]}
             quote_balance = balances.get(self.config.quote_asset, Decimal("0"))
             position_value = Decimal("0")
-            if self.state.position:
-                last = self.client.ticker_price(self.state.position.symbol)
-                position_value = Decimal(self.state.position.quantity) * last
+            for position in self._active_positions():
+                last = self.client.ticker_price(position.symbol)
+                position_value += Decimal(position.quantity) * last
             return quote_balance + position_value >= self.config.fixed_stop_equity_usdt
         except Exception:
             LOGGER.exception("failed to evaluate equity threshold; keeping percent stop")
@@ -1177,10 +1281,15 @@ def load_state(path: str) -> BotState:
     with open(path, "r", encoding="utf-8") as handle:
         raw = json.load(handle)
     position = raw.get("position")
+    positions_raw = raw.get("positions") or []
+    positions = [PositionState(**item) for item in positions_raw if item]
+    if position and not positions:
+        positions = [PositionState(**position)]
     return BotState(
         first_buy_done=bool(raw.get("first_buy_done", False)),
         completed_round_trips=int(raw.get("completed_round_trips", 0)),
-        position=PositionState(**position) if position else None,
+        position=positions[0] if positions else None,
+        positions=positions,
         updated_at=raw.get("updated_at", ""),
         trade_log=list(raw.get("trade_log", [])),
     )
@@ -1514,6 +1623,7 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         base_url=base_url,
         quote_asset=os.getenv("QUOTE_ASSET", "USDT"),
         order_quote_amount=order_quote_amount,
+        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
         min_quote_volume=decimal_env("MIN_QUOTE_VOLUME_USDT", "5000000") or Decimal("5000000"),
         min_price_change_percent=decimal_env("MIN_PRICE_CHANGE_PERCENT", "3") or Decimal("3"),
         min_volatility_percent=decimal_env("MIN_VOLATILITY_PERCENT", "5") or Decimal("5"),
@@ -1546,6 +1656,9 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         dry_run=not args.live,
         square_urls=square_urls,
         square_browser_mode=args.square_browser or bool_env("SQUARE_BROWSER_MODE", False),
+        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+        telegram_enabled=bool_env("TELEGRAM_ENABLED", False),
     )
 
 
