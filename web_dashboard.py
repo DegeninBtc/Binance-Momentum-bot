@@ -141,6 +141,14 @@ class BotRunner:
         self.worker.start()
         return self.status()
 
+    def manual_close(self, config: Any) -> dict[str, Any]:
+        if not self._claim("manual-close-live" if not config.dry_run else "manual-close-dry-run", config):
+            LOGGER.info("manual close ignored because another bot task is already running")
+            return self.status()
+        self.worker = threading.Thread(target=self._manual_close_worker, args=(config,), daemon=True)
+        self.worker.start()
+        return self.status()
+
     def start_loop(self, config: Any) -> dict[str, Any]:
         if not self._claim("loop-live" if not config.dry_run else "loop-dry-run", config):
             LOGGER.info("start-loop ignored because another bot task is already running")
@@ -207,6 +215,15 @@ class BotRunner:
             return
         self._finish()
 
+    def _manual_close_worker(self, config: Any) -> None:
+        try:
+            bot_module().LongOnlyMomentumBot(config).manual_close_position()
+        except Exception as exc:
+            LOGGER.exception("manual close failed")
+            self._finish(str(exc))
+            return
+        self._finish()
+
     def _loop_worker(self, config: Any) -> None:
         try:
             bot = bot_module().LongOnlyMomentumBot(config)
@@ -235,6 +252,9 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
     hot_assets = candidates[: config.top_coin_limit]
     source = "综合评分：Binance Square + 24h 涨幅榜"
     notes: list[str] = []
+    market_guard = bot._market_filter_reason()
+    if market_guard:
+        notes.append(f"大盘过滤暂停新开仓：{market_guard}")
     if not mentions:
         LOGGER.warning("no valid long-only Binance Square mentions found; preview is using market momentum only")
         notes.append("广场没有有效做多提及，本次按 24h 市场动能排序。")
@@ -249,6 +269,10 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
     if bot.state.position and bot.state.position.symbol:
         prefix = "模拟" if config.dry_run else "实盘"
         notes.append(f"当前已有{prefix}仓位 {bot.state.position.symbol}，执行一次不会重复开新仓。")
+    if config.asset_whitelist:
+        notes.append("白名单：" + ", ".join(config.asset_whitelist))
+    if config.asset_blacklist:
+        notes.append("黑名单：" + ", ".join(config.asset_blacklist))
     return {
         "checked_at": now_text(),
         "source": source,
@@ -322,17 +346,148 @@ def safe_load_state(path: str) -> dict[str, Any]:
 
 
 def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunner) -> dict[str, Any]:
+    enriched = dict(state)
+    enriched["entry_guard_snapshot"] = stringify_decimals(build_entry_guard_snapshot(state, config))
+    enriched["performance_stats"] = stringify_decimals(build_performance_stats(state, config.quote_asset))
+
     position = state.get("position")
     if not isinstance(position, dict) or not position.get("symbol"):
-        return state
+        return enriched
 
     snapshot = build_position_snapshot(position, state, config, runner)
     if not snapshot:
-        return state
+        return enriched
 
-    enriched = dict(state)
     enriched["position_snapshot"] = stringify_decimals(snapshot)
     return enriched
+
+
+def build_performance_stats(state: dict[str, Any], quote_asset: str) -> dict[str, Any]:
+    module = bot_module()
+    completed: list[dict[str, Any]] = []
+    open_trade: dict[str, Any] | None = None
+
+    for item in state.get("trade_log") or []:
+        action = str(item.get("action", ""))
+        qty = decimal_from_state(item.get("quantity"))
+        price = decimal_from_state(item.get("price"))
+        if qty is None or price is None:
+            continue
+        amount = decimal_from_state(item.get("quote_amount")) or qty * price
+        ts = module.parse_timestamp(item.get("ts"))
+        if "BUY" in action:
+            open_trade = {
+                "symbol": item.get("symbol", ""),
+                "amount": amount,
+                "ts": ts,
+                "dry_run": bool(item.get("dry_run", True)),
+            }
+        elif "SELL" in action and open_trade is not None:
+            pnl = amount - open_trade["amount"]
+            return_pct = pnl / open_trade["amount"] * Decimal("100") if open_trade["amount"] > 0 else Decimal("0")
+            completed.append(
+                {
+                    "symbol": open_trade["symbol"],
+                    "pnl": pnl,
+                    "return_pct": return_pct,
+                    "entry_amount": open_trade["amount"],
+                    "exit_amount": amount,
+                    "opened_at": open_trade["ts"],
+                    "closed_at": ts,
+                    "dry_run": open_trade["dry_run"],
+                    "exit_action": action,
+                }
+            )
+            open_trade = None
+
+    total = len(completed)
+    wins = [item for item in completed if item["pnl"] > 0]
+    losses = [item for item in completed if item["pnl"] < 0]
+    total_pnl = sum((item["pnl"] for item in completed), Decimal("0"))
+    gross_profit = sum((item["pnl"] for item in wins), Decimal("0"))
+    gross_loss = sum((-item["pnl"] for item in losses), Decimal("0"))
+    avg_pnl = total_pnl / total if total else Decimal("0")
+    avg_return_pct = sum((item["return_pct"] for item in completed), Decimal("0")) / total if total else Decimal("0")
+    win_rate = Decimal(len(wins)) / Decimal(total) * Decimal("100") if total else Decimal("0")
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+    best_trade = max((item["pnl"] for item in completed), default=Decimal("0"))
+    worst_trade = min((item["pnl"] for item in completed), default=Decimal("0"))
+
+    equity = Decimal("0")
+    peak = Decimal("0")
+    max_drawdown = Decimal("0")
+    current_streak = 0
+    current_streak_type = ""
+    for item in completed:
+        equity += item["pnl"]
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+        if item["pnl"] > 0:
+            current_streak = current_streak + 1 if current_streak_type == "win" else 1
+            current_streak_type = "win"
+        elif item["pnl"] < 0:
+            current_streak = current_streak + 1 if current_streak_type == "loss" else 1
+            current_streak_type = "loss"
+
+    return {
+        "quote_asset": quote_asset,
+        "completed_trades": total,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "avg_pnl": avg_pnl,
+        "avg_return_pct": avg_return_pct,
+        "profit_factor": profit_factor,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "max_drawdown": max_drawdown,
+        "current_streak": current_streak,
+        "current_streak_type": current_streak_type,
+    }
+
+
+def build_entry_guard_snapshot(state: dict[str, Any], config: Any) -> dict[str, Any]:
+    module = bot_module()
+    today = module.datetime.now(module.timezone.utc).date()
+    buy_count = 0
+    realized_pnl = Decimal("0")
+    open_cost: Decimal | None = None
+
+    for item in state.get("trade_log") or []:
+        action = str(item.get("action", ""))
+        ts = module.parse_timestamp(item.get("ts"))
+        qty = decimal_from_state(item.get("quantity"))
+        price = decimal_from_state(item.get("price"))
+        if qty is None or price is None:
+            continue
+        amount = decimal_from_state(item.get("quote_amount")) or qty * price
+        if "BUY" in action:
+            open_cost = amount
+            if ts and ts.date() == today:
+                buy_count += 1
+        elif "SELL" in action:
+            if ts and ts.date() == today and open_cost is not None:
+                realized_pnl += amount - open_cost
+            open_cost = None
+
+    trade_limit_hit = config.max_daily_trades > 0 and buy_count >= config.max_daily_trades
+    loss_limit_hit = config.max_daily_loss_usdt > 0 and realized_pnl <= -config.max_daily_loss_usdt
+    return {
+        "buy_count": buy_count,
+        "realized_pnl": realized_pnl,
+        "max_daily_trades": config.max_daily_trades,
+        "max_daily_loss_usdt": config.max_daily_loss_usdt,
+        "cooldown_minutes": config.cooldown_minutes,
+        "trade_limit_hit": trade_limit_hit,
+        "loss_limit_hit": loss_limit_hit,
+        "entry_blocked": trade_limit_hit or loss_limit_hit,
+    }
 
 
 def build_position_snapshot(
@@ -349,12 +504,22 @@ def build_position_snapshot(
     quote_spent = decimal_from_state(position.get("quote_spent")) or quantity * entry_price
     symbol = str(position.get("symbol") or "")
     current_price, price_error = runner.ticker_price_for_status(config, symbol)
+    highest_price = decimal_from_state(position.get("highest_price")) or entry_price
+    if current_price is not None and current_price > highest_price:
+        highest_price = current_price
     is_dry_run = position_is_dry_run(position, state, config)
     fixed_stop_enabled = (
         bool(config.fixed_stop_after_first_round_trip)
         and int(state.get("completed_round_trips") or 0) > 0
     )
     stop_price = entry_price * (Decimal("1") - config.initial_stop_loss_pct / Decimal("100"))
+    dynamic_stop_price, dynamic_stop_mode = bot_module().dynamic_stop_price(
+        config,
+        entry_price,
+        highest_price,
+        stop_price,
+    )
+    take_profit_price = entry_price * (Decimal("1") + config.take_profit_pct / Decimal("100"))
 
     snapshot: dict[str, Any] = {
         "symbol": symbol,
@@ -364,14 +529,23 @@ def build_position_snapshot(
         "mode_label": "模拟" if is_dry_run else "实盘",
         "quantity": quantity,
         "entry_price": entry_price,
+        "highest_price": highest_price,
         "quote_spent": quote_spent,
         "opened_at": position.get("opened_at", ""),
         "current_price": current_price,
         "price_error": price_error,
-        "active_stop_mode": "fixed-usdt" if fixed_stop_enabled else "percent",
+        "active_stop_mode": "fixed-usdt+" + dynamic_stop_mode if fixed_stop_enabled else dynamic_stop_mode,
         "stop_price": stop_price,
+        "dynamic_stop_price": dynamic_stop_price,
+        "dynamic_stop_mode": dynamic_stop_mode,
+        "take_profit_price": take_profit_price,
         "fixed_stop_loss_usdt": config.fixed_stop_loss_usdt,
         "initial_stop_loss_pct": config.initial_stop_loss_pct,
+        "take_profit_pct": config.take_profit_pct,
+        "breakeven_trigger_pct": config.breakeven_trigger_pct,
+        "breakeven_offset_pct": config.breakeven_offset_pct,
+        "trailing_start_pct": config.trailing_start_pct,
+        "trailing_stop_pct": config.trailing_stop_pct,
     }
 
     if current_price is None:
@@ -384,9 +558,16 @@ def build_position_snapshot(
     stop_triggered = (
         unrealized_loss >= config.fixed_stop_loss_usdt
         if fixed_stop_enabled
-        else current_price <= stop_price
+        else current_price <= dynamic_stop_price
     )
-    stop_distance_pct = (current_price - stop_price) / current_price * Decimal("100") if current_price > 0 else None
+    stop_triggered = stop_triggered or current_price <= dynamic_stop_price
+    take_profit_triggered = config.take_profit_pct > 0 and current_price >= take_profit_price
+    stop_distance_pct = (current_price - dynamic_stop_price) / current_price * Decimal("100") if current_price > 0 else None
+    take_profit_distance_pct = (
+        (take_profit_price - current_price) / current_price * Decimal("100")
+        if current_price > 0 and not take_profit_triggered
+        else Decimal("0")
+    )
     snapshot.update(
         {
             "market_value": market_value,
@@ -395,6 +576,8 @@ def build_position_snapshot(
             "unrealized_loss": unrealized_loss,
             "stop_distance_pct": stop_distance_pct,
             "stop_triggered": stop_triggered,
+            "take_profit_distance_pct": take_profit_distance_pct,
+            "take_profit_triggered": take_profit_triggered,
         }
     )
     return snapshot
@@ -440,13 +623,17 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
     )
     testnet = bool(payload.get("testnet"))
     base_url = "https://testnet.binance.vision" if testnet else os.getenv("BINANCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    order_quote_amount = decimal_value(payload, "order_quote_amount", "ORDER_QUOTE_USDT", "50")
+    fixed_stop_loss_usdt = optional_decimal(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT")
+    if fixed_stop_loss_usdt is None:
+        fixed_stop_loss_usdt = module.default_fixed_stop_loss_usdt(order_quote_amount)
 
     return module.BotConfig(
         api_key=os.getenv("BINANCE_API_KEY", ""),
         api_secret=os.getenv("BINANCE_API_SECRET", ""),
         base_url=base_url,
         quote_asset=str(payload.get("quote_asset") or os.getenv("QUOTE_ASSET", "USDT")).upper(),
-        order_quote_amount=decimal_value(payload, "order_quote_amount", "ORDER_QUOTE_USDT", "50"),
+        order_quote_amount=order_quote_amount,
         min_quote_volume=decimal_value(payload, "min_quote_volume", "MIN_QUOTE_VOLUME_USDT", "5000000"),
         min_price_change_percent=decimal_value(payload, "min_price_change_percent", "MIN_PRICE_CHANGE_PERCENT", "3"),
         min_volatility_percent=decimal_value(payload, "min_volatility_percent", "MIN_VOLATILITY_PERCENT", "5"),
@@ -455,9 +642,26 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         poll_seconds=int_value(payload, "poll_seconds", "POLL_SECONDS", 300),
         recv_window_ms=int_value(payload, "recv_window_ms", "RECV_WINDOW_MS", 5000),
         initial_stop_loss_pct=decimal_value(payload, "initial_stop_loss_pct", "INITIAL_STOP_LOSS_PCT", "20"),
-        fixed_stop_loss_usdt=decimal_value(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT", "200"),
-        fixed_stop_after_first_round_trip=bool_value(payload, "fixed_stop_after_first_round_trip", True),
+        take_profit_pct=decimal_value(payload, "take_profit_pct", "TAKE_PROFIT_PCT", "12"),
+        breakeven_trigger_pct=decimal_value(payload, "breakeven_trigger_pct", "BREAKEVEN_TRIGGER_PCT", "6"),
+        breakeven_offset_pct=decimal_value(payload, "breakeven_offset_pct", "BREAKEVEN_OFFSET_PCT", "0"),
+        trailing_start_pct=decimal_value(payload, "trailing_start_pct", "TRAILING_START_PCT", "8"),
+        trailing_stop_pct=decimal_value(payload, "trailing_stop_pct", "TRAILING_STOP_PCT", "5"),
+        fixed_stop_loss_usdt=fixed_stop_loss_usdt,
+        fixed_stop_after_first_round_trip=bool_value(payload, "fixed_stop_after_first_round_trip", False),
         fixed_stop_equity_usdt=optional_decimal(payload, "fixed_stop_equity_usdt", "FIXED_STOP_EQUITY_USDT"),
+        cooldown_minutes=int_value(payload, "cooldown_minutes", "COOLDOWN_MINUTES", 30),
+        max_daily_trades=int_value(payload, "max_daily_trades", "MAX_DAILY_TRADES", 5),
+        max_daily_loss_usdt=decimal_value(payload, "max_daily_loss_usdt", "MAX_DAILY_LOSS_USDT", "25"),
+        fee_rate_pct=decimal_value(payload, "fee_rate_pct", "FEE_RATE_PCT", "0.1"),
+        slippage_pct=decimal_value(payload, "slippage_pct", "SLIPPAGE_PCT", "0.05"),
+        asset_whitelist=symbol_list_value(payload, "asset_whitelist", "ASSET_WHITELIST"),
+        asset_blacklist=symbol_list_value(payload, "asset_blacklist", "ASSET_BLACKLIST"),
+        market_filter_enabled=bool_value(payload, "market_filter_enabled", False),
+        market_filter_assets=symbol_list_value(payload, "market_filter_assets", "MARKET_FILTER_ASSETS", "BTC,ETH"),
+        market_filter_min_change_pct=decimal_value(payload, "market_filter_min_change_pct", "MARKET_FILTER_MIN_CHANGE_PCT", "-1"),
+        market_filter_require_all=bool_value(payload, "market_filter_require_all", False),
+        account_sync_enabled=bool_value(payload, "account_sync_enabled", True),
         state_file=str(payload.get("state_file") or os.getenv("STATE_FILE", "bot_state.json")),
         dry_run=not bool(payload.get("live")),
         square_urls=square_urls,
@@ -485,6 +689,13 @@ def optional_decimal(payload: dict[str, Any], key: str, env_name: str) -> Decima
         return Decimal(str(raw))
     except InvalidOperation as exc:
         raise ValueError(f"{key} must be a decimal number") from exc
+
+
+def symbol_list_value(payload: dict[str, Any], key: str, env_name: str, default: str = "") -> tuple[str, ...]:
+    raw = payload.get(key)
+    if raw in (None, ""):
+        raw = os.getenv(env_name, default)
+    return bot_module().parse_symbol_list(str(raw or ""))
 
 
 def int_value(payload: dict[str, Any], key: str, env_name: str, default: int) -> int:
@@ -558,6 +769,8 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
                     self._send_json(runner.diagnose_square(config))
                 elif route == "/api/run-once":
                     self._send_json(runner.run_once(config))
+                elif route == "/api/manual-close":
+                    self._send_json(runner.manual_close(config))
                 elif route == "/api/start-loop":
                     self._send_json(runner.start_loop(config))
                 elif route == "/api/reset-dry-run-state":
@@ -761,10 +974,25 @@ DASHBOARD_HTML = r"""<!doctype html>
     .tag-live{background:var(--red-dim);color:var(--red)}
 
     /* ── Settings panel ── */
-    .settings-grid{padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .settings-shell{padding:0}
+    .settings-subtabs{display:flex;gap:6px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--bg2)}
+    .settings-tab-btn{
+      height:32px;padding:0 12px;border-radius:var(--radius-sm);
+      border:1px solid transparent;background:transparent;color:var(--text-muted);
+      font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;
+    }
+    .settings-tab-btn:hover{color:var(--text);background:var(--card-hover);border-color:var(--border)}
+    .settings-tab-btn.active{color:var(--green);background:var(--green-dim);border-color:rgba(34,197,94,.24)}
+    .settings-section{display:none}
+    .settings-section.active{display:block}
+    .settings-section-head{padding:16px 20px 0;display:grid;gap:4px}
+    .settings-section-head strong{font-size:13px;color:var(--text)}
+    .settings-section-head span{font-size:12px;color:var(--text-dim);line-height:1.45}
+    .settings-grid{padding:16px 20px 20px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
     .settings-grid .full{grid-column:1/-1}
     .field{display:flex;flex-direction:column;gap:5px}
     .field-label{font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0}
+    .field-help{font-size:11px;line-height:1.4;color:var(--text-dim)}
     .field input[type=number],.field input[type=text],.field input:not([type]){
       height:36px;padding:0 12px;border-radius:var(--radius-sm);
       border:1px solid var(--border);background:var(--bg);color:var(--text);
@@ -781,6 +1009,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     .switch-item input[type=checkbox]{
       width:16px;height:16px;accent-color:var(--green);cursor:pointer;
     }
+
+    /* ── Performance panel ── */
+    .stats-grid{padding:16px;display:grid;grid-template-columns:repeat(4,1fr);gap:12px;border-bottom:1px solid var(--border)}
+    .stat-box{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;display:grid;gap:5px;min-height:74px}
+    .stat-box .label{font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0}
+    .stat-box .value{font-size:18px;font-weight:700;font-family:var(--mono);color:var(--text);line-height:1.2}
+    .stat-box .sub{font-size:11px;color:var(--text-dim);line-height:1.35}
 
     /* ── Diagnostics ── */
     .diag-content{padding:16px;font-size:13px;color:var(--text-muted);line-height:1.7}
@@ -804,6 +1039,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     /* ── Responsive ── */
     @media(max-width:900px){
       .kpi-row{grid-template-columns:1fr 1fr}
+      .stats-grid{grid-template-columns:1fr 1fr}
       .settings-grid{grid-template-columns:1fr}
       .shell{padding:14px 14px 32px}
     }
@@ -811,6 +1047,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       .topbar{padding:0 14px;height:48px}
       .topbar h1{font-size:14px}
       .kpi-row{grid-template-columns:1fr}
+      .stats-grid{grid-template-columns:1fr}
       .action-bar{padding:10px 12px}
       .tab-btn{padding:8px 14px;font-size:12px}
     }
@@ -870,6 +1107,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button type="button" id="runOnce" class="btn primary"><span class="icon">▶</span>执行一次</button>
     <button type="button" id="startLoop" class="btn"><span class="icon">⏵⏵</span>启动循环</button>
     <div class="sep"></div>
+    <button type="button" id="manualClose" class="btn danger"><span class="icon">⏏</span>手动平仓</button>
     <button type="button" id="stopLoop" class="btn danger"><span class="icon">■</span>停止</button>
     <button type="button" id="resetState" class="btn danger"><span class="icon">↺</span>清空模拟仓位</button>
   </div>
@@ -896,6 +1134,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <!-- Tab: Trades -->
   <div class="tab-panel" id="panel-trades">
+    <div id="performanceStats" class="stats-grid"></div>
     <div id="trades" class="empty-state">暂无交易记录</div>
   </div>
 
@@ -911,25 +1150,88 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <!-- Tab: Settings -->
   <div class="tab-panel" id="panel-settings">
-    <form id="settings" class="settings-grid">
-      <div class="field"><span class="field-label">计价币种</span><input name="quote_asset" value="USDT"></div>
-      <div class="field"><span class="field-label">单笔金额</span><input name="order_quote_amount" type="number" min="1" step="1" value="50"></div>
-      <div class="field"><span class="field-label">最低涨幅 %</span><input name="min_price_change_percent" type="number" step="0.1" value="3"></div>
-      <div class="field"><span class="field-label">最低波动 %</span><input name="min_volatility_percent" type="number" step="0.1" value="5"></div>
-      <div class="field full"><span class="field-label">最低成交额</span><input name="min_quote_volume" type="number" min="0" step="100000" value="5000000"></div>
-      <div class="field"><span class="field-label">热门帖子数</span><input name="top_post_limit" type="number" min="1" step="1" value="25"></div>
-      <div class="field"><span class="field-label">热门币种数</span><input name="top_coin_limit" type="number" min="1" step="1" value="10"></div>
-      <div class="field"><span class="field-label">轮询秒数</span><input name="poll_seconds" type="number" min="5" step="1" value="300"></div>
-      <div class="field"><span class="field-label">签名窗口 ms</span><input name="recv_window_ms" type="number" min="1000" step="100" value="5000"></div>
-      <div class="field"><span class="field-label">初始止损 %</span><input name="initial_stop_loss_pct" type="number" min="0.1" step="0.1" value="20"></div>
-      <div class="field"><span class="field-label">固定止损 USDT</span><input name="fixed_stop_loss_usdt" type="number" min="1" step="1" value="200"></div>
-      <div class="field"><span class="field-label">权益触发 USDT</span><input name="fixed_stop_equity_usdt" type="number" min="0" step="1" placeholder=""></div>
-      <div class="field"><span class="field-label">状态文件</span><input name="state_file" value="bot_state.json"></div>
-      <div class="full switches-row">
-        <label class="switch-item"><input name="testnet" type="checkbox">Testnet</label>
-        <label class="switch-item"><input name="live" type="checkbox">Live 实盘</label>
-        <label class="switch-item"><input name="square_browser_mode" type="checkbox">浏览器抓广场</label>
-        <label class="switch-item"><input name="fixed_stop_after_first_round_trip" type="checkbox" checked>首回合后固定止损</label>
+    <form id="settings" class="settings-shell">
+      <div class="settings-subtabs">
+        <button type="button" class="settings-tab-btn active" data-setting-tab="basic">基础</button>
+        <button type="button" class="settings-tab-btn" data-setting-tab="signal">信号筛选</button>
+        <button type="button" class="settings-tab-btn" data-setting-tab="scope">交易范围</button>
+        <button type="button" class="settings-tab-btn" data-setting-tab="risk">风控退出</button>
+        <button type="button" class="settings-tab-btn" data-setting-tab="cost">交易成本</button>
+        <button type="button" class="settings-tab-btn" data-setting-tab="runtime">运行模式</button>
+      </div>
+
+      <div class="settings-section active" id="settings-basic">
+        <div class="settings-section-head"><strong>基础交易</strong><span>控制交易计价、单笔投入和本地状态文件。</span></div>
+        <div class="settings-grid">
+          <div class="field"><span class="field-label">计价币种</span><input name="quote_asset" value="USDT"></div>
+          <div class="field"><span class="field-label">单笔金额</span><input name="order_quote_amount" type="number" min="1" step="1" value="50"></div>
+          <div class="field"><span class="field-label">状态文件</span><input name="state_file" value="bot_state.json"></div>
+        </div>
+      </div>
+
+      <div class="settings-section" id="settings-signal">
+        <div class="settings-section-head"><strong>信号筛选</strong><span>控制候选币进入排序前必须满足的行情和广场热度条件。</span></div>
+        <div class="settings-grid">
+          <div class="field"><span class="field-label">最低涨幅 %</span><input name="min_price_change_percent" type="number" step="0.1" value="3"></div>
+          <div class="field"><span class="field-label">最低波动 %</span><input name="min_volatility_percent" type="number" step="0.1" value="5"></div>
+          <div class="field full"><span class="field-label">最低成交额</span><input name="min_quote_volume" type="number" min="0" step="100000" value="5000000"></div>
+          <div class="field"><span class="field-label">热门帖子数</span><input name="top_post_limit" type="number" min="1" step="1" value="25"></div>
+          <div class="field"><span class="field-label">热门币种数</span><input name="top_coin_limit" type="number" min="1" step="1" value="10"></div>
+        </div>
+      </div>
+
+      <div class="settings-section" id="settings-scope">
+        <div class="settings-section-head"><strong>交易范围</strong><span>控制允许交易的币种、大盘环境过滤和实盘账户同步。</span></div>
+        <div class="settings-grid">
+          <div class="field full"><span class="field-label">白名单</span><input name="asset_whitelist" value="" placeholder="BTC,ETH,SOL 或 SOLUSDT"><span class="field-help">填写后只交易这些币种；留空表示不限制。</span></div>
+          <div class="field full"><span class="field-label">黑名单</span><input name="asset_blacklist" value="" placeholder="USDC,FDUSD 或 OPNUSDT"><span class="field-help">这些币种永不新开仓，优先级高于候选排序。</span></div>
+          <div class="field"><span class="field-label">大盘过滤币种</span><input name="market_filter_assets" value="BTC,ETH"><span class="field-help">用于判断大盘环境，默认 BTC 和 ETH。</span></div>
+          <div class="field"><span class="field-label">大盘最低涨幅 %</span><input name="market_filter_min_change_pct" type="number" step="0.1" value="-1"><span class="field-help">低于该 24h 涨幅时暂停追涨开仓。</span></div>
+          <div class="field full switches-row">
+            <label class="switch-item"><input name="market_filter_enabled" type="checkbox">启用 BTC/ETH 大盘过滤</label>
+            <label class="switch-item"><input name="market_filter_require_all" type="checkbox">要求全部大盘币满足</label>
+            <label class="switch-item"><input name="account_sync_enabled" type="checkbox" checked>实盘成交后账户同步</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-section" id="settings-risk">
+        <div class="settings-section-head"><strong>风控退出</strong><span>控制止损、止盈、保本、移动止盈和开仓节流。</span></div>
+        <div class="settings-grid">
+          <div class="field"><span class="field-label">初始止损 %</span><input name="initial_stop_loss_pct" type="number" min="0.1" step="0.1" value="20"></div>
+          <div class="field"><span class="field-label">止盈 %</span><input name="take_profit_pct" type="number" min="0" step="0.1" value="12"></div>
+          <div class="field"><span class="field-label">保本触发 %</span><input name="breakeven_trigger_pct" type="number" min="0" step="0.1" value="6"><span class="field-help">最高价达到该涨幅后，把动态止损抬到成本附近；填 0 关闭。</span></div>
+          <div class="field"><span class="field-label">保本偏移 %</span><input name="breakeven_offset_pct" type="number" step="0.1" value="0"><span class="field-help">保本止损相对开仓价的偏移，0 表示刚好成本价。</span></div>
+          <div class="field"><span class="field-label">移动止盈启动 %</span><input name="trailing_start_pct" type="number" min="0" step="0.1" value="8"><span class="field-help">最高价达到该涨幅后启用移动止盈。</span></div>
+          <div class="field"><span class="field-label">移动止盈回撤 %</span><input name="trailing_stop_pct" type="number" min="0" step="0.1" value="5"><span class="field-help">从最高价回撤该比例时卖出；填 0 关闭。</span></div>
+          <div class="field"><span class="field-label">固定止损 USDT</span><input name="fixed_stop_loss_usdt" type="number" min="1" step="1" value="10"><span class="field-help">仅在固定止损模式启用后生效；建议为单笔金额的 10%-25%。</span></div>
+          <div class="field"><span class="field-label">权益触发 USDT</span><input name="fixed_stop_equity_usdt" type="number" min="0" step="1" placeholder=""><span class="field-help">留空则不按账户权益切换固定止损。</span></div>
+          <div class="field"><span class="field-label">冷却分钟</span><input name="cooldown_minutes" type="number" min="0" step="1" value="30"><span class="field-help">同一币种卖出后暂停重新开仓；填 0 关闭。</span></div>
+          <div class="field"><span class="field-label">每日最大开仓</span><input name="max_daily_trades" type="number" min="0" step="1" value="5"><span class="field-help">按 UTC 日期统计买入次数；填 0 关闭。</span></div>
+          <div class="field"><span class="field-label">每日最大亏损 USDT</span><input name="max_daily_loss_usdt" type="number" min="0" step="1" value="25"><span class="field-help">已实现亏损达到后停止新开仓；填 0 关闭。</span></div>
+          <div class="field full"><label class="switch-item"><input name="fixed_stop_after_first_round_trip" type="checkbox">首回合后固定止损</label></div>
+        </div>
+      </div>
+
+      <div class="settings-section" id="settings-cost">
+        <div class="settings-section-head"><strong>交易成本</strong><span>用于 dry-run 估算真实成交偏差和手续费，影响模拟绩效统计。</span></div>
+        <div class="settings-grid">
+          <div class="field"><span class="field-label">手续费 %</span><input name="fee_rate_pct" type="number" min="0" step="0.01" value="0.1"><span class="field-help">dry-run 估算手续费，影响模拟成本和绩效统计。</span></div>
+          <div class="field"><span class="field-label">滑点 %</span><input name="slippage_pct" type="number" min="0" step="0.01" value="0.05"><span class="field-help">dry-run 买入上浮、卖出下调，用于贴近真实成交。</span></div>
+        </div>
+      </div>
+
+      <div class="settings-section" id="settings-runtime">
+        <div class="settings-section-head"><strong>运行模式</strong><span>控制循环频率、签名窗口、测试网、实盘和广场抓取方式。</span></div>
+        <div class="settings-grid">
+          <div class="field"><span class="field-label">轮询秒数</span><input name="poll_seconds" type="number" min="5" step="1" value="300"></div>
+          <div class="field"><span class="field-label">签名窗口 ms</span><input name="recv_window_ms" type="number" min="1000" step="100" value="5000"></div>
+          <div class="field full switches-row">
+            <label class="switch-item"><input name="testnet" type="checkbox">Testnet</label>
+            <label class="switch-item"><input name="live" type="checkbox">Live 实盘</label>
+            <label class="switch-item"><input name="square_browser_mode" type="checkbox">浏览器抓广场</label>
+          </div>
+        </div>
       </div>
     </form>
   </div>
@@ -938,7 +1240,23 @@ DASHBOARD_HTML = r"""<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 const form = $("settings");
-const buttons = ["preview","diagnose","runOnce","startLoop","stopLoop","resetState"].map($);
+const buttons = ["preview","diagnose","runOnce","startLoop","manualClose","stopLoop","resetState"].map($);
+const fixedStopInput = form.elements["fixed_stop_loss_usdt"];
+const orderAmountInput = form.elements["order_quote_amount"];
+let fixedStopEdited = false;
+
+function formatDefaultFixedStop(value) {
+  const rounded = Math.max(1, value * 0.2);
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, "");
+}
+
+fixedStopInput.addEventListener("input", () => { fixedStopEdited = true; });
+orderAmountInput.addEventListener("input", () => {
+  const orderAmount = Number(orderAmountInput.value);
+  if (!fixedStopEdited && Number.isFinite(orderAmount) && orderAmount > 0) {
+    fixedStopInput.value = formatDefaultFixedStop(orderAmount);
+  }
+});
 
 /* ── Theme toggle ── */
 function applyThemeIcon() {
@@ -964,9 +1282,26 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
   });
 });
 
+document.querySelectorAll(".settings-tab-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".settings-tab-btn").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".settings-section").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    $("settings-" + btn.dataset.settingTab).classList.add("active");
+  });
+});
+
 function payload() {
   const data = Object.fromEntries(new FormData(form).entries());
-  for (const name of ["testnet","live","square_browser_mode","fixed_stop_after_first_round_trip"]) {
+  for (const name of [
+    "testnet",
+    "live",
+    "square_browser_mode",
+    "fixed_stop_after_first_round_trip",
+    "market_filter_enabled",
+    "market_filter_require_all",
+    "account_sync_enabled"
+  ]) {
     data[name] = form.elements[name].checked;
   }
   return data;
@@ -1030,9 +1365,13 @@ function render(data) {
   const state = data.state || {};
   const pos = state.position;
   const snapshot = state.position_snapshot || null;
+  const entryGuard = state.entry_guard_snapshot || null;
+  const performance = state.performance_stats || null;
   const trades = state.trade_log || [];
   renderPosition(pos, snapshot);
   $("roundTrips").textContent = state.completed_round_trips ?? 0;
+  renderEntryGuard(entryGuard);
+  renderPerformanceStats(performance);
   renderTrades(trades);
   renderDiagnostics(data.last_diagnostics);
   $("logs").textContent = (data.logs || []).join("\n") || "--";
@@ -1090,9 +1429,11 @@ function renderPosition(pos, snapshot) {
   const qty = snapshot?.quantity ?? pos.quantity;
   const entry = snapshot?.entry_price ?? pos.entry_price;
   const current = snapshot?.current_price;
+  const highest = snapshot?.highest_price;
   metaEl.innerHTML =
     "数量 <strong>" + formatQty(qty) + "</strong>" +
     " · 成本 <strong>" + formatPrice(entry) + "</strong>" +
+    (highest ? " · 最高 <strong>" + formatPrice(highest) + "</strong>" : "") +
     (current ? " · 现价 <strong>" + formatPrice(current) + "</strong>" : "");
 
   if (!snapshot || !snapshot.market_value) {
@@ -1109,14 +1450,50 @@ function renderPosition(pos, snapshot) {
       " · 本金 " + formatMoney(snapshot.quote_spent, snapshot.quote_asset);
   }
 
-  const stopMode = snapshot?.active_stop_mode === "fixed-usdt" ? "固定金额止损" : "百分比止损";
-  const stopText = snapshot?.stop_price ? "止损价 " + formatPrice(snapshot.stop_price) : "止损价 --";
+  const stopMode = stopModeLabel(snapshot?.active_stop_mode);
+  const stopText = snapshot?.dynamic_stop_price ? "动态止损价 " + formatPrice(snapshot.dynamic_stop_price) : "止损价 --";
   const distanceText = snapshot?.stop_distance_pct ? " · 距止损 " + formatPercent(snapshot.stop_distance_pct) : "";
+  const takeProfitText = snapshot?.take_profit_price ? "止盈价 " + formatPrice(snapshot.take_profit_price) : "止盈价 --";
+  const takeProfitDistance = snapshot?.take_profit_distance_pct ? " · 距止盈 " + formatPercent(snapshot.take_profit_distance_pct) : "";
   const triggered = snapshot?.stop_triggered;
+  const takeProfitTriggered = snapshot?.take_profit_triggered;
   riskEl.innerHTML =
-    (triggered ? '<span class="c-red">已触发止损</span>' : '<span class="c-green">风控正常</span>') +
+    (triggered ? '<span class="c-red">已触发止损</span>' : (takeProfitTriggered ? '<span class="c-green">已触发止盈</span>' : '<span class="c-green">风控正常</span>')) +
     " · " + stopMode + " · " + stopText + distanceText +
+    " · " + takeProfitText + takeProfitDistance +
     ' · 交易回合 <strong id="roundTrips">' + esc($("roundTrips")?.textContent || "0") + "</strong>";
+}
+
+function renderEntryGuard(guard) {
+  const riskEl = $("riskMeta");
+  if (!guard) return;
+  const tradeLimit = Number(guard.max_daily_trades || 0);
+  const tradeText = tradeLimit > 0
+    ? "今日开仓 " + esc(guard.buy_count ?? 0) + "/" + esc(guard.max_daily_trades)
+    : "今日开仓 " + esc(guard.buy_count ?? 0);
+  const pnl = Number(guard.realized_pnl || 0);
+  const pnlClass = pnl < 0 ? "c-red" : "c-green";
+  const lossLimit = Number(guard.max_daily_loss_usdt || 0);
+  const lossText = lossLimit > 0 ? "每日亏损上限 " + formatMoney(guard.max_daily_loss_usdt, "USDT") : "每日亏损不限";
+  const blockedText = guard.entry_blocked
+    ? ' · <span class="c-red">已暂停新开仓</span>'
+    : ' · <span class="c-green">可新开仓</span>';
+  riskEl.innerHTML +=
+    " · " + tradeText +
+    ' · 今日已实现 <span class="' + pnlClass + '">' + signedMoney(guard.realized_pnl, "USDT") + "</span>" +
+    " · " + lossText +
+    " · 冷却 " + esc(guard.cooldown_minutes ?? 0) + " 分钟" +
+    blockedText;
+}
+
+function stopModeLabel(mode) {
+  const text = String(mode || "percent");
+  const parts = [];
+  if (text.includes("fixed-usdt")) parts.push("固定金额");
+  if (text.includes("trailing")) parts.push("移动止盈");
+  else if (text.includes("breakeven")) parts.push("保本止损");
+  else parts.push("百分比止损");
+  return parts.join("+");
 }
 
 function renderHotAssets(items) {
@@ -1136,12 +1513,52 @@ function renderHotAssets(items) {
   '</tbody></table>';
 }
 
+function renderPerformanceStats(stats) {
+  const el = $("performanceStats");
+  const empty = {
+    completed_trades: 0,
+    wins: 0,
+    losses: 0,
+    win_rate: 0,
+    total_pnl: 0,
+    avg_pnl: 0,
+    avg_return_pct: 0,
+    profit_factor: null,
+    best_trade: 0,
+    worst_trade: 0,
+    max_drawdown: 0,
+    current_streak: 0,
+    current_streak_type: "",
+    quote_asset: "USDT",
+  };
+  const s = Object.assign(empty, stats || {});
+  const quote = s.quote_asset || "USDT";
+  const totalPnl = Number(s.total_pnl || 0);
+  const avgPnl = Number(s.avg_pnl || 0);
+  const streakType = s.current_streak_type === "win" ? "连胜" : (s.current_streak_type === "loss" ? "连亏" : "连续");
+  const profitFactor = s.profit_factor == null ? "--" : trimNumber(s.profit_factor, 2, 2);
+  el.innerHTML = [
+    statBox("完成回合", esc(s.completed_trades || 0), "胜 " + esc(s.wins || 0) + " · 负 " + esc(s.losses || 0)),
+    statBox("胜率", formatPercent(s.win_rate), "盈亏比 " + profitFactor),
+    statBox("总盈亏", '<span class="' + (totalPnl >= 0 ? "c-green" : "c-red") + '">' + signedMoney(s.total_pnl, quote) + "</span>", "最大回撤 " + formatMoney(s.max_drawdown, quote)),
+    statBox("平均盈亏", '<span class="' + (avgPnl >= 0 ? "c-green" : "c-red") + '">' + signedMoney(s.avg_pnl, quote) + "</span>", "平均收益 " + signedPercent(s.avg_return_pct)),
+    statBox("最佳交易", '<span class="c-green">' + signedMoney(s.best_trade, quote) + "</span>", "单笔最大盈利"),
+    statBox("最差交易", '<span class="c-red">' + signedMoney(s.worst_trade, quote) + "</span>", "单笔最大亏损"),
+    statBox("毛利润", '<span class="c-green">' + formatMoney(s.gross_profit, quote) + "</span>", "毛亏损 " + formatMoney(s.gross_loss, quote)),
+    statBox("当前连续", esc(s.current_streak || 0), streakType),
+  ].join("");
+}
+
+function statBox(label, value, sub) {
+  return '<div class="stat-box"><span class="label">' + esc(label) + '</span><span class="value">' + value + '</span><span class="sub">' + sub + '</span></div>';
+}
+
 function renderTrades(items) {
   const recent = items.slice(-10).reverse();
   const el = $("trades");
   if (!recent.length) { el.className = "empty-state"; el.textContent = "暂无交易记录"; return; }
   el.className = "";
-  el.innerHTML = '<table><thead><tr><th>时间</th><th>模式</th><th>动作</th><th>标的</th><th>数量</th><th>价格</th><th>成交额</th></tr></thead><tbody>' +
+  el.innerHTML = '<table><thead><tr><th>时间</th><th>模式</th><th>动作</th><th>标的</th><th>数量</th><th>价格</th><th>手续费</th><th>成交额</th></tr></thead><tbody>' +
     recent.map(item => {
       const action = (item.action || "");
       const isBuy = action.includes("BUY");
@@ -1154,6 +1571,7 @@ function renderTrades(items) {
         '<td class="mono" style="font-weight:600">' + esc(item.symbol || "") + '</td>' +
         '<td class="mono">' + formatQty(item.quantity) + '</td>' +
         '<td class="mono">' + formatPrice(item.price) + '</td>' +
+        '<td class="mono">' + formatMoney(item.fee_amount, item.fee_asset || "") + '</td>' +
         '<td class="mono">' + formatMoney(tradeAmount(item), "") + '</td>' +
       '</tr>';
     }).join("") +
@@ -1220,13 +1638,16 @@ function signedMoney(v, quoteAsset){
   return sign+formatMoney(Math.abs(n), quoteAsset);
 }
 function tradeAmount(item){
+  const quoteAmount = asNumber(item.quote_amount);
+  if (quoteAmount !== null) return quoteAmount;
   const qty=asNumber(item.quantity);
   const price=asNumber(item.price);
   return qty!==null&&price!==null ? qty*price : null;
 }
 function actionLabel(action){
   if(action.includes("BUY"))return"买入";
-  if(action.includes("SELL"))return action.includes("STOP") ? "止损卖出" : "卖出";
+  if(action.includes("MANUAL"))return"手动平仓";
+  if(action.includes("SELL"))return action.includes("TAKE_PROFIT") ? "止盈卖出" : (action.includes("STOP") ? "止损卖出" : "卖出");
   return action || "--";
 }
 function formatTime(value){
@@ -1240,6 +1661,13 @@ $("preview").addEventListener("click", () => post("/api/preview"));
 $("diagnose").addEventListener("click", () => post("/api/square-diagnose"));
 $("runOnce").addEventListener("click", () => post("/api/run-once"));
 $("startLoop").addEventListener("click", () => post("/api/start-loop"));
+$("manualClose").addEventListener("click", () => {
+  const live = Boolean(form.elements["live"].checked);
+  const message = live
+    ? "确认实盘市价卖出当前仓位？这个操作会真实下单。"
+    : "确认模拟卖出当前仓位？";
+  if (confirm(message)) post("/api/manual-close");
+});
 $("stopLoop").addEventListener("click", () => post("/api/stop"));
 $("resetState").addEventListener("click", () => {
   if (confirm("清空 bot_state.json 中的模拟仓位和交易记录？")) post("/api/reset-dry-run-state");

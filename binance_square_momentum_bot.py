@@ -20,7 +20,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Iterable
 from urllib.parse import urlencode
@@ -38,6 +38,8 @@ except ImportError:  # The scraper can still extract from raw HTML without bs4.
 LOGGER = logging.getLogger("square-momentum-bot")
 DEFAULT_STATE_FILE = "bot_state.json"
 DEFAULT_BASE_URL = "https://api.binance.com"
+DEFAULT_FIXED_STOP_LOSS_RATIO = Decimal("0.2")
+MIN_FIXED_STOP_LOSS_USDT = Decimal("1")
 DEFAULT_SQUARE_URLS = (
     "https://www.binance.com/en/square",
     "https://www.binance.com/en/square/top",
@@ -162,9 +164,26 @@ class BotConfig:
     poll_seconds: int = 300
     recv_window_ms: int = 5000
     initial_stop_loss_pct: Decimal = Decimal("20")
-    fixed_stop_loss_usdt: Decimal = Decimal("200")
-    fixed_stop_after_first_round_trip: bool = True
+    take_profit_pct: Decimal = Decimal("12")
+    breakeven_trigger_pct: Decimal = Decimal("6")
+    breakeven_offset_pct: Decimal = Decimal("0")
+    trailing_start_pct: Decimal = Decimal("8")
+    trailing_stop_pct: Decimal = Decimal("5")
+    fixed_stop_loss_usdt: Decimal = Decimal("10")
+    fixed_stop_after_first_round_trip: bool = False
     fixed_stop_equity_usdt: Decimal | None = None
+    cooldown_minutes: int = 30
+    max_daily_trades: int = 5
+    max_daily_loss_usdt: Decimal = Decimal("25")
+    fee_rate_pct: Decimal = Decimal("0.1")
+    slippage_pct: Decimal = Decimal("0.05")
+    asset_whitelist: tuple[str, ...] = ()
+    asset_blacklist: tuple[str, ...] = ()
+    market_filter_enabled: bool = False
+    market_filter_assets: tuple[str, ...] = ("BTC", "ETH")
+    market_filter_min_change_pct: Decimal = Decimal("-1")
+    market_filter_require_all: bool = False
+    account_sync_enabled: bool = True
     state_file: str = DEFAULT_STATE_FILE
     dry_run: bool = True
     square_urls: tuple[str, ...] = DEFAULT_SQUARE_URLS
@@ -195,11 +214,20 @@ class TradeCandidate:
 
 
 @dataclass
+class OrderRules:
+    symbol: str
+    min_qty: Decimal = Decimal("0")
+    step_size: Decimal = Decimal("0.00000001")
+    min_notional: Decimal = Decimal("0")
+
+
+@dataclass
 class PositionState:
     symbol: str = ""
     base_asset: str = ""
     quantity: str = "0"
     entry_price: str = "0"
+    highest_price: str = "0"
     quote_spent: str = "0"
     opened_at: str = ""
     order_id: int | None = None
@@ -569,6 +597,7 @@ class LongOnlyMomentumBot:
     def run_once(self) -> None:
         try:
             self.client.sync_time()
+            self._sync_open_position_with_account()
             self._manage_open_position()
             if self.state.position is None:
                 self._scan_and_enter()
@@ -585,33 +614,96 @@ class LongOnlyMomentumBot:
         qty = Decimal(position.quantity)
         entry_price = Decimal(position.entry_price)
         last_price = self.client.ticker_price(symbol)
+        highest_price = decimal_from_any(position.highest_price) or entry_price
+        highest_updated = False
+        if last_price > highest_price:
+            highest_price = last_price
+            position.highest_price = format_decimal(highest_price)
+            highest_updated = True
+        unrealized_pnl = (last_price - entry_price) * qty
         unrealized_loss = max(Decimal("0"), (entry_price - last_price) * qty)
         pct_stop = entry_price * (Decimal("1") - self.config.initial_stop_loss_pct / Decimal("100"))
+        dynamic_stop, dynamic_stop_mode = self._dynamic_stop_price(entry_price, highest_price, pct_stop)
+        take_profit_price = entry_price * (Decimal("1") + self.config.take_profit_pct / Decimal("100"))
         fixed_mode = self._fixed_stop_enabled()
 
         LOGGER.info(
-            "position %s qty=%s entry=%s last=%s loss=%s stop_mode=%s",
+            "position %s qty=%s entry=%s last=%s high=%s pnl=%s loss=%s stop_mode=%s dynamic_stop=%s take_profit=%s",
             symbol,
             qty,
             entry_price,
             last_price,
+            highest_price,
+            unrealized_pnl,
             unrealized_loss,
-            "fixed-usdt" if fixed_mode else "percent",
+            "fixed-usdt+" + dynamic_stop_mode if fixed_mode else dynamic_stop_mode,
+            dynamic_stop,
+            take_profit_price,
         )
 
-        should_stop = unrealized_loss >= self.config.fixed_stop_loss_usdt if fixed_mode else last_price <= pct_stop
-        if not should_stop:
+        should_price_stop = last_price <= dynamic_stop
+        should_fixed_stop = fixed_mode and unrealized_loss >= self.config.fixed_stop_loss_usdt
+        should_stop = should_fixed_stop or should_price_stop
+        should_take_profit = self.config.take_profit_pct > 0 and last_price >= take_profit_price
+        if should_stop:
+            exit_label = "stop loss"
+            dry_action = "DRY_RUN_STOP_SELL"
+            live_action = "STOP_SELL"
+        elif should_take_profit:
+            exit_label = "take profit"
+            dry_action = "DRY_RUN_TAKE_PROFIT_SELL"
+            live_action = "TAKE_PROFIT_SELL"
+        else:
+            if highest_updated:
+                self._touch_state()
             return
 
-        LOGGER.warning("stop loss triggered for %s", symbol)
+        self._close_position(position, last_price, dry_action, live_action, exit_label)
+
+    def manual_close_position(self) -> None:
+        position = self.state.position
+        if position is None or not position.symbol:
+            raise BinanceAPIError("no open position to close")
+        last_price = self.client.ticker_price(position.symbol)
+        self._close_position(position, last_price, "DRY_RUN_MANUAL_SELL", "MANUAL_SELL", "manual close")
+
+    def _close_position(
+        self,
+        position: PositionState,
+        last_price: Decimal,
+        dry_action: str,
+        live_action: str,
+        exit_label: str,
+    ) -> None:
+        symbol = position.symbol
+        qty = Decimal(position.quantity)
+        LOGGER.warning("%s triggered for %s", exit_label, symbol)
         sell_qty = self._safe_sell_quantity(symbol, position.base_asset, qty)
         if sell_qty <= 0:
             LOGGER.error("no sellable balance for %s; clearing local position is unsafe, keeping state", symbol)
             return
+        order_check_price = (
+            last_price * (Decimal("1") - self.config.slippage_pct / Decimal("100"))
+            if self.config.dry_run
+            else last_price
+        )
+        sell_error = self._sell_order_error(symbol, sell_qty, order_check_price)
+        if sell_error:
+            LOGGER.error("cannot close %s: %s; keeping state", symbol, sell_error)
+            return
 
         if self.config.dry_run:
-            LOGGER.warning("[dry-run] would SELL %s %s at market", sell_qty, symbol)
-            self._append_trade("DRY_RUN_STOP_SELL", symbol, sell_qty, last_price, None)
+            fill_price, fee_amount, quote_received = self._dry_run_sell_fill(last_price, sell_qty)
+            LOGGER.warning("[dry-run] would SELL %s %s at market price=%s fee=%s", sell_qty, symbol, fill_price, fee_amount)
+            self._append_trade(
+                dry_action,
+                symbol,
+                sell_qty,
+                fill_price,
+                None,
+                fee_amount=fee_amount,
+                quote_amount=quote_received,
+            )
             self.state.completed_round_trips += 1
             self.state.position = None
             self._touch_state()
@@ -619,12 +711,32 @@ class LongOnlyMomentumBot:
 
         order = self.client.market_sell_quantity(symbol, sell_qty)
         avg_price = average_fill_price(order) or last_price
-        self._append_trade("STOP_SELL", symbol, sell_qty, avg_price, order)
-        self.state.completed_round_trips += 1
-        self.state.position = None
+        self._append_trade(live_action, symbol, sell_qty, avg_price, order)
+        remaining_qty = Decimal("0")
+        if self.config.account_sync_enabled:
+            remaining_qty = round_down_to_step(
+                self._account_asset_balance(position.base_asset),
+                symbol_step_size(self.client.exchange_info(), symbol),
+            )
+        if Decimal("0") < remaining_qty < qty:
+            LOGGER.warning("account sync kept residual %s quantity after sell: %s", symbol, remaining_qty)
+            position.quantity = format_decimal(remaining_qty)
+            position.quote_spent = format_decimal(remaining_qty * Decimal(position.entry_price))
+        else:
+            self.state.completed_round_trips += 1
+            self.state.position = None
         self._touch_state()
 
     def _scan_and_enter(self) -> None:
+        daily_guard = self._daily_entry_guard_reason()
+        if daily_guard:
+            LOGGER.warning("entry skipped: %s", daily_guard)
+            return
+        market_guard = self._market_filter_reason()
+        if market_guard:
+            LOGGER.warning("entry skipped: %s", market_guard)
+            return
+
         symbols = self.client.tradable_quote_symbols(self.config.quote_asset)
         base_assets = {data["baseAsset"] for data in symbols.values()}
         posts = self.square.fetch_top_posts(self.config.top_post_limit, browser_mode=self.config.square_browser_mode)
@@ -640,18 +752,23 @@ class LongOnlyMomentumBot:
         if not candidates:
             LOGGER.info("no candidate passed momentum filters")
             return
-        candidate = candidates[0]
+        candidate = self._first_allowed_candidate(candidates)
+        if candidate is None:
+            LOGGER.info("all candidates are blocked by entry guards")
+            return
 
         LOGGER.info("selected candidate: %s", asdict(candidate))
         if self.config.dry_run:
+            fill_price, qty, fee_amount, quote_spent = self._dry_run_buy_fill(candidate.last_price)
             LOGGER.warning(
-                "[dry-run] would BUY %s with %s %s",
+                "[dry-run] would BUY %s with %s %s price=%s fee=%s",
                 candidate.symbol,
                 self.config.order_quote_amount,
                 self.config.quote_asset,
+                fill_price,
+                fee_amount,
             )
-            qty = self.config.order_quote_amount / candidate.last_price
-            self._open_position(candidate, qty, candidate.last_price, None)
+            self._open_position(candidate, qty, fill_price, None, quote_spent=quote_spent, fee_amount=fee_amount)
             return
 
         order = self.client.market_buy_quote(candidate.symbol, self.config.order_quote_amount)
@@ -659,6 +776,14 @@ class LongOnlyMomentumBot:
         avg_price = average_fill_price(order) or candidate.last_price
         if qty <= 0:
             raise BinanceAPIError(f"market buy returned zero executedQty: {order}")
+        if self.config.account_sync_enabled:
+            synced_qty = round_down_to_step(
+                self._account_asset_balance(candidate.base_asset),
+                symbol_step_size(self.client.exchange_info(), candidate.symbol),
+            )
+            if Decimal("0") < synced_qty < qty:
+                LOGGER.warning("account sync reduced buy quantity for %s from %s to %s", candidate.symbol, qty, synced_qty)
+                qty = synced_qty
         self._open_position(candidate, qty, avg_price, order)
 
     def _select_trade_candidate(
@@ -687,6 +812,8 @@ class LongOnlyMomentumBot:
                 continue
             base_asset = symbol_info["baseAsset"]
             if not is_momentum_asset(base_asset, self.config.quote_asset):
+                continue
+            if not self._asset_allowed(symbol, base_asset):
                 continue
 
             price_change = Decimal(str(ticker.get("priceChangePercent", "0")))
@@ -771,19 +898,161 @@ class LongOnlyMomentumBot:
         quantity: Decimal,
         entry_price: Decimal,
         order: dict[str, Any] | None,
+        quote_spent: Decimal | None = None,
+        fee_amount: Decimal | None = None,
     ) -> None:
+        spent = quote_spent if quote_spent is not None else quantity * entry_price
         self.state.position = PositionState(
             symbol=candidate.symbol,
             base_asset=candidate.base_asset,
             quantity=format_decimal(quantity),
             entry_price=format_decimal(entry_price),
-            quote_spent=format_decimal(quantity * entry_price),
+            quote_spent=format_decimal(spent),
+            highest_price=format_decimal(entry_price),
             opened_at=utc_now(),
             order_id=int(order["orderId"]) if order and "orderId" in order else None,
         )
         self.state.first_buy_done = True
-        self._append_trade("BUY", candidate.symbol, quantity, entry_price, order)
+        self._append_trade("BUY", candidate.symbol, quantity, entry_price, order, fee_amount=fee_amount, quote_amount=spent)
         self._touch_state()
+
+    def _dynamic_stop_price(self, entry_price: Decimal, highest_price: Decimal, pct_stop: Decimal) -> tuple[Decimal, str]:
+        return dynamic_stop_price(self.config, entry_price, highest_price, pct_stop)
+
+    def _daily_entry_guard_reason(self) -> str | None:
+        stats = self._daily_trade_stats()
+        if self.config.max_daily_trades > 0 and stats["buy_count"] >= self.config.max_daily_trades:
+            return f"daily trade limit reached ({stats['buy_count']}/{self.config.max_daily_trades})"
+        if self.config.max_daily_loss_usdt > 0 and stats["realized_pnl"] <= -self.config.max_daily_loss_usdt:
+            return f"daily loss limit reached ({stats['realized_pnl']} {self.config.quote_asset})"
+        return None
+
+    def _first_allowed_candidate(self, candidates: list[TradeCandidate]) -> TradeCandidate | None:
+        for candidate in candidates:
+            cooldown_until = self._cooldown_until(candidate.symbol)
+            if cooldown_until is None:
+                buy_error = self._buy_order_error(candidate.symbol, self.config.order_quote_amount, candidate.last_price)
+                if buy_error:
+                    LOGGER.info("candidate %s skipped by order rules: %s", candidate.symbol, buy_error)
+                    continue
+                return candidate
+            LOGGER.info("candidate %s skipped for cooldown until %s", candidate.symbol, cooldown_until.isoformat())
+        return None
+
+    def _asset_allowed(self, symbol: str, base_asset: str) -> bool:
+        whitelist = {item.upper() for item in self.config.asset_whitelist}
+        blacklist = {item.upper() for item in self.config.asset_blacklist}
+        normalized_symbol = symbol.upper()
+        normalized_base = base_asset.upper()
+        if whitelist and normalized_symbol not in whitelist and normalized_base not in whitelist:
+            LOGGER.info("candidate %s skipped by whitelist", symbol)
+            return False
+        if normalized_symbol in blacklist or normalized_base in blacklist:
+            LOGGER.info("candidate %s skipped by blacklist", symbol)
+            return False
+        return True
+
+    def _market_filter_reason(self) -> str | None:
+        if not self.config.market_filter_enabled:
+            return None
+        assets = [item.upper() for item in self.config.market_filter_assets if item.strip()]
+        if not assets:
+            return None
+        changes: dict[str, Decimal] = {}
+        for ticker in self.client.ticker_24hr():
+            symbol = str(ticker.get("symbol", "")).upper()
+            for asset in assets:
+                if symbol == f"{asset}{self.config.quote_asset}".upper():
+                    changes[asset] = Decimal(str(ticker.get("priceChangePercent", "0")))
+        missing = [asset for asset in assets if asset not in changes]
+        if missing:
+            return f"market filter data missing for {', '.join(missing)}"
+        passed = {
+            asset: change >= self.config.market_filter_min_change_pct
+            for asset, change in changes.items()
+        }
+        ok = all(passed.values()) if self.config.market_filter_require_all else any(passed.values())
+        if ok:
+            LOGGER.info("market filter passed: %s", changes)
+            return None
+        detail = ", ".join(f"{asset}={changes[asset]}%" for asset in assets)
+        mode = "all" if self.config.market_filter_require_all else "any"
+        return f"market filter blocked entry ({mode} of {assets} must be >= {self.config.market_filter_min_change_pct}%): {detail}"
+
+    def _sync_open_position_with_account(self) -> None:
+        if self.config.dry_run or not self.config.account_sync_enabled:
+            return
+        position = self.state.position
+        if position is None or not position.symbol:
+            return
+        try:
+            account_qty = self._account_asset_balance(position.base_asset)
+            wanted_qty = Decimal(position.quantity)
+            step_size = symbol_step_size(self.client.exchange_info(), position.symbol)
+            synced_qty = round_down_to_step(account_qty, step_size)
+            if synced_qty <= 0:
+                LOGGER.warning("account sync cleared local position %s; no %s balance found", position.symbol, position.base_asset)
+                self._append_trade("ACCOUNT_SYNC_CLEAR", position.symbol, wanted_qty, Decimal(position.entry_price), None)
+                self.state.position = None
+                self._touch_state()
+                return
+            if synced_qty < wanted_qty:
+                LOGGER.warning("account sync reduced %s local quantity from %s to %s", position.symbol, wanted_qty, synced_qty)
+                position.quantity = format_decimal(synced_qty)
+                position.quote_spent = format_decimal(synced_qty * Decimal(position.entry_price))
+                self._touch_state()
+        except Exception:
+            LOGGER.exception("account sync failed; keeping local position state")
+
+    def _account_asset_balance(self, asset: str) -> Decimal:
+        account = self.client.account()
+        for item in account.get("balances", []):
+            if item.get("asset") == asset:
+                return Decimal(str(item.get("free", "0"))) + Decimal(str(item.get("locked", "0")))
+        return Decimal("0")
+
+    def _cooldown_until(self, symbol: str) -> datetime | None:
+        if self.config.cooldown_minutes <= 0:
+            return None
+        now = datetime.now(timezone.utc)
+        cooldown_seconds = self.config.cooldown_minutes * 60
+        for item in reversed(self.state.trade_log):
+            action = str(item.get("action", ""))
+            if item.get("symbol") != symbol or "SELL" not in action:
+                continue
+            closed_at = parse_timestamp(item.get("ts"))
+            if closed_at is None:
+                continue
+            until = closed_at + timedelta(seconds=cooldown_seconds)
+            if until > now:
+                return until
+            return None
+        return None
+
+    def _daily_trade_stats(self) -> dict[str, Decimal | int]:
+        today = datetime.now(timezone.utc).date()
+        buy_count = 0
+        realized_pnl = Decimal("0")
+        open_cost: Decimal | None = None
+
+        for item in self.state.trade_log:
+            action = str(item.get("action", ""))
+            ts = parse_timestamp(item.get("ts"))
+            qty = decimal_from_any(item.get("quantity"))
+            price = decimal_from_any(item.get("price"))
+            if qty is None or price is None:
+                continue
+            amount = decimal_from_any(item.get("quote_amount")) or qty * price
+            if "BUY" in action:
+                open_cost = amount
+                if ts and ts.date() == today:
+                    buy_count += 1
+            elif "SELL" in action:
+                if ts and ts.date() == today and open_cost is not None:
+                    realized_pnl += amount - open_cost
+                open_cost = None
+
+        return {"buy_count": buy_count, "realized_pnl": realized_pnl}
 
     def _fixed_stop_enabled(self) -> bool:
         if self.config.fixed_stop_after_first_round_trip and self.state.completed_round_trips > 0:
@@ -815,6 +1084,41 @@ class LongOnlyMomentumBot:
         step_size = symbol_step_size(self.client.exchange_info(), symbol)
         return round_down_to_step(qty, step_size)
 
+    def _buy_order_error(self, symbol: str, quote_amount: Decimal, price: Decimal) -> str | None:
+        rules = symbol_order_rules(self.client.exchange_info(), symbol)
+        if rules.min_notional > 0 and quote_amount < rules.min_notional:
+            return f"quote amount {quote_amount} is below min notional {rules.min_notional}"
+        estimate_price = price * (Decimal("1") + self.config.slippage_pct / Decimal("100")) if self.config.dry_run else price
+        estimate_quote = max(Decimal("0"), quote_amount - (quote_amount * self.config.fee_rate_pct / Decimal("100")))
+        estimated_qty = estimate_quote / estimate_price if estimate_price > 0 else Decimal("0")
+        if rules.min_qty > 0 and estimated_qty < rules.min_qty:
+            return f"estimated quantity {estimated_qty} is below min quantity {rules.min_qty}"
+        return None
+
+    def _sell_order_error(self, symbol: str, quantity: Decimal, price: Decimal) -> str | None:
+        rules = symbol_order_rules(self.client.exchange_info(), symbol)
+        if rules.min_qty > 0 and quantity < rules.min_qty:
+            return f"quantity {quantity} is below min quantity {rules.min_qty}"
+        notional = quantity * price
+        if rules.min_notional > 0 and notional < rules.min_notional:
+            return f"notional {notional} is below min notional {rules.min_notional}"
+        return None
+
+    def _dry_run_buy_fill(self, market_price: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        fill_price = market_price * (Decimal("1") + self.config.slippage_pct / Decimal("100"))
+        gross_quote = self.config.order_quote_amount
+        fee_amount = gross_quote * self.config.fee_rate_pct / Decimal("100")
+        net_quote = max(Decimal("0"), gross_quote - fee_amount)
+        quantity = net_quote / fill_price if fill_price > 0 else Decimal("0")
+        return fill_price, quantity, fee_amount, gross_quote
+
+    def _dry_run_sell_fill(self, market_price: Decimal, quantity: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+        fill_price = market_price * (Decimal("1") - self.config.slippage_pct / Decimal("100"))
+        gross_quote = quantity * fill_price
+        fee_amount = gross_quote * self.config.fee_rate_pct / Decimal("100")
+        quote_received = max(Decimal("0"), gross_quote - fee_amount)
+        return fill_price, fee_amount, quote_received
+
     def _append_trade(
         self,
         action: str,
@@ -822,18 +1126,24 @@ class LongOnlyMomentumBot:
         quantity: Decimal,
         price: Decimal,
         raw_order: dict[str, Any] | None,
+        fee_amount: Decimal | None = None,
+        quote_amount: Decimal | None = None,
     ) -> None:
-        self.state.trade_log.append(
-            {
-                "ts": utc_now(),
-                "action": action,
-                "symbol": symbol,
-                "quantity": format_decimal(quantity),
-                "price": format_decimal(price),
-                "dry_run": self.config.dry_run,
-                "order": raw_order,
-            }
-        )
+        record = {
+            "ts": utc_now(),
+            "action": action,
+            "symbol": symbol,
+            "quantity": format_decimal(quantity),
+            "price": format_decimal(price),
+            "dry_run": self.config.dry_run,
+            "order": raw_order,
+        }
+        if fee_amount is not None:
+            record["fee_amount"] = format_decimal(fee_amount)
+            record["fee_asset"] = self.config.quote_asset
+        if quote_amount is not None:
+            record["quote_amount"] = format_decimal(quote_amount)
+        self.state.trade_log.append(record)
         self.state.trade_log = self.state.trade_log[-100:]
 
     def _touch_state(self) -> None:
@@ -1063,14 +1373,30 @@ def average_fill_price(order: dict[str, Any]) -> Decimal | None:
     return None
 
 
-def symbol_step_size(exchange_info: dict[str, Any], symbol: str) -> Decimal:
+def symbol_order_rules(exchange_info: dict[str, Any], symbol: str) -> OrderRules:
+    rules = OrderRules(symbol=symbol)
     for item in exchange_info.get("symbols", []):
         if item.get("symbol") != symbol:
             continue
         for filt in item.get("filters", []):
-            if filt.get("filterType") == "LOT_SIZE":
-                return Decimal(str(filt["stepSize"]))
-    return Decimal("0.00000001")
+            filter_type = filt.get("filterType")
+            if filter_type in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
+                step_size = Decimal(str(filt.get("stepSize", "0")))
+                min_qty = Decimal(str(filt.get("minQty", "0")))
+                if step_size > 0:
+                    rules.step_size = step_size
+                if min_qty > 0:
+                    rules.min_qty = max(rules.min_qty, min_qty)
+            elif filter_type in {"MIN_NOTIONAL", "NOTIONAL"}:
+                min_notional = Decimal(str(filt.get("minNotional", "0")))
+                if min_notional > 0:
+                    rules.min_notional = max(rules.min_notional, min_notional)
+        return rules
+    return rules
+
+
+def symbol_step_size(exchange_info: dict[str, Any], symbol: str) -> Decimal:
+    return symbol_order_rules(exchange_info, symbol).step_size
 
 
 def round_down_to_step(quantity: Decimal, step: Decimal) -> Decimal:
@@ -1092,6 +1418,27 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def decimal_from_any(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
 def decimal_env(name: str, default: str | None = None) -> Decimal | None:
     value = os.getenv(name, default)
     if value is None or value == "":
@@ -1106,6 +1453,44 @@ def bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def tuple_env(name: str, default: str = "") -> tuple[str, ...]:
+    return parse_symbol_list(os.getenv(name, default))
+
+
+def parse_symbol_list(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    else:
+        raw_items = list(value)
+    return tuple(item.strip().upper() for item in raw_items if str(item).strip())
+
+
+def default_fixed_stop_loss_usdt(order_quote_amount: Decimal) -> Decimal:
+    return max(MIN_FIXED_STOP_LOSS_USDT, order_quote_amount * DEFAULT_FIXED_STOP_LOSS_RATIO)
+
+
+def dynamic_stop_price(config: BotConfig, entry_price: Decimal, highest_price: Decimal, pct_stop: Decimal) -> tuple[Decimal, str]:
+    stop_price = pct_stop
+    stop_mode = "percent"
+    highest_gain_pct = (highest_price - entry_price) / entry_price * Decimal("100")
+
+    if config.breakeven_trigger_pct > 0 and highest_gain_pct >= config.breakeven_trigger_pct:
+        breakeven_stop = entry_price * (Decimal("1") + config.breakeven_offset_pct / Decimal("100"))
+        if breakeven_stop > stop_price:
+            stop_price = breakeven_stop
+            stop_mode = "breakeven"
+
+    if config.trailing_stop_pct > 0 and highest_gain_pct >= config.trailing_start_pct:
+        trailing_stop = highest_price * (Decimal("1") - config.trailing_stop_pct / Decimal("100"))
+        if trailing_stop > stop_price:
+            stop_price = trailing_stop
+            stop_mode = "trailing"
+
+    return stop_price, stop_mode
+
+
 def load_config(args: argparse.Namespace) -> BotConfig:
     square_urls = tuple(
         item.strip()
@@ -1116,12 +1501,17 @@ def load_config(args: argparse.Namespace) -> BotConfig:
     if args.testnet:
         base_url = "https://testnet.binance.vision"
 
+    order_quote_amount = decimal_env("ORDER_QUOTE_USDT", "50") or Decimal("50")
+    fixed_stop_loss_usdt = decimal_env("FIXED_STOP_LOSS_USDT")
+    if fixed_stop_loss_usdt is None:
+        fixed_stop_loss_usdt = default_fixed_stop_loss_usdt(order_quote_amount)
+
     return BotConfig(
         api_key=os.getenv("BINANCE_API_KEY", ""),
         api_secret=os.getenv("BINANCE_API_SECRET", ""),
         base_url=base_url,
         quote_asset=os.getenv("QUOTE_ASSET", "USDT"),
-        order_quote_amount=decimal_env("ORDER_QUOTE_USDT", "50") or Decimal("50"),
+        order_quote_amount=order_quote_amount,
         min_quote_volume=decimal_env("MIN_QUOTE_VOLUME_USDT", "5000000") or Decimal("5000000"),
         min_price_change_percent=decimal_env("MIN_PRICE_CHANGE_PERCENT", "3") or Decimal("3"),
         min_volatility_percent=decimal_env("MIN_VOLATILITY_PERCENT", "5") or Decimal("5"),
@@ -1130,9 +1520,26 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         poll_seconds=int(os.getenv("POLL_SECONDS", "300")),
         recv_window_ms=int(os.getenv("RECV_WINDOW_MS", "5000")),
         initial_stop_loss_pct=decimal_env("INITIAL_STOP_LOSS_PCT", "20") or Decimal("20"),
-        fixed_stop_loss_usdt=decimal_env("FIXED_STOP_LOSS_USDT", "200") or Decimal("200"),
-        fixed_stop_after_first_round_trip=bool_env("FIXED_STOP_AFTER_FIRST_ROUND_TRIP", True),
+        take_profit_pct=decimal_env("TAKE_PROFIT_PCT", "12"),
+        breakeven_trigger_pct=decimal_env("BREAKEVEN_TRIGGER_PCT", "6"),
+        breakeven_offset_pct=decimal_env("BREAKEVEN_OFFSET_PCT", "0"),
+        trailing_start_pct=decimal_env("TRAILING_START_PCT", "8"),
+        trailing_stop_pct=decimal_env("TRAILING_STOP_PCT", "5"),
+        fixed_stop_loss_usdt=fixed_stop_loss_usdt,
+        fixed_stop_after_first_round_trip=bool_env("FIXED_STOP_AFTER_FIRST_ROUND_TRIP", False),
         fixed_stop_equity_usdt=decimal_env("FIXED_STOP_EQUITY_USDT"),
+        cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "30")),
+        max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "5")),
+        max_daily_loss_usdt=decimal_env("MAX_DAILY_LOSS_USDT", "25"),
+        fee_rate_pct=decimal_env("FEE_RATE_PCT", "0.1"),
+        slippage_pct=decimal_env("SLIPPAGE_PCT", "0.05"),
+        asset_whitelist=tuple_env("ASSET_WHITELIST"),
+        asset_blacklist=tuple_env("ASSET_BLACKLIST"),
+        market_filter_enabled=bool_env("MARKET_FILTER_ENABLED", False),
+        market_filter_assets=tuple_env("MARKET_FILTER_ASSETS", "BTC,ETH"),
+        market_filter_min_change_pct=decimal_env("MARKET_FILTER_MIN_CHANGE_PCT", "-1"),
+        market_filter_require_all=bool_env("MARKET_FILTER_REQUIRE_ALL", False),
+        account_sync_enabled=bool_env("ACCOUNT_SYNC_ENABLED", True),
         state_file=os.getenv("STATE_FILE", DEFAULT_STATE_FILE),
         dry_run=not args.live,
         square_urls=square_urls,
