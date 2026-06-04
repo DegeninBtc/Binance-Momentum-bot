@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  code-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: code-server-dev
+    ports:
+      - "8080:8080" # Web IDE 网页版 VS Code 访问端口
+      - "5173:5173" # React Vite 前端开发调试端口
+      - "8000:8000" # Python 网页 Dashboard 后端运行端口
+    environment:
+      # 进入 Web IDE 的登录密码，请更改为安全的密码
+      - PASSWORD=your_secure_password
+      # 容器内 coder 用户的 sudo 密码
+      - SUDO_PASSWORD=your_secure_sudo_password
+      
+      # ==========================================
+      # 网络代理配置（如果服务器在国内，且有代理工具，请取消注释并按需配置）
+      # ==========================================
+      # - HTTP_PROXY=http://host.docker.internal:7890
+      # - HTTPS_PROXY=http://host.docker.internal:7890
+      # - ALL_PROXY=socks5://host.docker.internal:7890
+      # - NO_PROXY=localhost,127.0.0.1
+    volumes:
+      # 挂载名为 code_server_home 的 Docker 卷，持久化 VS Code 插件、配置、SSH 密钥和 shell 历史
+      - code_server_home:/home/coder
+      # 挂载上级目录（即整个项目的代码库）到容器的工程目录
+      - ..:/home/coder/project
+    extra_hosts:
+      # 允许容器通过 host.docker.internal 访问宿主机上运行的服务（例如代理软件）
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  code_server_home:
