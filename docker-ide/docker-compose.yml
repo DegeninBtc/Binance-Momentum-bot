@@ -8,10 +8,11 @@ services:
     container_name: code-server-dev
     ports:
       - "8080:8080" # Web IDE 网页版 VS Code 访问端口
+      - "2222:22"   # SSH 连接端口（用于本地 VS Code Remote-SSH / AI 助手连接）
       - "5173:5173" # React Vite 前端开发调试端口
       - "8000:8000" # Python 网页 Dashboard 后端运行端口
     environment:
-      # 进入 Web IDE 的登录密码，请更改为安全的密码
+      # 进入 Web IDE 和 SSH 连接的共同登录密码，请更改为安全的密码
       - PASSWORD=luudad666.
       # 容器内 coder 用户的 sudo 密码
       - SUDO_PASSWORD=luudad666.
@@ -24,7 +25,7 @@ services:
       # - ALL_PROXY=socks5://host.docker.internal:7890
       # - NO_PROXY=localhost,127.0.0.1
     volumes:
-      # 挂载名为 code_server_home 的 Docker 卷，持久化 VS Code 插件、配置、SSH 密钥和 shell 历史
+      # 挂载名为 code_server_home 的 Docker 卷，持久化 VS Code 插件、配置、SSH 密钥和 shell 历史记录
       - code_server_home:/home/coder
       # 挂载上级目录（即整个项目的代码库）到容器的工程目录
       - ..:/home/coder/project
