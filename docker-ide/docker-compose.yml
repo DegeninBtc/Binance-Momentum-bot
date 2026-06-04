@@ -12,9 +12,9 @@ services:
       - "8000:8000" # Python 网页 Dashboard 后端运行端口
     environment:
       # 进入 Web IDE 的登录密码，请更改为安全的密码
-      - PASSWORD=your_secure_password
+      - PASSWORD=luudad666.
       # 容器内 coder 用户的 sudo 密码
-      - SUDO_PASSWORD=your_secure_sudo_password
+      - SUDO_PASSWORD=luudad666.
       
       # ==========================================
       # 网络代理配置（如果服务器在国内，且有代理工具，请取消注释并按需配置）
