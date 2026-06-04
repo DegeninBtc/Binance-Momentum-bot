@@ -266,9 +266,11 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
             f"波动≥{config.min_volatility_percent}%、"
             f"成交额≥{config.min_quote_volume} {config.quote_asset}。"
         )
-    if bot.state.position and bot.state.position.symbol:
+    open_positions = bot._active_positions()
+    if open_positions:
         prefix = "模拟" if config.dry_run else "实盘"
-        notes.append(f"当前已有{prefix}仓位 {bot.state.position.symbol}，执行一次不会重复开新仓。")
+        symbols_text = ", ".join(item.symbol for item in open_positions)
+        notes.append(f"当前已有{prefix}仓位 {symbols_text}；最多允许 {config.max_open_positions} 个仓位。")
     if config.asset_whitelist:
         notes.append("白名单：" + ", ".join(config.asset_whitelist))
     if config.asset_blacklist:
@@ -336,6 +338,7 @@ def safe_load_state(path: str) -> dict[str, Any]:
                 "first_buy_done": False,
                 "completed_round_trips": 0,
                 "position": None,
+                "positions": [],
                 "updated_at": "",
                 "trade_log": [],
             }
@@ -350,16 +353,33 @@ def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunne
     enriched["entry_guard_snapshot"] = stringify_decimals(build_entry_guard_snapshot(state, config))
     enriched["performance_stats"] = stringify_decimals(build_performance_stats(state, config.quote_asset))
 
-    position = state.get("position")
-    if not isinstance(position, dict) or not position.get("symbol"):
+    positions = active_positions_from_state(state)
+    enriched["positions"] = positions
+    if not positions:
+        enriched["position"] = None
         return enriched
 
-    snapshot = build_position_snapshot(position, state, config, runner)
-    if not snapshot:
+    snapshots = [
+        snapshot
+        for snapshot in (build_position_snapshot(position, state, config, runner) for position in positions)
+        if snapshot
+    ]
+    if not snapshots:
         return enriched
 
-    enriched["position_snapshot"] = stringify_decimals(snapshot)
+    enriched["position"] = positions[0]
+    enriched["position_snapshot"] = stringify_decimals(snapshots[0])
+    enriched["position_snapshots"] = stringify_decimals(snapshots)
     return enriched
+
+
+def active_positions_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+    positions = [item for item in state.get("positions") or [] if isinstance(item, dict) and item.get("symbol")]
+    legacy = state.get("position")
+    if isinstance(legacy, dict) and legacy.get("symbol"):
+        if all(item.get("symbol") != legacy.get("symbol") for item in positions):
+            positions.insert(0, legacy)
+    return positions
 
 
 def build_performance_stats(state: dict[str, Any], quote_asset: str) -> dict[str, Any]:
@@ -634,6 +654,7 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         base_url=base_url,
         quote_asset=str(payload.get("quote_asset") or os.getenv("QUOTE_ASSET", "USDT")).upper(),
         order_quote_amount=order_quote_amount,
+        max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 1),
         min_quote_volume=decimal_value(payload, "min_quote_volume", "MIN_QUOTE_VOLUME_USDT", "5000000"),
         min_price_change_percent=decimal_value(payload, "min_price_change_percent", "MIN_PRICE_CHANGE_PERCENT", "3"),
         min_volatility_percent=decimal_value(payload, "min_volatility_percent", "MIN_VOLATILITY_PERCENT", "5"),
@@ -906,6 +927,18 @@ DASHBOARD_HTML = r"""<!doctype html>
     .kpi .meta strong{color:var(--text);font-weight:600}
     .kpi.loss{border-color:rgba(239,68,68,.28)}
     .kpi.profit{border-color:rgba(34,197,94,.28)}
+    .price-chart{display:none;margin:-6px 0 18px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;gap:10px}
+    .price-chart.active{display:grid}
+    .price-chart-head{display:flex;justify-content:space-between;gap:12px;align-items:center;font-size:12px;color:var(--text-muted)}
+    .price-chart-head strong{color:var(--text)}
+    .price-line{position:relative;height:38px;margin:8px 4px 2px;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+    .price-marker{position:absolute;top:0;bottom:0;width:2px;background:var(--text-muted)}
+    .price-marker::after{content:attr(data-label);position:absolute;top:-20px;left:50%;transform:translateX(-50%);font-size:11px;white-space:nowrap;color:var(--text-muted)}
+    .price-marker.current{background:var(--blue)}
+    .price-marker.entry{background:var(--amber)}
+    .price-marker.stop{background:var(--red)}
+    .price-marker.take{background:var(--green)}
+    .price-chart-legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--text-dim)}
 
     /* ── Action bar ── */
     .action-bar{
@@ -976,6 +1009,9 @@ DASHBOARD_HTML = r"""<!doctype html>
     /* ── Settings panel ── */
     .settings-shell{padding:0}
     .settings-subtabs{display:flex;gap:6px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--bg2)}
+    .preset-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--card)}
+    .preset-row .btn.active{background:var(--green);color:#fff;border-color:var(--green)}
+    .preset-feedback{font-size:12px;color:var(--text-dim);min-height:18px;display:inline-flex;align-items:center}
     .settings-tab-btn{
       height:32px;padding:0 12px;border-radius:var(--radius-sm);
       border:1px solid transparent;background:transparent;color:var(--text-muted);
@@ -1138,6 +1174,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div id="trades" class="empty-state">暂无交易记录</div>
   </div>
 
+  <div class="price-chart" id="positionChart">
+    <div class="price-chart-head"><strong id="chartTitle">价格区间</strong><span id="chartRange">--</span></div>
+    <div class="price-line" id="priceLine"></div>
+    <div class="price-chart-legend" id="chartLegend"></div>
+  </div>
+
   <!-- Tab: Diagnostics -->
   <div class="tab-panel" id="panel-diag">
     <div id="diagnostics" class="empty-state">点击「诊断广场」检查数据抓取状态</div>
@@ -1159,12 +1201,19 @@ DASHBOARD_HTML = r"""<!doctype html>
         <button type="button" class="settings-tab-btn" data-setting-tab="cost">交易成本</button>
         <button type="button" class="settings-tab-btn" data-setting-tab="runtime">运行模式</button>
       </div>
+      <div class="preset-row">
+        <button type="button" class="btn" data-preset="conservative">保守</button>
+        <button type="button" class="btn active" data-preset="standard">标准</button>
+        <button type="button" class="btn" data-preset="aggressive">激进</button>
+        <span class="preset-feedback" id="presetFeedback">当前：标准</span>
+      </div>
 
       <div class="settings-section active" id="settings-basic">
         <div class="settings-section-head"><strong>基础交易</strong><span>控制交易计价、单笔投入和本地状态文件。</span></div>
         <div class="settings-grid">
           <div class="field"><span class="field-label">计价币种</span><input name="quote_asset" value="USDT"></div>
           <div class="field"><span class="field-label">单笔金额</span><input name="order_quote_amount" type="number" min="1" step="1" value="50"></div>
+          <div class="field"><span class="field-label">最大持仓数</span><input name="max_open_positions" type="number" min="1" step="1" value="1"><span class="field-help">允许同时持有的仓位数量；保守/标准默认为 1，激进预设为 3。</span></div>
           <div class="field"><span class="field-label">状态文件</span><input name="state_file" value="bot_state.json"></div>
         </div>
       </div>
@@ -1244,6 +1293,56 @@ const buttons = ["preview","diagnose","runOnce","startLoop","manualClose","stopL
 const fixedStopInput = form.elements["fixed_stop_loss_usdt"];
 const orderAmountInput = form.elements["order_quote_amount"];
 let fixedStopEdited = false;
+const strategyPresets = {
+  conservative: {
+    min_price_change_percent: "4",
+    min_volatility_percent: "6",
+    min_quote_volume: "10000000",
+    take_profit_pct: "8",
+    initial_stop_loss_pct: "12",
+    breakeven_trigger_pct: "4",
+    trailing_start_pct: "6",
+    trailing_stop_pct: "3",
+    cooldown_minutes: "60",
+    max_daily_trades: "3",
+    max_daily_loss_usdt: "15",
+    max_open_positions: "1",
+    fee_rate_pct: "0.1",
+    slippage_pct: "0.08"
+  },
+  standard: {
+    min_price_change_percent: "3",
+    min_volatility_percent: "5",
+    min_quote_volume: "5000000",
+    take_profit_pct: "12",
+    initial_stop_loss_pct: "20",
+    breakeven_trigger_pct: "6",
+    trailing_start_pct: "8",
+    trailing_stop_pct: "5",
+    cooldown_minutes: "30",
+    max_daily_trades: "5",
+    max_daily_loss_usdt: "25",
+    max_open_positions: "1",
+    fee_rate_pct: "0.1",
+    slippage_pct: "0.05"
+  },
+  aggressive: {
+    min_price_change_percent: "2",
+    min_volatility_percent: "4",
+    min_quote_volume: "2500000",
+    take_profit_pct: "18",
+    initial_stop_loss_pct: "25",
+    breakeven_trigger_pct: "8",
+    trailing_start_pct: "12",
+    trailing_stop_pct: "7",
+    cooldown_minutes: "15",
+    max_daily_trades: "8",
+    max_daily_loss_usdt: "40",
+    max_open_positions: "3",
+    fee_rate_pct: "0.1",
+    slippage_pct: "0.08"
+  }
+};
 
 function formatDefaultFixedStop(value) {
   const rounded = Math.max(1, value * 0.2);
@@ -1256,6 +1355,41 @@ orderAmountInput.addEventListener("input", () => {
   if (!fixedStopEdited && Number.isFinite(orderAmount) && orderAmount > 0) {
     fixedStopInput.value = formatDefaultFixedStop(orderAmount);
   }
+});
+
+const presetLabels = {conservative:"保守", standard:"标准", aggressive:"激进"};
+
+function setFieldValue(name, value) {
+  const field = form.elements[name];
+  if (!field) return;
+  field.value = value;
+  field.dispatchEvent(new Event("input", {bubbles:true}));
+  field.dispatchEvent(new Event("change", {bubbles:true}));
+}
+
+function applyStrategyPreset(name) {
+  const preset = strategyPresets[name];
+  if (!preset) return;
+  for (const [fieldName, value] of Object.entries(preset)) {
+    setFieldValue(fieldName, value);
+  }
+  fixedStopEdited = false;
+  const orderAmount = Number(orderAmountInput.value);
+  if (Number.isFinite(orderAmount) && orderAmount > 0) {
+    setFieldValue("fixed_stop_loss_usdt", formatDefaultFixedStop(orderAmount));
+  }
+  document.querySelectorAll("[data-preset]").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.preset === name);
+  });
+  const feedback = $("presetFeedback");
+  if (feedback) feedback.textContent = "已应用：" + (presetLabels[name] || name);
+}
+
+document.querySelector(".preset-row")?.addEventListener("click", event => {
+  const btn = event.target.closest("[data-preset]");
+  if (!btn) return;
+  event.preventDefault();
+  applyStrategyPreset(btn.dataset.preset);
 });
 
 /* ── Theme toggle ── */
@@ -1365,10 +1499,12 @@ function render(data) {
   const state = data.state || {};
   const pos = state.position;
   const snapshot = state.position_snapshot || null;
+  const snapshots = state.position_snapshots || (snapshot ? [snapshot] : []);
   const entryGuard = state.entry_guard_snapshot || null;
   const performance = state.performance_stats || null;
   const trades = state.trade_log || [];
-  renderPosition(pos, snapshot);
+  renderPosition(pos, snapshot, snapshots);
+  renderPositionChart(snapshot);
   $("roundTrips").textContent = state.completed_round_trips ?? 0;
   renderEntryGuard(entryGuard);
   renderPerformanceStats(performance);
@@ -1403,7 +1539,7 @@ function renderCandidate(candidate) {
     " · 波动 " + formatPercent(candidate.volatility_percent);
 }
 
-function renderPosition(pos, snapshot) {
+function renderPosition(pos, snapshot, snapshots) {
   const positionEl = $("position");
   const metaEl = $("positionMeta");
   const pnlEl = $("positionPnl");
@@ -1420,11 +1556,13 @@ function renderPosition(pos, snapshot) {
     pnlEl.className = "value";
     valueEl.textContent = "等待模拟或实盘买入";
     riskEl.innerHTML = '交易回合 <strong id="roundTrips">' + esc($("roundTrips")?.textContent || "0") + "</strong>";
+    renderPositionChart(null);
     return;
   }
 
   const mode = snapshot?.mode_label || "持仓";
-  positionEl.textContent = mode + " " + pos.symbol;
+  const positionCount = snapshots?.length || 1;
+  positionEl.textContent = mode + " " + pos.symbol + (positionCount > 1 ? " +" + (positionCount - 1) : "");
   positionEl.classList.remove("small");
   const qty = snapshot?.quantity ?? pos.quantity;
   const entry = snapshot?.entry_price ?? pos.entry_price;
@@ -1462,6 +1600,49 @@ function renderPosition(pos, snapshot) {
     " · " + stopMode + " · " + stopText + distanceText +
     " · " + takeProfitText + takeProfitDistance +
     ' · 交易回合 <strong id="roundTrips">' + esc($("roundTrips")?.textContent || "0") + "</strong>";
+}
+
+function renderPositionChart(snapshot) {
+  const chart = $("positionChart");
+  const line = $("priceLine");
+  const legend = $("chartLegend");
+  const title = $("chartTitle");
+  const range = $("chartRange");
+  if (!snapshot || !snapshot.current_price || !snapshot.entry_price || !snapshot.dynamic_stop_price || !snapshot.take_profit_price) {
+    chart.classList.remove("active");
+    line.innerHTML = "";
+    legend.innerHTML = "";
+    return;
+  }
+  const points = [
+    {key:"stop", label:"止损", value:Number(snapshot.dynamic_stop_price), text:formatPrice(snapshot.dynamic_stop_price)},
+    {key:"entry", label:"入场", value:Number(snapshot.entry_price), text:formatPrice(snapshot.entry_price)},
+    {key:"current", label:"现价", value:Number(snapshot.current_price), text:formatPrice(snapshot.current_price)},
+    {key:"take", label:"止盈", value:Number(snapshot.take_profit_price), text:formatPrice(snapshot.take_profit_price)},
+  ].filter(item => Number.isFinite(item.value) && item.value > 0);
+  const min = Math.min(...points.map(item => item.value));
+  const max = Math.max(...points.map(item => item.value));
+  const pad = Math.max((max - min) * 0.12, max * 0.002);
+  const low = Math.max(0, min - pad);
+  const high = max + pad;
+  const span = Math.max(high - low, 1e-12);
+  chart.classList.add("active");
+  title.textContent = (snapshot.symbol || "持仓") + " 价格线";
+  range.textContent = formatPrice(low) + " - " + formatPrice(high);
+  line.innerHTML = points.map(item => {
+    const left = Math.min(100, Math.max(0, (item.value - low) / span * 100));
+    return '<span class="price-marker ' + item.key + '" style="left:' + left.toFixed(2) + '%" data-label="' + esc(item.label) + '"></span>';
+  }).join("");
+  legend.innerHTML = points.map(item =>
+    '<span><strong class="' + markerColorClass(item.key) + '">' + esc(item.label) + '</strong> ' + esc(item.text) + '</span>'
+  ).join("");
+}
+
+function markerColorClass(key) {
+  if (key === "stop") return "c-red";
+  if (key === "take") return "c-green";
+  if (key === "entry") return "c-amber";
+  return "";
 }
 
 function renderEntryGuard(guard) {
