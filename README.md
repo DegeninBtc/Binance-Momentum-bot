@@ -70,6 +70,7 @@ $env:BINANCE_API_KEY="你的 API Key"
 $env:BINANCE_API_SECRET="你的 API Secret"
 $env:ORDER_QUOTE_USDT="50"
 $env:MAX_OPEN_POSITIONS="1"
+$env:LEVERAGE_MULTIPLIER="10"
 $env:MIN_PRICE_CHANGE_PERCENT="3"
 $env:MIN_VOLATILITY_PERCENT="5"
 $env:MIN_QUOTE_VOLUME_USDT="5000000"
@@ -124,6 +125,8 @@ http://127.0.0.1:8787/
 - `激进`：降低入场门槛、放宽持仓和日内限制，默认最多 3 个仓位。
 
 首页持仓区域会展示当前持仓的入场价、动态止损价、止盈价和现价价格线；多仓位时，状态卡会显示主仓位并标记额外仓位数量。
+
+杠杆倍数默认 `10` 倍，可在网页“基础”设置里自由调整，或通过 `LEVERAGE_MULTIPLIER` 设置。当前项目仍是现货策略，杠杆倍数用于风险和收益率展示，不会自动切换为合约下单。
 
 通知页支持 Telegram 推送：
 

@@ -559,6 +559,7 @@ def build_position_snapshot(
         "symbol": symbol,
         "base_asset": position.get("base_asset") or symbol.removesuffix(config.quote_asset),
         "quote_asset": config.quote_asset,
+        "leverage_multiplier": config.leverage_multiplier,
         "dry_run": is_dry_run,
         "mode_label": "模拟" if is_dry_run else "实盘",
         "quantity": quantity,
@@ -588,6 +589,7 @@ def build_position_snapshot(
     market_value = quantity * current_price
     unrealized_pnl = market_value - quote_spent
     unrealized_pnl_pct = (current_price - entry_price) / entry_price * Decimal("100")
+    leveraged_unrealized_pnl_pct = unrealized_pnl_pct * config.leverage_multiplier
     unrealized_loss = max(Decimal("0"), -unrealized_pnl)
     stop_triggered = (
         unrealized_loss >= config.fixed_stop_loss_usdt
@@ -607,6 +609,7 @@ def build_position_snapshot(
             "market_value": market_value,
             "unrealized_pnl": unrealized_pnl,
             "unrealized_pnl_pct": unrealized_pnl_pct,
+            "leveraged_unrealized_pnl_pct": leveraged_unrealized_pnl_pct,
             "unrealized_loss": unrealized_loss,
             "stop_distance_pct": stop_distance_pct,
             "stop_triggered": stop_triggered,
@@ -663,6 +666,9 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
     fixed_stop_loss_usdt = optional_decimal(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
         fixed_stop_loss_usdt = module.default_fixed_stop_loss_usdt(order_quote_amount)
+    leverage_multiplier = decimal_value(payload, "leverage_multiplier", "LEVERAGE_MULTIPLIER", "10")
+    if leverage_multiplier <= 0:
+        raise ValueError("leverage_multiplier must be greater than zero")
 
     return module.BotConfig(
         api_key=os.getenv("BINANCE_API_KEY", ""),
@@ -671,6 +677,7 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         quote_asset=str(payload.get("quote_asset") or os.getenv("QUOTE_ASSET", "USDT")).upper(),
         order_quote_amount=order_quote_amount,
         max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 1),
+        leverage_multiplier=leverage_multiplier,
         min_quote_volume=decimal_value(payload, "min_quote_volume", "MIN_QUOTE_VOLUME_USDT", "5000000"),
         min_price_change_percent=decimal_value(payload, "min_price_change_percent", "MIN_PRICE_CHANGE_PERCENT", "3"),
         min_volatility_percent=decimal_value(payload, "min_volatility_percent", "MIN_VOLATILITY_PERCENT", "5"),

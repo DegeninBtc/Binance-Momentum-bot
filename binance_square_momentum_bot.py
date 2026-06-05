@@ -157,6 +157,7 @@ class BotConfig:
     quote_asset: str = "USDT"
     order_quote_amount: Decimal = Decimal("50")
     max_open_positions: int = 1
+    leverage_multiplier: Decimal = Decimal("10")
     min_quote_volume: Decimal = Decimal("5000000")
     min_price_change_percent: Decimal = Decimal("3")
     min_volatility_percent: Decimal = Decimal("5")
@@ -1616,6 +1617,9 @@ def load_config(args: argparse.Namespace) -> BotConfig:
     fixed_stop_loss_usdt = decimal_env("FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
         fixed_stop_loss_usdt = default_fixed_stop_loss_usdt(order_quote_amount)
+    leverage_multiplier = decimal_env("LEVERAGE_MULTIPLIER", "10") or Decimal("10")
+    if leverage_multiplier <= 0:
+        raise ValueError("LEVERAGE_MULTIPLIER must be greater than zero")
 
     return BotConfig(
         api_key=os.getenv("BINANCE_API_KEY", ""),
@@ -1624,6 +1628,7 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         quote_asset=os.getenv("QUOTE_ASSET", "USDT"),
         order_quote_amount=order_quote_amount,
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
+        leverage_multiplier=leverage_multiplier,
         min_quote_volume=decimal_env("MIN_QUOTE_VOLUME_USDT", "5000000") or Decimal("5000000"),
         min_price_change_percent=decimal_env("MIN_PRICE_CHANGE_PERCENT", "3") or Decimal("3"),
         min_volatility_percent=decimal_env("MIN_VOLATILITY_PERCENT", "5") or Decimal("5"),

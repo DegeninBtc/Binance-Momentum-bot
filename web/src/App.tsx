@@ -66,6 +66,7 @@ const DEFAULT_SETTINGS: SettingsState = {
   quote_asset: "USDT",
   order_quote_amount: "50",
   max_open_positions: "1",
+  leverage_multiplier: "10",
   state_file: "bot_state.json",
   min_price_change_percent: "3",
   min_volatility_percent: "5",
@@ -396,8 +397,8 @@ function App() {
           />
           <MetricCard
             label="浮动盈亏"
-            value={snapshot?.market_value ? `${signedMoney(snapshot.unrealized_pnl, quoteAsset)} · ${signedPercent(snapshot.unrealized_pnl_pct)}` : "--"}
-            detail={snapshot?.market_value ? `市值 ${formatMoney(snapshot.market_value, quoteAsset)} · 本金 ${formatMoney(snapshot.quote_spent, quoteAsset)}` : snapshot?.price_error || "等待当前价格"}
+            value={snapshot?.market_value ? `${signedMoney(snapshot.unrealized_pnl, quoteAsset)} · ${signedPercent(snapshot.leveraged_unrealized_pnl_pct ?? snapshot.unrealized_pnl_pct)}` : "--"}
+            detail={snapshot?.market_value ? `市值 ${formatMoney(snapshot.market_value, quoteAsset)} · 现货收益 ${signedPercent(snapshot.unrealized_pnl_pct)} · 杠杆 ${formatLeverage(snapshot.leverage_multiplier)}` : snapshot?.price_error || "等待当前价格"}
             icon={asNumber(snapshot?.unrealized_pnl) !== null && Number(snapshot?.unrealized_pnl) < 0 ? TrendingDown : TrendingUp}
             tone={asNumber(snapshot?.unrealized_pnl) !== null && Number(snapshot?.unrealized_pnl) < 0 ? "danger" : "success"}
           />
@@ -1003,6 +1004,7 @@ function SettingsPanel({
             <Field name="quote_asset" label="计价币种" />
             <Field name="order_quote_amount" label="单笔金额" type="number" min="1" step="1" />
             <Field name="max_open_positions" label="最大持仓数" type="number" min="1" step="1" help="允许同时持有的仓位数量；保守/标准默认为 1，激进预设为 3。" />
+            <Field name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="默认 10 倍，可自由输入；当前现货策略仅用于风险和收益率展示。" />
             <Field name="state_file" label="状态文件" full />
           </SettingsSection>
         )}
@@ -1121,6 +1123,7 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
     quote_asset: textValue(config.quote_asset) || DEFAULT_SETTINGS.quote_asset,
     order_quote_amount: textValue(config.order_quote_amount) || DEFAULT_SETTINGS.order_quote_amount,
     max_open_positions: textValue(config.max_open_positions) || DEFAULT_SETTINGS.max_open_positions,
+    leverage_multiplier: textValue(config.leverage_multiplier) || DEFAULT_SETTINGS.leverage_multiplier,
     state_file: textValue(config.state_file) || DEFAULT_SETTINGS.state_file,
     min_price_change_percent: textValue(config.min_price_change_percent) || DEFAULT_SETTINGS.min_price_change_percent,
     min_volatility_percent: textValue(config.min_volatility_percent) || DEFAULT_SETTINGS.min_volatility_percent,
@@ -1164,6 +1167,14 @@ function formatDefaultFixedStop(value: number): string {
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, "");
 }
 
+function formatLeverage(value: unknown): string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return "10x";
+  }
+  return `${trimNumber(parsed, 2)}x`;
+}
+
 function positionLabel(position: Position | null, snapshot: PositionSnapshot | null, positionCount = 0): string {
   if (!position?.symbol) {
     return "--";
@@ -1186,6 +1197,7 @@ function positionDetail(position: Position | null, snapshot: PositionSnapshot | 
   if (snapshot?.highest_price) {
     parts.push(`最高 ${formatPrice(snapshot.highest_price)}`);
   }
+  parts.push(`杠杆 ${formatLeverage(snapshot?.leverage_multiplier)}`);
   return parts.join(" · ");
 }
 
@@ -1212,6 +1224,9 @@ function riskSummary(snapshot: PositionSnapshot | null, guard: EntryGuardSnapsho
   }
   if (snapshot?.take_profit_distance_pct) {
     parts.push(`距止盈 ${formatPercent(snapshot.take_profit_distance_pct)}`);
+  }
+  if (snapshot?.leverage_multiplier) {
+    parts.push(`杠杆 ${formatLeverage(snapshot.leverage_multiplier)}`);
   }
   if (guard) {
     const tradeLimit = Number(guard.max_daily_trades || 0);

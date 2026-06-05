@@ -6,6 +6,7 @@ export type SettingsState = {
   quote_asset: string;
   order_quote_amount: string;
   max_open_positions: string;
+  leverage_multiplier: string;
   state_file: string;
   min_price_change_percent: string;
   min_volatility_percent: string;
@@ -96,6 +97,8 @@ export type PositionSnapshot = {
   market_value?: Primitive;
   unrealized_pnl?: Primitive;
   unrealized_pnl_pct?: Primitive;
+  leveraged_unrealized_pnl_pct?: Primitive;
+  leverage_multiplier?: Primitive;
   active_stop_mode?: string;
   dynamic_stop_price?: Primitive;
   take_profit_price?: Primitive;
