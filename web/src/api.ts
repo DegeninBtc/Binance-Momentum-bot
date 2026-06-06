@@ -1,4 +1,4 @@
-import type { DashboardStatus, SettingsState } from "./types";
+import type { ChartRangeKey, DashboardStatus, MarketChart, SettingsState } from "./types";
 
 export async function fetchStatus(): Promise<DashboardStatus> {
   const response = await fetch("/api/status", { cache: "no-store" });
@@ -16,6 +16,16 @@ export async function postAction(path: string, payload: SettingsState): Promise<
     body: JSON.stringify(payload),
   });
   const data = (await response.json()) as DashboardStatus;
+  if (!response.ok) {
+    throw new Error(data.error || response.statusText);
+  }
+  return data;
+}
+
+export async function fetchMarketChart(symbol: string, range: ChartRangeKey, testnet: boolean): Promise<MarketChart> {
+  const params = new URLSearchParams({ symbol, range, testnet: String(testnet) });
+  const response = await fetch(`/api/market-chart?${params.toString()}`, { cache: "no-store" });
+  const data = (await response.json()) as MarketChart;
   if (!response.ok) {
     throw new Error(data.error || response.statusText);
   }

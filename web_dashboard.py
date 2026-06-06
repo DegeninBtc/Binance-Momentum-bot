@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import threading
 import time
 import webbrowser
@@ -35,6 +36,13 @@ DEFAULT_SQUARE_URLS = (
     "https://www.binance.com/en/square",
     "https://www.binance.com/en/square/top",
 )
+CHART_RANGES = {
+    "1H": ("1m", 60),
+    "6H": ("5m", 72),
+    "24H": ("15m", 96),
+    "7D": ("2h", 84),
+    "30D": ("8h", 90),
+}
 BOT_MODULE: Any | None = None
 
 
@@ -306,15 +314,70 @@ def candidate_score_row(candidate: Any) -> dict[str, Any]:
 def build_square_diagnostics(config: Any) -> dict[str, Any]:
     module = bot_module()
     bot = module.LongOnlyMomentumBot(config)
-    diagnostics = bot.square.diagnose(config.top_post_limit, browser_mode=config.square_browser_mode)
+    diagnostics = bot.square.diagnose(
+        config.top_post_limit,
+        browser_mode=config.square_browser_mode,
+        display_limit=config.square_diagnostic_limit,
+    )
     diagnostics["mode"] = "browser" if config.square_browser_mode else "static"
     if not config.square_browser_mode:
-        diagnostics["hint"] = "当前是静态抓取；Binance Square 可能返回空响应。到设置里开启“浏览器抓广场”后再诊断。"
+        diagnostics["hint"] = "当前是静态抓取；Binance Square 可能返回空响应。到诊断页开启“浏览器抓广场”后再诊断。"
     elif diagnostics.get("browser_error"):
         diagnostics["hint"] = diagnostics.get("browser_hint", "") or "运行 fix_playwright_browser.bat 安装 Playwright Chromium。"
     else:
         diagnostics["hint"] = ""
     return stringify_decimals(diagnostics)
+
+
+def build_market_chart(symbol: str, range_key: str, testnet: bool = False) -> dict[str, Any]:
+    normalized_symbol = symbol.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{3,20}", normalized_symbol):
+        raise ValueError("symbol must be a Binance spot symbol")
+    normalized_range = range_key.strip().upper()
+    if normalized_range not in CHART_RANGES:
+        raise ValueError("range must be one of 1H, 6H, 24H, 7D, 30D")
+
+    interval, limit = CHART_RANGES[normalized_range]
+    module = bot_module()
+    base_url = "https://testnet.binance.vision" if testnet else DEFAULT_BASE_URL
+    config = module.BotConfig(api_key="", api_secret="", base_url=base_url)
+    client = module.BinanceSpotClient(config)
+    rows = client.klines(normalized_symbol, interval, limit)
+
+    points: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        points.append(
+            {
+                "time": row[0],
+                "open": row[1],
+                "high": row[2],
+                "low": row[3],
+                "close": row[4],
+            }
+        )
+    if not points:
+        raise ValueError("no kline data returned")
+
+    first_close = Decimal(str(points[0]["close"]))
+    last_close = Decimal(str(points[-1]["close"]))
+    highs = [Decimal(str(item["high"])) for item in points]
+    lows = [Decimal(str(item["low"])) for item in points]
+    change_pct = ((last_close - first_close) / first_close * Decimal("100")) if first_close else Decimal("0")
+    return stringify_decimals(
+        {
+            "symbol": normalized_symbol,
+            "range": normalized_range,
+            "interval": interval,
+            "points": points,
+            "first_close": first_close,
+            "last_close": last_close,
+            "high": max(highs),
+            "low": min(lows),
+            "change_percent": change_pct,
+        }
+    )
 
 
 def reset_dry_run_state(runner: BotRunner, config: Any) -> dict[str, Any]:
@@ -399,29 +462,33 @@ def active_positions_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
 def build_performance_stats(state: dict[str, Any], quote_asset: str) -> dict[str, Any]:
     module = bot_module()
     completed: list[dict[str, Any]] = []
-    open_trade: dict[str, Any] | None = None
+    open_trades: dict[str, list[dict[str, Any]]] = {}
 
     for item in state.get("trade_log") or []:
         action = str(item.get("action", ""))
+        symbol = str(item.get("symbol", ""))
         qty = decimal_from_state(item.get("quantity"))
         price = decimal_from_state(item.get("price"))
-        if qty is None or price is None:
+        if not symbol or qty is None or price is None:
             continue
         amount = decimal_from_state(item.get("quote_amount")) or qty * price
         ts = module.parse_timestamp(item.get("ts"))
         if "BUY" in action:
-            open_trade = {
-                "symbol": item.get("symbol", ""),
-                "amount": amount,
-                "ts": ts,
-                "dry_run": bool(item.get("dry_run", True)),
-            }
-        elif "SELL" in action and open_trade is not None:
+            open_trades.setdefault(symbol, []).append(
+                {
+                    "symbol": symbol,
+                    "amount": amount,
+                    "ts": ts,
+                    "dry_run": bool(item.get("dry_run", True)),
+                }
+            )
+        elif "SELL" in action and open_trades.get(symbol):
+            open_trade = open_trades[symbol].pop(0)
             pnl = amount - open_trade["amount"]
             return_pct = pnl / open_trade["amount"] * Decimal("100") if open_trade["amount"] > 0 else Decimal("0")
             completed.append(
                 {
-                    "symbol": open_trade["symbol"],
+                    "symbol": symbol,
                     "pnl": pnl,
                     "return_pct": return_pct,
                     "entry_amount": open_trade["amount"],
@@ -432,7 +499,6 @@ def build_performance_stats(state: dict[str, Any], quote_asset: str) -> dict[str
                     "exit_action": action,
                 }
             )
-            open_trade = None
 
     total = len(completed)
     wins = [item for item in completed if item["pnl"] > 0]
@@ -469,6 +535,7 @@ def build_performance_stats(state: dict[str, Any], quote_asset: str) -> dict[str
     return {
         "quote_asset": quote_asset,
         "completed_trades": total,
+        "trade_count": total,
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": win_rate,
@@ -491,24 +558,26 @@ def build_entry_guard_snapshot(state: dict[str, Any], config: Any) -> dict[str, 
     today = module.datetime.now(module.timezone.utc).date()
     buy_count = 0
     realized_pnl = Decimal("0")
-    open_cost: Decimal | None = None
+    open_costs: dict[str, list[Decimal]] = {}
 
     for item in state.get("trade_log") or []:
         action = str(item.get("action", ""))
+        symbol = str(item.get("symbol", ""))
         ts = module.parse_timestamp(item.get("ts"))
         qty = decimal_from_state(item.get("quantity"))
         price = decimal_from_state(item.get("price"))
-        if qty is None or price is None:
+        if not symbol or qty is None or price is None:
             continue
         amount = decimal_from_state(item.get("quote_amount")) or qty * price
         if "BUY" in action:
-            open_cost = amount
+            open_costs.setdefault(symbol, []).append(amount)
             if ts and ts.date() == today:
                 buy_count += 1
         elif "SELL" in action:
+            queue = open_costs.get(symbol) or []
+            open_cost = queue.pop(0) if queue else None
             if ts and ts.date() == today and open_cost is not None:
                 realized_pnl += amount - open_cost
-            open_cost = None
 
     trade_limit_hit = config.max_daily_trades > 0 and buy_count >= config.max_daily_trades
     loss_limit_hit = config.max_daily_loss_usdt > 0 and realized_pnl <= -config.max_daily_loss_usdt
@@ -709,7 +778,8 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         state_file=str(payload.get("state_file") or os.getenv("STATE_FILE", "bot_state.json")),
         dry_run=not bool(payload.get("live")),
         square_urls=square_urls,
-        square_browser_mode=bool_value(payload, "square_browser_mode", False),
+        square_browser_mode=bool_value(payload, "square_browser_mode", True),
+        square_diagnostic_limit=int_value(payload, "square_diagnostic_limit", "SQUARE_DIAGNOSTIC_LIMIT", 10),
         telegram_bot_token=str(payload.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")),
         telegram_chat_id=str(payload.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID", "")),
         telegram_enabled=bool_value(payload, "telegram_enabled", False),
@@ -785,12 +855,23 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
         server_version = "BinanceBotDashboard/1.0"
 
         def do_GET(self) -> None:
-            route = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            route = parsed.path
             if route == "/api/status":
                 self._send_json(runner.status())
                 return
             if route == "/api/defaults":
                 self._send_json(sanitize_config(config_from_payload({})))
+                return
+            if route == "/api/market-chart":
+                params = parse_qs(parsed.query)
+                symbol = (params.get("symbol") or [""])[-1]
+                range_key = (params.get("range") or ["24H"])[-1]
+                testnet = str((params.get("testnet") or [""])[-1]).lower() in {"1", "true", "yes", "on"}
+                try:
+                    self._send_json(build_market_chart(symbol, range_key, testnet=testnet))
+                except (ValueError, RuntimeError) as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             if route == "/favicon.ico":
                 self.send_response(HTTPStatus.NO_CONTENT)
@@ -961,4 +1042,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

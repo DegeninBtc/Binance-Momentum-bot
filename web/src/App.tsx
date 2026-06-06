@@ -30,7 +30,7 @@ import {
   TrendingUp,
   Wallet,
 } from "lucide-react";
-import { fetchStatus, postAction } from "./api";
+import { fetchMarketChart, fetchStatus, postAction } from "./api";
 import {
   actionLabel,
   asNumber,
@@ -49,13 +49,17 @@ import {
 } from "./format";
 import type {
   ConfigPayload,
+  ChartRangeKey,
   DashboardStatus,
   Diagnostics,
+  DiagnosticsPost,
   EntryGuardSnapshot,
   HotAsset,
+  MarketChart,
   PerformanceStats,
   Position,
   PositionSnapshot,
+  Primitive,
   SettingsState,
   SettingsTabKey,
   TabKey,
@@ -94,7 +98,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   recv_window_ms: "5000",
   testnet: false,
   live: false,
-  square_browser_mode: false,
+  square_browser_mode: true,
+  square_diagnostic_limit: "10",
   telegram_bot_token: "",
   telegram_chat_id: "",
   telegram_enabled: false,
@@ -105,6 +110,7 @@ const DEFAULT_SETTINGS: SettingsState = {
 };
 
 const TAB_ITEMS: Array<{ key: TabKey; label: string; icon: LucideIcon }> = [
+  { key: "positions", label: "当前仓位", icon: Wallet },
   { key: "hot", label: "热门币种", icon: Flame },
   { key: "trades", label: "交易记录", icon: CircleDollarSign },
   { key: "diag", label: "广场诊断", icon: Search },
@@ -141,7 +147,7 @@ const STRATEGY_PRESETS = {
     cooldown_minutes: "30",
     max_daily_trades: "5",
     max_daily_loss_usdt: "25",
-    max_open_positions: "1",
+    max_open_positions: "5",
     fee_rate_pct: "0.1",
     slippage_pct: "0.05",
   },
@@ -152,7 +158,7 @@ const STRATEGY_PRESETS = {
     cooldown_minutes: "15",
     max_daily_trades: "8",
     max_daily_loss_usdt: "40",
-    max_open_positions: "3",
+    max_open_positions: "10",
     fee_rate_pct: "0.1",
     slippage_pct: "0.08",
   },
@@ -166,17 +172,26 @@ const PRESET_LABELS: Record<StrategyPresetKey, string> = {
   aggressive: "激进",
 };
 
+const CHART_RANGES: ChartRangeKey[] = ["1H", "6H", "24H", "7D", "30D"];
+const SETTINGS_STORAGE_KEY = "dashboard-settings";
+const SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY = "dashboard-settings-browser-default-v1";
+
 function App() {
   const [status, setStatus] = useState<DashboardStatus | null>(null);
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS);
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   const [fixedStopEdited, setFixedStopEdited] = useState(false);
   const [activePreset, setActivePreset] = useState<StrategyPresetKey>("standard");
-  const [activeTab, setActiveTab] = useState<TabKey>("hot");
+  const [activeTab, setActiveTab] = useState<TabKey>("positions");
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTabKey>("basic");
   const [busyPath, setBusyPath] = useState("");
   const [requestError, setRequestError] = useState("");
   const [theme, setTheme] = useState(() => localStorage.getItem("dashboard-theme") || "light");
+  const [chartRange, setChartRange] = useState<ChartRangeKey>("24H");
+  const [marketChart, setMarketChart] = useState<MarketChart | null>(null);
+  const [chartLoading, setChartLoading] = useState(false);
+  const [chartError, setChartError] = useState("");
+  const [positionsExpanded, setPositionsExpanded] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -201,7 +216,7 @@ function App() {
 
   useEffect(() => {
     if (!settingsHydrated && status?.config) {
-      setSettings(settingsFromConfig(status.config));
+      setSettings({ ...settingsFromConfig(status.config), ...loadSavedSettings() });
       setSettingsHydrated(true);
     }
   }, [settingsHydrated, status?.config]);
@@ -212,6 +227,7 @@ function App() {
   const candidate = signal.candidate || null;
   const positions = state.positions?.length ? state.positions : state.position ? [state.position] : [];
   const snapshots = state.position_snapshots?.length ? state.position_snapshots : state.position_snapshot ? [state.position_snapshot] : [];
+  const positionViews = useMemo(() => buildPositionViews(positions, snapshots), [positions, snapshots]);
   const position = state.position || positions[0] || null;
   const snapshot = state.position_snapshot || snapshots[0] || null;
   const guard = state.entry_guard_snapshot || null;
@@ -223,7 +239,9 @@ function App() {
   const keysLoaded = Boolean(config.api_key_loaded && config.api_secret_loaded);
   const liveMode = settings.live || config.dry_run === false;
   const quoteAsset = snapshot?.quote_asset || textValue(config.quote_asset) || settings.quote_asset || "USDT";
+  const heroSymbol = candidate?.symbol || position?.symbol || "OPNUSDT";
   const updatedAt = status?.last_finished_at || status?.last_started_at || "--";
+  const totals = useMemo(() => positionTotals(positionViews), [positionViews]);
 
   const riskTone = useMemo(() => {
     if (hasError || snapshot?.stop_triggered || guard?.entry_blocked) {
@@ -237,6 +255,36 @@ function App() {
     }
     return "success";
   }, [guard?.entry_blocked, hasError, keysLoaded, liveMode, running, snapshot?.stop_triggered, snapshot?.take_profit_triggered]);
+
+  useEffect(() => {
+    if (!heroSymbol) {
+      setMarketChart(null);
+      return;
+    }
+    let cancelled = false;
+    setChartLoading(true);
+    setChartError("");
+    fetchMarketChart(heroSymbol, chartRange, Boolean(settings.testnet))
+      .then((chart) => {
+        if (!cancelled) {
+          setMarketChart(chart);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setChartError(error instanceof Error ? error.message : "行情图加载失败");
+          setMarketChart(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setChartLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [chartRange, heroSymbol, settings.testnet]);
 
   function updateSetting<K extends keyof SettingsState>(key: K, value: SettingsState[K]) {
     setSettings((current) => {
@@ -362,7 +410,7 @@ function App() {
             <div className="hero-title-row">
               <div>
                 <p><span>市场指令</span> <strong>Market Command</strong></p>
-                <h1>{candidate?.symbol || position?.symbol || "OPNUSDT"}</h1>
+                <h1>{heroSymbol}</h1>
               </div>
               <Star className="hero-star" size={28} />
             </div>
@@ -371,36 +419,49 @@ function App() {
               <HeroScore label="24h 涨幅" value={formatPercent(candidate?.price_change_percent ?? 0)} tone="positive" />
               <HeroScore label="波动率" value={formatPercent(candidate?.volatility_percent ?? 0)} tone="warning" />
             </div>
-            <MarketCurve />
+            <MarketCurve chart={marketChart} loading={chartLoading} error={chartError} />
             <div className="range-tabs" aria-label="行情周期">
-              <span>1H</span>
-              <span>6H</span>
-              <span className="is-active">24H</span>
-              <span>7D</span>
-              <span>30D</span>
+              {CHART_RANGES.map((range) => (
+                <button
+                  className={chartRange === range ? "is-active" : ""}
+                  type="button"
+                  key={range}
+                  onClick={() => setChartRange(range)}
+                >
+                  {range}
+                </button>
+              ))}
             </div>
           </div>
-          <div className="hero-meta">
-            <Database className="source-watermark" size={42} />
-            <span>数据源</span>
-            <strong>{signal.source || "--"}</strong>
-            <small>{signal.checked_at ? `检查于 ${signal.checked_at}` : signal.note || "等待首次刷新"}</small>
+          <div className="hero-side">
+            <div className="hero-meta">
+              <Database className="source-watermark" size={38} />
+              <span>数据源</span>
+              <strong>{signal.source || "--"}</strong>
+              <small>{signal.checked_at ? `检查于 ${signal.checked_at}` : signal.note || "等待首次刷新"}</small>
+            </div>
+            <div className={`hero-meta ${hasError ? "tone-danger" : ""}`}>
+              <Clock3 className="source-watermark" size={38} />
+              <span>最后更新</span>
+              <strong>{updatedAt}</strong>
+              <small>{requestError || status?.last_error || `轮询 ${settings.poll_seconds || "300"} 秒 · 页面 2.5 秒刷新`}</small>
+            </div>
           </div>
         </section>
 
         <section className="overview-grid">
-          <MetricCard
-            label="当前仓位"
-            value={positionLabel(position, snapshot, snapshots.length)}
-            detail={positionDetail(position, snapshot)}
-            icon={Wallet}
+          <PositionsSummaryCard
+            positions={positionViews}
+            expanded={positionsExpanded}
+            onToggle={() => setPositionsExpanded((value) => !value)}
+            onOpenTab={() => setActiveTab("positions")}
           />
           <MetricCard
             label="浮动盈亏"
-            value={snapshot?.market_value ? `${signedMoney(snapshot.unrealized_pnl, quoteAsset)} · ${signedPercent(snapshot.leveraged_unrealized_pnl_pct ?? snapshot.unrealized_pnl_pct)}` : "--"}
-            detail={snapshot?.market_value ? `市值 ${formatMoney(snapshot.market_value, quoteAsset)} · 现货收益 ${signedPercent(snapshot.unrealized_pnl_pct)} · 杠杆 ${formatLeverage(snapshot.leverage_multiplier)}` : snapshot?.price_error || "等待当前价格"}
-            icon={asNumber(snapshot?.unrealized_pnl) !== null && Number(snapshot?.unrealized_pnl) < 0 ? TrendingDown : TrendingUp}
-            tone={asNumber(snapshot?.unrealized_pnl) !== null && Number(snapshot?.unrealized_pnl) < 0 ? "danger" : "success"}
+            value={totals.marketValue !== null ? `${signedMoney(totals.unrealizedPnl, quoteAsset)} · ${signedPercent(totals.unrealizedPnlPct)}` : "--"}
+            detail={totals.marketValue !== null ? `市值 ${formatMoney(totals.marketValue, quoteAsset)} · 持仓 ${positionViews.length}` : snapshot?.price_error || "等待当前价格"}
+            icon={totals.unrealizedPnl !== null && totals.unrealizedPnl < 0 ? TrendingDown : TrendingUp}
+            tone={totals.unrealizedPnl !== null && totals.unrealizedPnl < 0 ? "danger" : "success"}
           />
           <MetricCard
             label="运行 / 风控"
@@ -409,16 +470,7 @@ function App() {
             icon={Target}
             tone={riskTone}
           />
-          <MetricCard
-            label="最后更新"
-            value={updatedAt}
-            detail={requestError || status?.last_error || `轮询 ${settings.poll_seconds || "300"} 秒 · 页面 2.5 秒刷新`}
-            icon={Clock3}
-            tone={hasError ? "danger" : "muted"}
-          />
         </section>
-
-        <PositionPriceCharts snapshots={snapshots} />
 
         <section className="command-panel">
           <div className="command-title">
@@ -459,9 +511,18 @@ function App() {
         </nav>
 
         <section className="tab-surface">
+          {activeTab === "positions" && <PositionsPanel positions={positionViews} snapshots={snapshots} />}
           {activeTab === "hot" && <HotAssetsTable items={signal.hot_assets || []} />}
           {activeTab === "trades" && <TradesPanel stats={performance} trades={trades} />}
-          {activeTab === "diag" && <DiagnosticsPanel diagnostics={diagnostics} />}
+          {activeTab === "diag" && (
+            <DiagnosticsPanel
+              diagnostics={diagnostics}
+              settings={settings}
+              busy={busyPath === "/api/square-diagnose"}
+              updateSetting={updateSetting}
+              onDiagnose={() => submit("/api/square-diagnose", "diag")}
+            />
+          )}
           {activeTab === "logs" && <LogsPanel logs={status?.logs || []} requestError={requestError} />}
           {activeTab === "settings" && (
             <SettingsPanel
@@ -508,9 +569,14 @@ function HeroScore({ label, value, tone = "default" }: { label: string; value: s
   );
 }
 
-function MarketCurve() {
+function MarketCurve({ chart, loading, error }: { chart: MarketChart | null; loading: boolean; error: string }) {
+  const closes = (chart?.points || []).map((item) => asNumber(item.close)).filter((item): item is number => item !== null && Number.isFinite(item));
+  const paths = buildMarketCurvePaths(closes);
+  const change = asNumber(chart?.change_percent);
+  const tone = change !== null && change < 0 ? "negative" : "positive";
+  const label = loading ? "加载行情..." : error || (change !== null ? `${chart?.range || "24H"} ${signedPercent(change)}` : chart?.range || "24H");
   return (
-    <div className="market-curve" aria-hidden="true">
+    <div className={`market-curve tone-${tone}`} aria-label={label} title={label}>
       <svg viewBox="0 0 760 150" preserveAspectRatio="none">
         <defs>
           <linearGradient id="curveFill" x1="0" x2="0" y1="0" y2="1">
@@ -518,12 +584,40 @@ function MarketCurve() {
             <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
           </linearGradient>
         </defs>
-        <path className="curve-fill" d="M0 122 L30 120 L58 106 L82 111 L110 98 L136 91 L165 73 L190 94 L214 86 L240 91 L268 84 L296 80 L326 72 L354 79 L382 66 L410 70 L438 63 L468 74 L492 59 L520 51 L548 57 L580 43 L608 50 L635 36 L664 47 L692 41 L724 44 L760 26 L760 150 L0 150 Z" />
-        <path className="curve-line" d="M0 122 L30 120 L58 106 L82 111 L110 98 L136 91 L165 73 L190 94 L214 86 L240 91 L268 84 L296 80 L326 72 L354 79 L382 66 L410 70 L438 63 L468 74 L492 59 L520 51 L548 57 L580 43 L608 50 L635 36 L664 47 L692 41 L724 44 L760 26" />
-        <line x1="0" y1="122" x2="760" y2="122" />
+        <path className="curve-fill" d={paths.fill} />
+        <path className="curve-line" d={paths.line} />
+        <line x1="0" y1={paths.baseline} x2="760" y2={paths.baseline} />
       </svg>
+      <span>{label}</span>
     </div>
   );
+}
+
+function buildMarketCurvePaths(values: number[]) {
+  const fallback = [122, 120, 106, 111, 98, 91, 73, 94, 86, 91, 84, 80, 72, 79, 66, 70, 63, 74, 59, 51, 57, 43, 50, 36, 47, 41, 44, 26];
+  const width = 760;
+  const top = 18;
+  const bottom = 130;
+  const baseline = 122;
+  const prices = values.length >= 2 ? values : fallback.map((value) => bottom - value + top);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const range = max - min || 1;
+  const points = prices.map((value, index) => {
+    const x = prices.length === 1 ? width : (index / (prices.length - 1)) * width;
+    const y = bottom - ((value - min) / range) * (bottom - top);
+    return `${roundPathNumber(x)} ${roundPathNumber(y)}`;
+  });
+  const line = points.map((point, index) => `${index === 0 ? "M" : "L"}${point}`).join(" ");
+  return {
+    line,
+    fill: `${line} L${width} 150 L0 150 Z`,
+    baseline,
+  };
+}
+
+function roundPathNumber(value: number): string {
+  return value.toFixed(2).replace(/\.?0+$/, "");
 }
 
 function MetricCard({
@@ -548,6 +642,173 @@ function MetricCard({
       <strong>{value}</strong>
       <p>{detail}</p>
     </article>
+  );
+}
+
+type PositionView = {
+  symbol: string;
+  baseAsset: string;
+  quantity?: Primitive;
+  entryPrice?: Primitive;
+  highestPrice?: Primitive;
+  quoteSpent?: Primitive;
+  openedAt?: string;
+  snapshot?: PositionSnapshot;
+  modeLabel?: string;
+};
+
+function formatAbsQty(value: Primitive): string {
+  const parsed = asNumber(value);
+  return parsed === null ? formatQty(value) : formatQty(Math.abs(parsed));
+}
+
+function positionRawSide(item: PositionView): string {
+  const snapshot = item.snapshot as (PositionSnapshot & Record<string, unknown>) | undefined;
+  return [
+    snapshot?.side,
+    snapshot?.position_side,
+    snapshot?.positionSide,
+    snapshot?.direction,
+    item.modeLabel,
+  ]
+    .filter((value) => value !== null && value !== undefined)
+    .map((value) => String(value).toLowerCase())
+    .join(" ");
+}
+
+function positionSide(item: PositionView): { label: "多" | "空"; tone: "tone-long" | "tone-short" } {
+  const rawSide = positionRawSide(item);
+  const quantity = asNumber(item.quantity ?? item.snapshot?.quantity);
+  if (rawSide.includes("short") || rawSide.includes("sell") || rawSide.includes("空") || (quantity !== null && quantity < 0)) {
+    return { label: "空", tone: "tone-short" };
+  }
+  return { label: "多", tone: "tone-long" };
+}
+
+function PositionsSummaryCard({
+  positions,
+  expanded,
+  onToggle,
+  onOpenTab,
+}: {
+  positions: PositionView[];
+  expanded: boolean;
+  onToggle: () => void;
+  onOpenTab: () => void;
+}) {
+  const visible = expanded ? positions : positions.slice(0, 3);
+  return (
+    <article className="metric-card positions-summary-card">
+      <div className="metric-icon">
+        <Wallet size={18} />
+      </div>
+      <div className="positions-summary-head">
+        <span>当前仓位</span>
+        <button type="button" onClick={onOpenTab}>查看完整</button>
+      </div>
+      {!positions.length ? (
+        <>
+          <strong>暂无持仓</strong>
+          <p>执行一次或启动循环后，这里会显示开仓标的。</p>
+        </>
+      ) : (
+        <>
+          <strong>{positions.length} 个持仓</strong>
+          <div className="position-summary-list">
+            {visible.map((item) => (
+              <PositionSummaryLine item={item} key={item.symbol} />
+            ))}
+          </div>
+          {positions.length > 3 ? (
+            <button className="link-button" type="button" onClick={onToggle}>
+              {expanded ? "收起" : `展开 ${positions.length - 3} 个更多仓位`}
+            </button>
+          ) : null}
+        </>
+      )}
+    </article>
+  );
+}
+
+function PositionSummaryLine({ item }: { item: PositionView }) {
+  const pnl = asNumber(item.snapshot?.unrealized_pnl);
+  const side = positionSide(item);
+  return (
+    <div className="position-summary-line">
+      <strong>{item.symbol}</strong>
+      <span>
+        <b className={`position-side-badge ${side.tone}`}>{side.label}</b>
+        {item.modeLabel || "持仓"} · {formatAbsQty(item.quantity)} · {formatMoney(item.quoteSpent, item.snapshot?.quote_asset || "USDT")}
+      </span>
+      <em className={pnl !== null && pnl < 0 ? "negative" : "positive"}>{signedMoney(item.snapshot?.unrealized_pnl, item.snapshot?.quote_asset || "USDT")}</em>
+    </div>
+  );
+}
+
+function PositionsPanel({ positions, snapshots }: { positions: PositionView[]; snapshots: PositionSnapshot[] }) {
+  if (!positions.length) {
+    return <EmptyState title="暂无当前仓位" text="开仓后这里会显示完整仓位、浮动盈亏和价格线。" />;
+  }
+  return (
+    <div className="positions-panel">
+      <section className="positions-list-panel">
+        <div className="section-heading compact">
+          <div>
+            <p className="eyebrow">Positions</p>
+            <h2>完整持仓</h2>
+            <span>显示全部当前开仓、数量、成本、现价和浮动盈亏</span>
+          </div>
+        </div>
+        <div className="position-card-grid">
+          {positions.map((item) => (
+            <PositionDetailCard item={item} key={item.symbol} />
+          ))}
+        </div>
+      </section>
+      <PositionPriceCharts snapshots={snapshots} />
+    </div>
+  );
+}
+
+function PositionDetailCard({ item }: { item: PositionView }) {
+  const pnl = asNumber(item.snapshot?.unrealized_pnl);
+  const side = positionSide(item);
+  const quoteAsset = item.snapshot?.quote_asset || "USDT";
+  return (
+    <article className="position-detail-card">
+      <div className="position-detail-head">
+        <div className="position-title">
+          <div>
+            <strong>{item.symbol}</strong>
+            <b className={`position-side-badge ${side.tone}`}>{side.label}</b>
+          </div>
+          <span>{item.modeLabel || "持仓"}</span>
+        </div>
+        <div className="position-pnl-stack">
+          <em className={pnl !== null && pnl < 0 ? "negative" : "positive"}>{signedMoney(item.snapshot?.unrealized_pnl, quoteAsset)}</em>
+          <span className={pnl !== null && pnl < 0 ? "negative" : "positive"}>{signedPercent(item.snapshot?.unrealized_pnl_pct)}</span>
+        </div>
+      </div>
+      <div className="position-detail-grid">
+        <PositionFact label="仓位数量" value={formatAbsQty(item.quantity)} />
+        <PositionFact label="开仓均价" value={formatPrice(item.entryPrice)} />
+        <PositionFact label="现价" value={formatPrice(item.snapshot?.current_price)} />
+        <PositionFact label="最高" value={formatPrice(item.highestPrice)} />
+        <PositionFact label="动态止损" value={formatPrice(item.snapshot?.dynamic_stop_price)} tone={item.snapshot?.stop_triggered ? "danger" : undefined} />
+        <PositionFact label="止盈价" value={formatPrice(item.snapshot?.take_profit_price)} tone={item.snapshot?.take_profit_triggered ? "success" : undefined} />
+        <PositionFact label="投入金额" value={formatMoney(item.quoteSpent, quoteAsset)} />
+        <PositionFact label="开仓时间" value={item.openedAt ? formatTime(item.openedAt) : "--"} />
+      </div>
+    </article>
+  );
+}
+
+function PositionFact({ label, value, tone }: { label: string; value: string; tone?: "success" | "danger" }) {
+  return (
+    <div className={`position-fact${tone ? ` ${tone}` : ""}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   );
 }
 
@@ -729,10 +990,11 @@ function MiniSparkline({ tone, seed }: { tone: "positive" | "warning"; seed: num
 function TradesPanel({ stats, trades }: { stats: PerformanceStats | null; trades: TradeItem[] }) {
   const quote = stats?.quote_asset || "USDT";
   const recent = trades.slice(-10).reverse();
+  const tradeCount = stats?.trade_count ?? stats?.completed_trades ?? 0;
   return (
     <div className="stack-panel">
       <div className="stats-grid">
-        <StatTile label="完成回合" value={trimNumber(stats?.completed_trades ?? 0, 0)} detail={`胜 ${stats?.wins ?? 0} · 负 ${stats?.losses ?? 0}`} />
+        <StatTile label="交易次数" value={trimNumber(tradeCount, 0)} detail={`胜 ${stats?.wins ?? 0} · 负 ${stats?.losses ?? 0}`} />
         <StatTile label="胜率" value={formatPercent(stats?.win_rate ?? 0)} detail={`盈亏比 ${stats?.profit_factor == null ? "--" : trimNumber(stats.profit_factor, 2, 2)}`} />
         <StatTile label="总盈亏" value={signedMoney(stats?.total_pnl ?? 0, quote)} detail={`最大回撤 ${formatMoney(stats?.max_drawdown ?? 0, quote)}`} tone={Number(stats?.total_pnl || 0) < 0 ? "danger" : "success"} />
         <StatTile label="平均盈亏" value={signedMoney(stats?.avg_pnl ?? 0, quote)} detail={`平均收益 ${signedPercent(stats?.avg_return_pct ?? 0)}`} tone={Number(stats?.avg_pnl || 0) < 0 ? "danger" : "success"} />
@@ -808,23 +1070,64 @@ function StatTile({
   );
 }
 
-function DiagnosticsPanel({ diagnostics }: { diagnostics: Diagnostics | null }) {
-  if (!diagnostics) {
-    return <EmptyState title="暂无诊断结果" text="点击诊断广场后查看 Binance Square 抓取与解析状态。" />;
-  }
-  const urls = diagnostics.urls || [];
-  const samples = diagnostics.samples || [];
+function DiagnosticsPanel({
+  diagnostics,
+  settings,
+  busy,
+  updateSetting,
+  onDiagnose,
+}: {
+  diagnostics: Diagnostics | null;
+  settings: SettingsState;
+  busy: boolean;
+  updateSetting: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
+  onDiagnose: () => void;
+}) {
+  const urls = diagnostics?.urls || [];
+  const posts = diagnostics?.display_posts || [];
+  const checkedAt = diagnostics?.checked_at ? formatTime(diagnostics.checked_at) : "--";
   return (
     <div className="diagnostics-layout">
+      <div className="diagnostic-toolbar">
+        <label className="toggle-row">
+          <input
+            type="checkbox"
+            checked={Boolean(settings.square_browser_mode)}
+            onChange={(event) => updateSetting("square_browser_mode", event.target.checked)}
+          />
+          <span>浏览器抓广场</span>
+        </label>
+        <div className="segmented-control" aria-label="真实帖子展示数量">
+          {["10", "20"].map((value) => (
+            <button
+              key={value}
+              className={settings.square_diagnostic_limit === value ? "is-active" : ""}
+              type="button"
+              onClick={() => updateSetting("square_diagnostic_limit", value)}
+            >
+              {value} 条
+            </button>
+          ))}
+        </div>
+        <button className="action-button" type="button" disabled={busy} onClick={onDiagnose}>
+          <Search size={16} />
+          <span>{busy ? "诊断中" : "重新诊断"}</span>
+        </button>
+      </div>
+      {!diagnostics ? <EmptyState title="暂无诊断结果" text="点击诊断广场后查看 Binance Square 抓取与解析状态。" /> : null}
+      {diagnostics ? (
+        <>
       <div className="diagnostic-summary">
-        <span>模式</span>
-        <strong>{diagnostics.mode || "--"}</strong>
+        <span>抓取反馈</span>
+        <strong>{diagnostics.mode || "--"} · {checkedAt}</strong>
         <p>
           有效帖子 {diagnostics.total_posts ?? 0}
           {diagnostics.raw_posts !== undefined ? ` · 原始 ${diagnostics.raw_posts}` : ""}
           {diagnostics.filtered_out_posts !== undefined ? ` · 过滤 ${diagnostics.filtered_out_posts}` : ""}
           {diagnostics.browser_posts_raw !== undefined ? ` · 浏览器 ${diagnostics.browser_posts_raw}` : ""}
+          {diagnostics.display_limit !== undefined ? ` · 展示 ${diagnostics.displayed_posts ?? 0}/${diagnostics.display_limit}` : ""}
         </p>
+        <p>帖子分 = 币种符号分 + 交易语境分 + 非看空/做空语境分 + 流量/长度分。有效帖子仍按原策略过滤；下方列表展示真实抓到的原始帖子。</p>
         {diagnostics.browser_error ? <p className="negative">浏览器错误：{diagnostics.browser_error}</p> : null}
         {diagnostics.hint ? <p className="warning">{diagnostics.hint}</p> : null}
       </div>
@@ -851,18 +1154,58 @@ function DiagnosticsPanel({ diagnostics }: { diagnostics: Diagnostics | null }) 
           </table>
         </div>
       ) : null}
-      <div className="sample-list">
-        {samples.length ? (
-          samples.map((sample, index) => (
-            <article className="sample-post" key={`${sample.title || "sample"}-${index}`}>
-              <strong>{sample.title || "帖子样例"}</strong>
-              <p>{sample.text || "--"}</p>
-            </article>
-          ))
-        ) : (
-          <EmptyState title="没有帖子样例" text="当前诊断没有解析到可展示的帖子内容。" />
-        )}
-      </div>
+      {posts.length ? <DiagnosticPostList posts={posts} /> : <EmptyState title="没有真实帖子" text="当前诊断没有解析到可展示的 Binance Square 帖子内容。" />}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function DiagnosticPostList({ posts }: { posts: DiagnosticsPost[] }) {
+  return (
+    <div className="diagnostic-post-list">
+      {posts.map((post, index) => (
+        <article className="diagnostic-post" key={`${post.url || post.text || "post"}-${index}`}>
+          <div className="diagnostic-post-head">
+            <div>
+              <span className={post.valid_trading_post ? "post-status positive" : "post-status warning"}>
+                {post.valid_trading_post ? "有效帖" : "原始帖"}
+              </span>
+              <strong>{post.title || `真实帖子 #${index + 1}`}</strong>
+            </div>
+            <span className="score-badge">分数 {formatScore(post.score)}</span>
+          </div>
+          <p>{post.text || "--"}</p>
+          <div className="post-meta-row">
+            <span>流量 {trimNumber(post.traffic_score, 0)}</span>
+            <span>长度 {trimNumber(post.score_basis?.text_length, 0)}</span>
+            {post.url ? <span className="url-cell">{post.url}</span> : null}
+          </div>
+          <div className="symbol-chip-row">
+            {post.symbols?.length ? (
+              post.symbols.map((item) => (
+                <span className="symbol-chip" key={`${item.asset}-${item.mentions}`}>
+                  {item.asset} × {item.mentions ?? 0}
+                </span>
+              ))
+            ) : (
+              <span className="muted">未识别币种符号</span>
+            )}
+          </div>
+          <div className="score-breakdown">
+            <span>符号 {formatScore(post.score_basis?.symbol_score)}</span>
+            <span>交易语境 {formatScore(post.score_basis?.context_score)}</span>
+            <span>非看空/做空 {formatScore(post.score_basis?.long_context_score)}</span>
+            <span>流量 {formatScore(post.score_basis?.traffic_score)}</span>
+            <span>长度 {formatScore(post.score_basis?.length_score)}</span>
+          </div>
+          <div className="reason-row">
+            {(post.filter_reasons || []).map((reason) => (
+              <span key={reason}>{reason}</span>
+            ))}
+          </div>
+        </article>
+      ))}
     </div>
   );
 }
@@ -895,58 +1238,14 @@ function SettingsPanel({
 }) {
   const [telegramTestBusy, setTelegramTestBusy] = useState(false);
   const [telegramTestResult, setTelegramTestResult] = useState("");
+  const [saveMessage, setSaveMessage] = useState("");
+  const fieldProps = { settings, updateSetting, setFixedStopEdited };
+  const toggleProps = { settings, updateSetting };
 
-  function Field({
-    name,
-    label,
-    help,
-    type = "text",
-    min,
-    step,
-    placeholder,
-    full = false,
-  }: {
-    name: keyof SettingsState;
-    label: string;
-    help?: string;
-    type?: string;
-    min?: string;
-    step?: string;
-    placeholder?: string;
-    full?: boolean;
-  }) {
-    return (
-      <label className={`field ${full ? "is-full" : ""}`}>
-        <span>{label}</span>
-        <input
-          type={type}
-          min={min}
-          step={step}
-          value={String(settings[name])}
-          placeholder={placeholder}
-          onChange={(event) => {
-            if (name === "fixed_stop_loss_usdt") {
-              setFixedStopEdited(true);
-            }
-            updateSetting(name, event.target.value as never);
-          }}
-        />
-        {help ? <small>{help}</small> : null}
-      </label>
-    );
-  }
-
-  function Toggle({ name, label }: { name: keyof SettingsState; label: string }) {
-    return (
-      <label className="toggle-row">
-        <input
-          type="checkbox"
-          checked={Boolean(settings[name])}
-          onChange={(event) => updateSetting(name, event.target.checked as never)}
-        />
-        <span>{label}</span>
-      </label>
-    );
+  function saveCurrentSettings() {
+    saveSettings(settings);
+    setSaveMessage("已保存");
+    window.setTimeout(() => setSaveMessage(""), 1800);
   }
 
   async function testTelegram() {
@@ -1000,78 +1299,77 @@ function SettingsPanel({
           <small>当前：{PRESET_LABELS[activePreset]}</small>
         </div>
         {activeTab === "basic" && (
-          <SettingsSection title="基础交易" description="控制交易计价、单笔投入和本地状态文件。">
-            <Field name="quote_asset" label="计价币种" />
-            <Field name="order_quote_amount" label="单笔金额" type="number" min="1" step="1" />
-            <Field name="max_open_positions" label="最大持仓数" type="number" min="1" step="1" help="允许同时持有的仓位数量；保守/标准默认为 1，激进预设为 3。" />
-            <Field name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="默认 10 倍，可自由输入；当前现货策略仅用于风险和收益率展示。" />
-            <Field name="state_file" label="状态文件" full />
+          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="基础交易" description="控制交易计价、单笔投入和本地状态文件。">
+            <SettingsField {...fieldProps} name="quote_asset" label="计价币种" />
+            <SettingsField {...fieldProps} name="order_quote_amount" label="单笔金额" type="number" min="1" step="1" />
+            <SettingsField {...fieldProps} name="max_open_positions" label="最大持仓数" type="number" min="1" step="1" help="允许同时持有的仓位数量；保守默认为 1，标准预设为 5，激进预设为 10。" />
+            <SettingsField {...fieldProps} name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="默认 10 倍，可自由输入；当前现货策略仅用于风险和收益率展示。" />
+            <SettingsField {...fieldProps} name="state_file" label="状态文件" full />
           </SettingsSection>
         )}
         {activeTab === "signal" && (
-          <SettingsSection title="信号筛选" description="候选进入排序前必须满足的行情和广场热度条件。">
-            <Field name="min_price_change_percent" label="最低涨幅 %" type="number" step="0.1" />
-            <Field name="min_volatility_percent" label="最低波动 %" type="number" step="0.1" />
-            <Field name="min_quote_volume" label="最低成交额" type="number" min="0" step="100000" full />
-            <Field name="top_post_limit" label="热门帖子数" type="number" min="1" step="1" />
-            <Field name="top_coin_limit" label="热门币种数" type="number" min="1" step="1" />
+          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="信号筛选" description="候选进入排序前必须满足的行情和广场热度条件。">
+            <SettingsField {...fieldProps} name="min_price_change_percent" label="最低涨幅 %" type="number" step="0.1" />
+            <SettingsField {...fieldProps} name="min_volatility_percent" label="最低波动 %" type="number" step="0.1" />
+            <SettingsField {...fieldProps} name="min_quote_volume" label="最低成交额" type="number" min="0" step="100000" full />
+            <SettingsField {...fieldProps} name="top_post_limit" label="热门帖子数" type="number" min="1" step="1" />
+            <SettingsField {...fieldProps} name="top_coin_limit" label="热门币种数" type="number" min="1" step="1" />
           </SettingsSection>
         )}
         {activeTab === "scope" && (
-          <SettingsSection title="交易范围" description="控制允许交易的币种、大盘环境过滤和实盘账户同步。">
-            <Field name="asset_whitelist" label="白名单" placeholder="BTC,ETH,SOL 或 SOLUSDT" help="填写后只交易这些币种；留空表示不限制。" full />
-            <Field name="asset_blacklist" label="黑名单" placeholder="USDC,FDUSD 或 OPNUSDT" help="这些币种永不新开仓，优先级高于候选排序。" full />
-            <Field name="market_filter_assets" label="大盘过滤币种" help="用于判断大盘环境，默认 BTC 和 ETH。" />
-            <Field name="market_filter_min_change_pct" label="大盘最低涨幅 %" type="number" step="0.1" help="低于该 24h 涨幅时暂停追涨开仓。" />
+          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="交易范围" description="控制允许交易的币种、大盘环境过滤和实盘账户同步。">
+            <SettingsField {...fieldProps} name="asset_whitelist" label="白名单" placeholder="BTC,ETH,SOL 或 SOLUSDT" help="填写后只交易这些币种；留空表示不限制。" full />
+            <SettingsField {...fieldProps} name="asset_blacklist" label="黑名单" placeholder="USDC,FDUSD 或 OPNUSDT" help="这些币种永不新开仓，优先级高于候选排序。" full />
+            <SettingsField {...fieldProps} name="market_filter_assets" label="大盘过滤币种" help="用于判断大盘环境，默认 BTC 和 ETH。" />
+            <SettingsField {...fieldProps} name="market_filter_min_change_pct" label="大盘最低涨幅 %" type="number" step="0.1" help="低于该 24h 涨幅时暂停追涨开仓。" />
             <div className="toggle-grid">
-              <Toggle name="market_filter_enabled" label="启用 BTC/ETH 大盘过滤" />
-              <Toggle name="market_filter_require_all" label="要求全部大盘币满足" />
-              <Toggle name="account_sync_enabled" label="实盘成交后账户同步" />
+              <SettingsToggle {...toggleProps} name="market_filter_enabled" label="启用 BTC/ETH 大盘过滤" />
+              <SettingsToggle {...toggleProps} name="market_filter_require_all" label="要求全部大盘币满足" />
+              <SettingsToggle {...toggleProps} name="account_sync_enabled" label="实盘成交后账户同步" />
             </div>
           </SettingsSection>
         )}
         {activeTab === "risk" && (
-          <SettingsSection title="风控退出" description="控制止损、止盈、保本、移动止盈和开仓节流。">
-            <Field name="initial_stop_loss_pct" label="初始止损 %" type="number" min="0.1" step="0.1" />
-            <Field name="take_profit_pct" label="止盈 %" type="number" min="0" step="0.1" />
-            <Field name="breakeven_trigger_pct" label="保本触发 %" type="number" min="0" step="0.1" help="最高价达到该涨幅后，把动态止损抬到成本附近；填 0 关闭。" />
-            <Field name="breakeven_offset_pct" label="保本偏移 %" type="number" step="0.1" help="保本止损相对开仓价的偏移，0 表示刚好成本价。" />
-            <Field name="trailing_start_pct" label="移动止盈启动 %" type="number" min="0" step="0.1" help="最高价达到该涨幅后启用移动止盈。" />
-            <Field name="trailing_stop_pct" label="移动止盈回撤 %" type="number" min="0" step="0.1" help="从最高价回撤该比例时卖出；填 0 关闭。" />
-            <Field name="fixed_stop_loss_usdt" label="固定止损 USDT" type="number" min="1" step="1" help="仅在固定止损模式启用后生效；建议为单笔金额的 10%-25%。" />
-            <Field name="fixed_stop_equity_usdt" label="权益触发 USDT" type="number" min="0" step="1" help="留空则不按账户权益切换固定止损。" />
-            <Field name="cooldown_minutes" label="冷却分钟" type="number" min="0" step="1" help="同一币种卖出后暂停重新开仓；填 0 关闭。" />
-            <Field name="max_daily_trades" label="每日最大开仓" type="number" min="0" step="1" help="按 UTC 日期统计买入次数；填 0 关闭。" />
-            <Field name="max_daily_loss_usdt" label="每日最大亏损 USDT" type="number" min="0" step="1" help="已实现亏损达到后停止新开仓；填 0 关闭。" full />
+          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="风控退出" description="控制止损、止盈、保本、移动止盈和开仓节流。">
+            <SettingsField {...fieldProps} name="initial_stop_loss_pct" label="初始止损 %" type="number" min="0.1" step="0.1" />
+            <SettingsField {...fieldProps} name="take_profit_pct" label="止盈 %" type="number" min="0" step="0.1" />
+            <SettingsField {...fieldProps} name="breakeven_trigger_pct" label="保本触发 %" type="number" min="0" step="0.1" help="最高价达到该涨幅后，把动态止损抬到成本附近；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="breakeven_offset_pct" label="保本偏移 %" type="number" step="0.1" help="保本止损相对开仓价的偏移，0 表示刚好成本价。" />
+            <SettingsField {...fieldProps} name="trailing_start_pct" label="移动止盈启动 %" type="number" min="0" step="0.1" help="最高价达到该涨幅后启用移动止盈。" />
+            <SettingsField {...fieldProps} name="trailing_stop_pct" label="移动止盈回撤 %" type="number" min="0" step="0.1" help="从最高价回撤该比例时卖出；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="fixed_stop_loss_usdt" label="固定止损 USDT" type="number" min="1" step="1" help="仅在固定止损模式启用后生效；建议为单笔金额的 10%-25%。" />
+            <SettingsField {...fieldProps} name="fixed_stop_equity_usdt" label="权益触发 USDT" type="number" min="0" step="1" help="留空则不按账户权益切换固定止损。" />
+            <SettingsField {...fieldProps} name="cooldown_minutes" label="冷却分钟" type="number" min="0" step="1" help="同一币种卖出后暂停重新开仓；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="max_daily_trades" label="每日最大开仓" type="number" min="0" step="1" help="按 UTC 日期统计买入次数；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="max_daily_loss_usdt" label="每日最大亏损 USDT" type="number" min="0" step="1" help="已实现亏损达到后停止新开仓；填 0 关闭。" full />
             <div className="toggle-grid">
-              <Toggle name="fixed_stop_after_first_round_trip" label="首回合后固定止损" />
+              <SettingsToggle {...toggleProps} name="fixed_stop_after_first_round_trip" label="首回合后固定止损" />
             </div>
           </SettingsSection>
         )}
         {activeTab === "cost" && (
-          <SettingsSection title="交易成本" description="用于 dry-run 估算真实成交偏差和手续费。">
-            <Field name="fee_rate_pct" label="手续费 %" type="number" min="0" step="0.01" help="dry-run 估算手续费，影响模拟成本和绩效统计。" />
-            <Field name="slippage_pct" label="滑点 %" type="number" min="0" step="0.01" help="dry-run 买入上浮、卖出下调，用于贴近真实成交。" />
+          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="交易成本" description="用于 dry-run 估算真实成交偏差和手续费。">
+            <SettingsField {...fieldProps} name="fee_rate_pct" label="手续费 %" type="number" min="0" step="0.01" help="dry-run 估算手续费，影响模拟成本和绩效统计。" />
+            <SettingsField {...fieldProps} name="slippage_pct" label="滑点 %" type="number" min="0" step="0.01" help="dry-run 买入上浮、卖出下调，用于贴近真实成交。" />
           </SettingsSection>
         )}
         {activeTab === "runtime" && (
-          <SettingsSection title="运行模式" description="控制循环频率、签名窗口、测试网、实盘和广场抓取方式。">
-            <Field name="poll_seconds" label="轮询秒数" type="number" min="5" step="1" />
-            <Field name="recv_window_ms" label="签名窗口 ms" type="number" min="1000" step="100" />
+          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="运行模式" description="控制循环频率、签名窗口、测试网、实盘和广场抓取方式。">
+            <SettingsField {...fieldProps} name="poll_seconds" label="轮询秒数" type="number" min="5" step="1" />
+            <SettingsField {...fieldProps} name="recv_window_ms" label="签名窗口 ms" type="number" min="1000" step="100" />
             <div className="toggle-grid">
-              <Toggle name="testnet" label="Testnet" />
-              <Toggle name="live" label="Live 实盘" />
-              <Toggle name="square_browser_mode" label="浏览器抓广场" />
+              <SettingsToggle {...toggleProps} name="testnet" label="Testnet" />
+              <SettingsToggle {...toggleProps} name="live" label="Live 实盘" />
             </div>
           </SettingsSection>
         )}
         {activeTab === "notify" && (
-          <SettingsSection title="Telegram 通知" description="交易事件和异常通过 Telegram Bot 推送。">
+          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="Telegram 通知" description="交易事件和异常通过 Telegram Bot 推送。">
             <div className="toggle-grid">
-              <Toggle name="telegram_enabled" label="启用 Telegram 通知" />
+              <SettingsToggle {...toggleProps} name="telegram_enabled" label="启用 Telegram 通知" />
             </div>
-            <Field name="telegram_bot_token" label="Bot Token" type="password" placeholder="123456:ABC-DEF..." help="从 @BotFather 获取的 Bot Token；页面不会从后端回显 Token。" full />
-            <Field name="telegram_chat_id" label="Chat ID" placeholder="-100123456789" help="目标聊天 ID，可以是个人或群组。" />
+            <SettingsField {...fieldProps} name="telegram_bot_token" label="Bot Token" type="password" placeholder="123456:ABC-DEF..." help="从 @BotFather 获取的 Bot Token；页面不会从后端回显 Token。" full />
+            <SettingsField {...fieldProps} name="telegram_chat_id" label="Chat ID" placeholder="-100123456789" help="目标聊天 ID，可以是个人或群组。" />
             <div className="telegram-test-row">
               <button className="action-button tone-secondary" type="button" disabled={telegramTestBusy} onClick={testTelegram}>
                 <Send size={16} />
@@ -1086,21 +1384,102 @@ function SettingsPanel({
   );
 }
 
+function SettingsField({
+  name,
+  label,
+  settings,
+  updateSetting,
+  setFixedStopEdited,
+  help,
+  type = "text",
+  min,
+  step,
+  placeholder,
+  full = false,
+}: {
+  name: keyof SettingsState;
+  label: string;
+  settings: SettingsState;
+  updateSetting: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
+  setFixedStopEdited: (value: boolean) => void;
+  help?: string;
+  type?: string;
+  min?: string;
+  step?: string;
+  placeholder?: string;
+  full?: boolean;
+}) {
+  return (
+    <label className={`field ${full ? "is-full" : ""}`}>
+      <span>{label}</span>
+      <input
+        type={type}
+        min={min}
+        step={step}
+        value={String(settings[name])}
+        placeholder={placeholder}
+        onChange={(event) => {
+          if (name === "fixed_stop_loss_usdt") {
+            setFixedStopEdited(true);
+          }
+          updateSetting(name, event.target.value as never);
+        }}
+      />
+      {help ? <small>{help}</small> : null}
+    </label>
+  );
+}
+
+function SettingsToggle({
+  name,
+  label,
+  settings,
+  updateSetting,
+}: {
+  name: keyof SettingsState;
+  label: string;
+  settings: SettingsState;
+  updateSetting: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
+}) {
+  return (
+    <label className="toggle-row">
+      <input
+        type="checkbox"
+        checked={Boolean(settings[name])}
+        onChange={(event) => updateSetting(name, event.target.checked as never)}
+      />
+      <span>{label}</span>
+    </label>
+  );
+}
+
 function SettingsSection({
   title,
   description,
   children,
+  onSave,
+  saveMessage,
 }: {
   title: string;
   description: string;
   children: ReactNode;
+  onSave: () => void;
+  saveMessage: string;
 }) {
   return (
     <section className="settings-section">
       <div className="section-heading">
-        <p className="eyebrow">Configuration</p>
-        <h2>{title}</h2>
-        <span>{description}</span>
+        <div>
+          <p className="eyebrow">Configuration</p>
+          <h2>{title}</h2>
+          <span>{description}</span>
+        </div>
+        <div className="settings-save-row">
+          {saveMessage ? <small>{saveMessage}</small> : null}
+          <button className="action-button" type="button" onClick={onSave}>
+            保存设置
+          </button>
+        </div>
       </div>
       <div className="settings-grid">{children}</div>
     </section>
@@ -1151,7 +1530,8 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
     recv_window_ms: textValue(config.recv_window_ms) || DEFAULT_SETTINGS.recv_window_ms,
     testnet: textValue(config.base_url).includes("testnet"),
     live: config.dry_run === false,
-    square_browser_mode: Boolean(config.square_browser_mode),
+    square_browser_mode: config.square_browser_mode !== false,
+    square_diagnostic_limit: textValue(config.square_diagnostic_limit) || DEFAULT_SETTINGS.square_diagnostic_limit,
     telegram_bot_token: "",
     telegram_chat_id: textValue(config.telegram_chat_id),
     telegram_enabled: Boolean(config.telegram_enabled),
@@ -1162,43 +1542,104 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
   };
 }
 
+function loadSavedSettings(): Partial<SettingsState> {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as Partial<SettingsState>;
+    if (!localStorage.getItem(SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY)) {
+      parsed.square_browser_mode = true;
+      localStorage.setItem(SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY, "1");
+    }
+    const allowedKeys = new Set(Object.keys(DEFAULT_SETTINGS));
+    return Object.fromEntries(Object.entries(parsed).filter(([key]) => allowedKeys.has(key))) as Partial<SettingsState>;
+  } catch {
+    return {};
+  }
+}
+
+function saveSettings(settings: SettingsState) {
+  localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  localStorage.setItem(SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY, "1");
+}
+
 function formatDefaultFixedStop(value: number): string {
   const rounded = Math.max(1, value * 0.2);
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, "");
 }
 
-function formatLeverage(value: unknown): string {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return "10x";
+function buildPositionViews(positions: Position[], snapshots: PositionSnapshot[]): PositionView[] {
+  const snapshotBySymbol = new Map(snapshots.filter((item) => item?.symbol).map((item) => [String(item.symbol), item]));
+  const seen = new Set<string>();
+  const result: PositionView[] = [];
+  for (const position of positions) {
+    const symbol = String(position.symbol || "");
+    if (!symbol) {
+      continue;
+    }
+    const snapshot = snapshotBySymbol.get(symbol);
+    seen.add(symbol);
+    result.push({
+      symbol,
+      baseAsset: String(position.base_asset || snapshot?.base_asset || symbol.replace(/USDT$/, "")),
+      quantity: snapshot?.quantity ?? position.quantity,
+      entryPrice: snapshot?.entry_price ?? position.entry_price,
+      highestPrice: snapshot?.highest_price ?? position.highest_price,
+      quoteSpent: snapshot?.quote_spent ?? position.quote_spent,
+      openedAt: position.opened_at,
+      snapshot,
+      modeLabel: snapshot?.mode_label,
+    });
   }
-  return `${trimNumber(parsed, 2)}x`;
+  for (const snapshot of snapshots) {
+    const symbol = String(snapshot.symbol || "");
+    if (!symbol || seen.has(symbol)) {
+      continue;
+    }
+    result.push({
+      symbol,
+      baseAsset: String(snapshot.base_asset || symbol.replace(/USDT$/, "")),
+      quantity: snapshot.quantity,
+      entryPrice: snapshot.entry_price,
+      highestPrice: snapshot.highest_price,
+      quoteSpent: snapshot.quote_spent,
+      openedAt: snapshot.opened_at,
+      snapshot,
+      modeLabel: snapshot.mode_label,
+    });
+  }
+  return result;
 }
 
-function positionLabel(position: Position | null, snapshot: PositionSnapshot | null, positionCount = 0): string {
-  if (!position?.symbol) {
-    return "--";
+function positionTotals(positions: PositionView[]) {
+  let marketValue = 0;
+  let unrealizedPnl = 0;
+  let quoteSpent = 0;
+  let hasMarketValue = false;
+  let hasPnl = false;
+  for (const item of positions) {
+    const itemMarketValue = asNumber(item.snapshot?.market_value);
+    if (itemMarketValue !== null) {
+      marketValue += itemMarketValue;
+      hasMarketValue = true;
+    }
+    const itemPnl = asNumber(item.snapshot?.unrealized_pnl);
+    if (itemPnl !== null) {
+      unrealizedPnl += itemPnl;
+      hasPnl = true;
+    }
+    const itemQuoteSpent = asNumber(item.quoteSpent);
+    if (itemQuoteSpent !== null) {
+      quoteSpent += itemQuoteSpent;
+    }
   }
-  const extra = positionCount > 1 ? ` +${positionCount - 1}` : "";
-  return `${snapshot?.mode_label || "持仓"} ${position.symbol}${extra}`;
-}
-
-function positionDetail(position: Position | null, snapshot: PositionSnapshot | null): string {
-  if (!position?.symbol) {
-    return "暂无持仓";
-  }
-  const parts = [
-    `数量 ${formatQty(snapshot?.quantity ?? position.quantity)}`,
-    `成本 ${formatPrice(snapshot?.entry_price ?? position.entry_price)}`,
-  ];
-  if (snapshot?.current_price) {
-    parts.push(`现价 ${formatPrice(snapshot.current_price)}`);
-  }
-  if (snapshot?.highest_price) {
-    parts.push(`最高 ${formatPrice(snapshot.highest_price)}`);
-  }
-  parts.push(`杠杆 ${formatLeverage(snapshot?.leverage_multiplier)}`);
-  return parts.join(" · ");
+  return {
+    marketValue: hasMarketValue ? marketValue : null,
+    unrealizedPnl: hasPnl ? unrealizedPnl : null,
+    unrealizedPnlPct: quoteSpent > 0 && hasPnl ? (unrealizedPnl / quoteSpent) * 100 : null,
+  };
 }
 
 function riskSummary(snapshot: PositionSnapshot | null, guard: EntryGuardSnapshot | null, roundTrips: unknown): string {
@@ -1224,9 +1665,6 @@ function riskSummary(snapshot: PositionSnapshot | null, guard: EntryGuardSnapsho
   }
   if (snapshot?.take_profit_distance_pct) {
     parts.push(`距止盈 ${formatPercent(snapshot.take_profit_distance_pct)}`);
-  }
-  if (snapshot?.leverage_multiplier) {
-    parts.push(`杠杆 ${formatLeverage(snapshot.leverage_multiplier)}`);
   }
   if (guard) {
     const tradeLimit = Number(guard.max_daily_trades || 0);

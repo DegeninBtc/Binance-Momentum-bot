@@ -35,6 +35,7 @@ export type SettingsState = {
   testnet: boolean;
   live: boolean;
   square_browser_mode: boolean;
+  square_diagnostic_limit: string;
   telegram_bot_token: string;
   telegram_chat_id: string;
   telegram_enabled: boolean;
@@ -61,6 +62,29 @@ export type HotAsset = {
   mentions?: Primitive;
   price_change_percent?: Primitive;
   volatility_percent?: Primitive;
+};
+
+export type ChartRangeKey = "1H" | "6H" | "24H" | "7D" | "30D";
+
+export type MarketChartPoint = {
+  time?: Primitive;
+  open?: Primitive;
+  high?: Primitive;
+  low?: Primitive;
+  close?: Primitive;
+};
+
+export type MarketChart = {
+  symbol?: string;
+  range?: ChartRangeKey;
+  interval?: string;
+  points?: MarketChartPoint[];
+  first_close?: Primitive;
+  last_close?: Primitive;
+  high?: Primitive;
+  low?: Primitive;
+  change_percent?: Primitive;
+  error?: string;
 };
 
 export type LastSignal = {
@@ -122,6 +146,7 @@ export type EntryGuardSnapshot = {
 export type PerformanceStats = {
   quote_asset?: string;
   completed_trades?: Primitive;
+  trade_count?: Primitive;
   wins?: Primitive;
   losses?: Primitive;
   win_rate?: Primitive;
@@ -164,8 +189,34 @@ export type DiagnosticsSample = {
   text?: string;
 };
 
+export type DiagnosticsPostScoreBasis = {
+  symbol_score?: Primitive;
+  context_score?: Primitive;
+  long_context_score?: Primitive;
+  traffic_score?: Primitive;
+  length_score?: Primitive;
+  symbol_mentions?: Primitive;
+  has_trading_context?: boolean;
+  long_only_context?: boolean;
+  text_length?: Primitive;
+};
+
+export type DiagnosticsPost = DiagnosticsSample & {
+  score?: Primitive;
+  traffic_score?: Primitive;
+  url?: string;
+  created_at?: string;
+  valid_trading_post?: boolean;
+  filter_reasons?: string[];
+  symbols?: Array<{ asset?: string; mentions?: Primitive }>;
+  score_basis?: DiagnosticsPostScoreBasis;
+};
+
 export type Diagnostics = {
   mode?: string;
+  checked_at?: string;
+  display_limit?: Primitive;
+  displayed_posts?: Primitive;
   total_posts?: Primitive;
   raw_posts?: Primitive;
   filtered_out_posts?: Primitive;
@@ -174,6 +225,7 @@ export type Diagnostics = {
   hint?: string;
   urls?: DiagnosticsUrl[];
   samples?: DiagnosticsSample[];
+  display_posts?: DiagnosticsPost[];
 };
 
 export type BotState = {
@@ -201,6 +253,6 @@ export type DashboardStatus = {
   error?: string;
 };
 
-export type TabKey = "hot" | "trades" | "diag" | "logs" | "settings";
+export type TabKey = "positions" | "hot" | "trades" | "diag" | "logs" | "settings";
 
 export type SettingsTabKey = "basic" | "signal" | "scope" | "risk" | "cost" | "runtime" | "notify";

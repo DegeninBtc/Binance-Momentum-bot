@@ -189,7 +189,8 @@ class BotConfig:
     state_file: str = DEFAULT_STATE_FILE
     dry_run: bool = True
     square_urls: tuple[str, ...] = DEFAULT_SQUARE_URLS
-    square_browser_mode: bool = False
+    square_browser_mode: bool = True
+    square_diagnostic_limit: int = 10
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_enabled: bool = False
@@ -328,6 +329,9 @@ class BinanceSpotClient:
         data = self.public_get("/api/v3/ticker/price", {"symbol": symbol})
         return Decimal(str(data["price"]))
 
+    def klines(self, symbol: str, interval: str, limit: int) -> list[Any]:
+        return self.public_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+
     def market_buy_quote(self, symbol: str, quote_order_qty: Decimal) -> dict[str, Any]:
         params = {
             "symbol": symbol,
@@ -420,13 +424,15 @@ class BinanceSquareScraper:
         deduped.sort(key=lambda item: item.traffic_score, reverse=True)
         return deduped[:limit]
 
-    def diagnose(self, limit: int, browser_mode: bool = False) -> dict[str, Any]:
+    def diagnose(self, limit: int, browser_mode: bool = False, display_limit: int = 10) -> dict[str, Any]:
         result: dict[str, Any] = {
             "checked_at": utc_now(),
             "browser_mode": browser_mode,
+            "display_limit": display_limit,
             "urls": [],
             "total_posts": 0,
             "samples": [],
+            "display_posts": [],
             "browser_hint": "",
         }
         all_posts: list[SquarePost] = []
@@ -478,6 +484,8 @@ class BinanceSquareScraper:
         result["raw_posts"] = len(raw_deduped)
         result["filtered_out_posts"] = max(0, len(raw_deduped) - len(deduped))
         result["total_posts"] = len(deduped)
+        result["displayed_posts"] = min(max(1, display_limit), len(raw_deduped))
+        result["display_posts"] = score_diagnostic_posts(raw_deduped, max(1, display_limit))
         result["samples"] = [post_to_dict(post) for post in deduped[: min(limit, 8)]]
         return result
 
@@ -1140,24 +1148,26 @@ class LongOnlyMomentumBot:
         today = datetime.now(timezone.utc).date()
         buy_count = 0
         realized_pnl = Decimal("0")
-        open_cost: Decimal | None = None
+        open_costs: dict[str, list[Decimal]] = {}
 
         for item in self.state.trade_log:
             action = str(item.get("action", ""))
+            symbol = str(item.get("symbol", ""))
             ts = parse_timestamp(item.get("ts"))
             qty = decimal_from_any(item.get("quantity"))
             price = decimal_from_any(item.get("price"))
-            if qty is None or price is None:
+            if not symbol or qty is None or price is None:
                 continue
             amount = decimal_from_any(item.get("quote_amount")) or qty * price
             if "BUY" in action:
-                open_cost = amount
+                open_costs.setdefault(symbol, []).append(amount)
                 if ts and ts.date() == today:
                     buy_count += 1
             elif "SELL" in action:
+                queue = open_costs.get(symbol) or []
+                open_cost = queue.pop(0) if queue else None
                 if ts and ts.date() == today and open_cost is not None:
                     realized_pnl += amount - open_cost
-                open_cost = None
 
         return {"buy_count": buy_count, "realized_pnl": realized_pnl}
 
@@ -1363,6 +1373,81 @@ def count_coin_mentions(posts: list[SquarePost], base_assets: set[str]) -> Count
             if count:
                 mentions[asset] += count * rank_weight
     return mentions
+
+
+def extract_square_symbols(text: str) -> Counter[str]:
+    upper = text.upper()
+    symbols: Counter[str] = Counter()
+    for asset in re.findall(r"(?<![A-Z0-9])(?:\$|#)([A-Z0-9]{2,12})(?![A-Z0-9])", upper):
+        if is_square_mention_asset(asset):
+            symbols[asset] += 1
+    for asset in STRONG_BARE_SYMBOLS:
+        if is_square_mention_asset(asset):
+            count = len(re.findall(rf"(?<![A-Z0-9]){re.escape(asset)}(?![A-Z0-9])", upper))
+            if count:
+                symbols[asset] += count
+    return symbols
+
+
+def score_diagnostic_posts(posts: list[SquarePost], limit: int) -> list[dict[str, Any]]:
+    scored = [score_diagnostic_post(post) for post in posts]
+    scored.sort(key=lambda item: (item["score"], item.get("traffic_score") or 0), reverse=True)
+    return scored[:limit]
+
+
+def score_diagnostic_post(post: SquarePost) -> dict[str, Any]:
+    text = clean_text(f"{post.title} {post.text}")
+    symbols = extract_square_symbols(text)
+    symbol_total = sum(symbols.values())
+    has_symbol = contains_market_symbol_hint(text)
+    has_context = contains_trading_context(text)
+    long_context = is_long_only_context(text)
+    valid_post = is_valid_square_post(post)
+    traffic = float(post.traffic_score or 0)
+
+    symbol_score = min(35.0, len(symbols) * 8.0 + symbol_total * 3.0)
+    context_score = 25.0 if has_context else 0.0
+    long_score = 20.0 if long_context else -25.0
+    if traffic > 10000:
+        traffic_score = min(20.0, traffic / 50000.0)
+    else:
+        traffic_score = min(10.0, traffic / 120.0)
+    length_score = min(10.0, len(text) / 120.0)
+    total_score = max(0.0, symbol_score + context_score + long_score + traffic_score + length_score)
+
+    filter_reasons: list[str] = []
+    if is_square_noise_post(post):
+        filter_reasons.append("噪音文本或内容过短")
+    if not has_symbol:
+        filter_reasons.append("未识别币种符号")
+    if not has_context:
+        filter_reasons.append("缺少交易语境")
+    if not long_context:
+        filter_reasons.append("含看空或做空语境")
+    if not filter_reasons:
+        filter_reasons.append("通过有效帖过滤")
+
+    payload = post_to_dict(post)
+    payload.update(
+        {
+            "score": round(total_score, 1),
+            "valid_trading_post": valid_post,
+            "filter_reasons": filter_reasons,
+            "symbols": [{"asset": asset, "mentions": count} for asset, count in symbols.most_common(8)],
+            "score_basis": {
+                "symbol_score": round(symbol_score, 1),
+                "context_score": round(context_score, 1),
+                "long_context_score": round(long_score, 1),
+                "traffic_score": round(traffic_score, 1),
+                "length_score": round(length_score, 1),
+                "symbol_mentions": symbol_total,
+                "has_trading_context": has_context,
+                "long_only_context": long_context,
+                "text_length": len(text),
+            },
+        }
+    )
+    return payload
 
 
 def iter_json_objects(blob: str) -> Iterable[dict[str, Any]]:
@@ -1660,7 +1745,8 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         state_file=os.getenv("STATE_FILE", DEFAULT_STATE_FILE),
         dry_run=not args.live,
         square_urls=square_urls,
-        square_browser_mode=args.square_browser or bool_env("SQUARE_BROWSER_MODE", False),
+        square_browser_mode=args.square_browser or bool_env("SQUARE_BROWSER_MODE", True),
+        square_diagnostic_limit=int(os.getenv("SQUARE_DIAGNOSTIC_LIMIT", "10")),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         telegram_enabled=bool_env("TELEGRAM_ENABLED", False),
