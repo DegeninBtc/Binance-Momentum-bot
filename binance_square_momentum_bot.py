@@ -158,6 +158,7 @@ class BotConfig:
     order_quote_amount: Decimal = Decimal("50")
     max_open_positions: int = 1
     leverage_multiplier: Decimal = Decimal("10")
+    contract_simulation_enabled: bool = True
     min_quote_volume: Decimal = Decimal("5000000")
     min_price_change_percent: Decimal = Decimal("3")
     min_volatility_percent: Decimal = Decimal("5")
@@ -165,12 +166,12 @@ class BotConfig:
     top_coin_limit: int = 10
     poll_seconds: int = 300
     recv_window_ms: int = 5000
-    initial_stop_loss_pct: Decimal = Decimal("20")
-    take_profit_pct: Decimal = Decimal("12")
-    breakeven_trigger_pct: Decimal = Decimal("6")
-    breakeven_offset_pct: Decimal = Decimal("0")
-    trailing_start_pct: Decimal = Decimal("8")
-    trailing_stop_pct: Decimal = Decimal("5")
+    initial_stop_loss_pct: Decimal = Decimal("4")
+    take_profit_pct: Decimal = Decimal("0")
+    breakeven_trigger_pct: Decimal = Decimal("3")
+    breakeven_offset_pct: Decimal = Decimal("0.2")
+    trailing_start_pct: Decimal = Decimal("6")
+    trailing_stop_pct: Decimal = Decimal("3")
     fixed_stop_loss_usdt: Decimal = Decimal("10")
     fixed_stop_after_first_round_trip: bool = False
     fixed_stop_equity_usdt: Decimal | None = None
@@ -237,6 +238,10 @@ class PositionState:
     quote_spent: str = "0"
     opened_at: str = ""
     order_id: int | None = None
+    position_mode: str = "spot"
+    margin_quote: str = "0"
+    notional_quote: str = "0"
+    leverage_multiplier: str = "1"
 
 
 @dataclass
@@ -713,21 +718,28 @@ class LongOnlyMomentumBot:
             highest_price = last_price
             position.highest_price = format_decimal(highest_price)
             highest_updated = True
+        margin_quote = self._position_margin(position)
         unrealized_pnl = (last_price - entry_price) * qty
-        unrealized_loss = max(Decimal("0"), (entry_price - last_price) * qty)
+        unrealized_loss = max(Decimal("0"), -unrealized_pnl)
+        unrealized_pnl_pct = (
+            unrealized_pnl / margin_quote * Decimal("100")
+            if self._position_is_contract_sim(position) and margin_quote > 0
+            else (last_price - entry_price) / entry_price * Decimal("100")
+        )
         pct_stop = entry_price * (Decimal("1") - self.config.initial_stop_loss_pct / Decimal("100"))
         dynamic_stop, dynamic_stop_mode = self._dynamic_stop_price(entry_price, highest_price, pct_stop)
         take_profit_price = entry_price * (Decimal("1") + self.config.take_profit_pct / Decimal("100"))
         fixed_mode = self._fixed_stop_enabled()
 
         LOGGER.info(
-            "position %s qty=%s entry=%s last=%s high=%s pnl=%s loss=%s stop_mode=%s dynamic_stop=%s take_profit=%s",
+            "position %s qty=%s entry=%s last=%s high=%s pnl=%s roi=%s loss=%s stop_mode=%s dynamic_stop=%s take_profit=%s",
             symbol,
             qty,
             entry_price,
             last_price,
             highest_price,
             unrealized_pnl,
+            unrealized_pnl_pct,
             unrealized_loss,
             "fixed-usdt+" + dynamic_stop_mode if fixed_mode else dynamic_stop_mode,
             dynamic_stop,
@@ -737,7 +749,11 @@ class LongOnlyMomentumBot:
         should_price_stop = last_price <= dynamic_stop
         should_fixed_stop = fixed_mode and unrealized_loss >= self.config.fixed_stop_loss_usdt
         should_stop = should_fixed_stop or should_price_stop
-        should_take_profit = self.config.take_profit_pct > 0 and last_price >= take_profit_price
+        should_take_profit = (
+            self.config.take_profit_pct > 0
+            and dynamic_stop_mode != "trailing"
+            and last_price >= take_profit_price
+        )
         if should_stop:
             exit_label = "stop loss"
             dry_action = "DRY_RUN_STOP_SELL"
@@ -753,13 +769,18 @@ class LongOnlyMomentumBot:
 
         self._close_position(position, last_price, dry_action, live_action, exit_label)
 
-    def manual_close_position(self) -> None:
+    def manual_close_position(self, symbol: str | None = None, quantity: Decimal | None = None) -> None:
         positions = list(self._active_positions())
         if not positions:
             raise BinanceAPIError("no open position to close")
+        if symbol:
+            wanted_symbol = symbol.upper()
+            positions = [position for position in positions if position.symbol == wanted_symbol]
+            if not positions:
+                raise BinanceAPIError(f"no open position for {wanted_symbol}")
         for position in positions:
             last_price = self.client.ticker_price(position.symbol)
-            self._close_position(position, last_price, "DRY_RUN_MANUAL_SELL", "MANUAL_SELL", "manual close")
+            self._close_position(position, last_price, "DRY_RUN_MANUAL_SELL", "MANUAL_SELL", "manual close", quantity)
 
     def _close_position(
         self,
@@ -768,12 +789,24 @@ class LongOnlyMomentumBot:
         dry_action: str,
         live_action: str,
         exit_label: str,
+        close_quantity: Decimal | None = None,
     ) -> None:
         symbol = position.symbol
         qty = Decimal(position.quantity)
+        wanted_qty = min(qty, close_quantity) if close_quantity is not None else qty
+        full_close_requested = close_quantity is None or wanted_qty >= qty
+        if wanted_qty <= 0:
+            raise BinanceAPIError(f"close quantity for {symbol} must be positive")
         LOGGER.warning("%s triggered for %s", exit_label, symbol)
-        sell_qty = self._safe_sell_quantity(symbol, position.base_asset, qty)
+        sell_qty = self._safe_sell_quantity(symbol, position.base_asset, wanted_qty)
         if sell_qty <= 0:
+            if self.config.dry_run and full_close_requested:
+                LOGGER.info("[dry-run] cleared %s residual quantity below sell step after full close request: %s", symbol, qty)
+                self.state.completed_round_trips += 1
+                self._remove_position(symbol)
+                self._touch_state()
+                self._notify(f"[dry-run] {exit_label} {symbol} cleared residual qty={qty}")
+                return
             LOGGER.error("no sellable balance for %s; clearing local position is unsafe, keeping state", symbol)
             return
         order_check_price = (
@@ -783,11 +816,22 @@ class LongOnlyMomentumBot:
         )
         sell_error = self._sell_order_error(symbol, sell_qty, order_check_price)
         if sell_error:
-            LOGGER.error("cannot close %s: %s; keeping state", symbol, sell_error)
-            return
+            if self.config.dry_run and full_close_requested:
+                LOGGER.info("[dry-run] ignoring close validation for full close %s: %s", symbol, sell_error)
+            else:
+                LOGGER.error("cannot close %s: %s; keeping state", symbol, sell_error)
+                return
 
         if self.config.dry_run:
             fill_price, fee_amount, quote_received = self._dry_run_sell_fill(last_price, sell_qty)
+            if self._position_is_contract_sim(position):
+                gross_quote = sell_qty * fill_price
+                fee_amount = gross_quote * self.config.fee_rate_pct / Decimal("100")
+                entry_price = Decimal(position.entry_price)
+                realized_pnl = (fill_price - entry_price) * sell_qty - fee_amount
+                position_margin = self._position_margin(position)
+                closed_margin = position_margin * (sell_qty / qty) if qty > 0 else position_margin
+                quote_received = closed_margin + realized_pnl
             LOGGER.warning("[dry-run] would SELL %s %s at market price=%s fee=%s", sell_qty, symbol, fill_price, fee_amount)
             self._append_trade(
                 dry_action,
@@ -798,8 +842,22 @@ class LongOnlyMomentumBot:
                 fee_amount=fee_amount,
                 quote_amount=quote_received,
             )
-            self.state.completed_round_trips += 1
-            self._remove_position(symbol)
+            remaining_qty = max(Decimal("0"), qty - sell_qty)
+            if remaining_qty > 0 and not full_close_requested:
+                if self._position_is_contract_sim(position):
+                    remaining_margin = max(Decimal("0"), self._position_margin(position) - (self._position_margin(position) * (sell_qty / qty)))
+                    position.margin_quote = format_decimal(remaining_margin)
+                    position.quote_spent = format_decimal(remaining_margin)
+                    position.notional_quote = format_decimal(remaining_qty * Decimal(position.entry_price))
+                else:
+                    position.quote_spent = format_decimal(remaining_qty * Decimal(position.entry_price))
+                position.quantity = format_decimal(remaining_qty)
+                self._replace_position(position)
+            else:
+                if remaining_qty > 0:
+                    LOGGER.info("[dry-run] cleared %s residual quantity after full close request: %s", symbol, remaining_qty)
+                self.state.completed_round_trips += 1
+                self._remove_position(symbol)
             self._touch_state()
             mode = "[dry-run] " if self.config.dry_run else ""
             self._notify(f"{mode}{exit_label} {symbol} qty={sell_qty} price={fill_price}")
@@ -808,7 +866,7 @@ class LongOnlyMomentumBot:
         order = self.client.market_sell_quantity(symbol, sell_qty)
         avg_price = average_fill_price(order) or last_price
         self._append_trade(live_action, symbol, sell_qty, avg_price, order)
-        remaining_qty = Decimal("0")
+        remaining_qty = max(Decimal("0"), qty - sell_qty)
         if self.config.account_sync_enabled:
             remaining_qty = round_down_to_step(
                 self._account_asset_balance(position.base_asset),
@@ -863,12 +921,14 @@ class LongOnlyMomentumBot:
         if self.config.dry_run:
             fill_price, qty, fee_amount, quote_spent = self._dry_run_buy_fill(candidate.last_price)
             LOGGER.warning(
-                "[dry-run] would BUY %s with %s %s price=%s fee=%s",
+                "[dry-run] would BUY %s with %s %s price=%s fee=%s mode=%s leverage=%sx",
                 candidate.symbol,
                 self.config.order_quote_amount,
                 self.config.quote_asset,
                 fill_price,
                 fee_amount,
+                "contract-sim" if self.config.contract_simulation_enabled else "spot",
+                self.config.leverage_multiplier if self.config.contract_simulation_enabled else Decimal("1"),
             )
             self._open_position(candidate, qty, fill_price, None, quote_spent=quote_spent, fee_amount=fee_amount)
             return
@@ -887,6 +947,19 @@ class LongOnlyMomentumBot:
                 LOGGER.warning("account sync reduced buy quantity for %s from %s to %s", candidate.symbol, qty, synced_qty)
                 qty = synced_qty
         self._open_position(candidate, qty, avg_price, order)
+
+    def _position_leverage(self, position: PositionState) -> Decimal:
+        parsed = decimal_from_any(position.leverage_multiplier)
+        return parsed if parsed and parsed > 0 else Decimal("1")
+
+    def _position_margin(self, position: PositionState) -> Decimal:
+        margin = decimal_from_any(position.margin_quote)
+        if margin and margin > 0:
+            return margin
+        return decimal_from_any(position.quote_spent) or Decimal("0")
+
+    def _position_is_contract_sim(self, position: PositionState) -> bool:
+        return self.config.dry_run and position.position_mode == "contract-sim"
 
     def _select_trade_candidate(
         self,
@@ -1006,6 +1079,10 @@ class LongOnlyMomentumBot:
         fee_amount: Decimal | None = None,
     ) -> None:
         spent = quote_spent if quote_spent is not None else quantity * entry_price
+        leverage = self.config.leverage_multiplier if self.config.dry_run and self.config.contract_simulation_enabled else Decimal("1")
+        position_mode = "contract-sim" if self.config.dry_run and self.config.contract_simulation_enabled else "spot"
+        margin_quote = spent if position_mode == "contract-sim" else Decimal("0")
+        notional_quote = quantity * entry_price
         new_position = PositionState(
             symbol=candidate.symbol,
             base_asset=candidate.base_asset,
@@ -1015,6 +1092,10 @@ class LongOnlyMomentumBot:
             highest_price=format_decimal(entry_price),
             opened_at=utc_now(),
             order_id=int(order["orderId"]) if order and "orderId" in order else None,
+            position_mode=position_mode,
+            margin_quote=format_decimal(margin_quote),
+            notional_quote=format_decimal(notional_quote),
+            leverage_multiplier=format_decimal(leverage),
         )
         positions = [item for item in self._active_positions() if item.symbol != candidate.symbol]
         positions.append(new_position)
@@ -1148,7 +1229,7 @@ class LongOnlyMomentumBot:
         today = datetime.now(timezone.utc).date()
         buy_count = 0
         realized_pnl = Decimal("0")
-        open_costs: dict[str, list[Decimal]] = {}
+        open_costs: dict[str, list[dict[str, Decimal]]] = {}
 
         for item in self.state.trade_log:
             action = str(item.get("action", ""))
@@ -1160,14 +1241,27 @@ class LongOnlyMomentumBot:
                 continue
             amount = decimal_from_any(item.get("quote_amount")) or qty * price
             if "BUY" in action:
-                open_costs.setdefault(symbol, []).append(amount)
+                open_costs.setdefault(symbol, []).append({"qty": qty, "amount": amount})
                 if ts and ts.date() == today:
                     buy_count += 1
             elif "SELL" in action:
                 queue = open_costs.get(symbol) or []
-                open_cost = queue.pop(0) if queue else None
-                if ts and ts.date() == today and open_cost is not None:
-                    realized_pnl += amount - open_cost
+                remaining_sell_qty = qty
+                while remaining_sell_qty > 0 and queue:
+                    open_trade = queue[0]
+                    open_qty = open_trade["qty"]
+                    closed_qty = min(open_qty, remaining_sell_qty)
+                    ratio = closed_qty / qty if qty > 0 else Decimal("1")
+                    open_ratio = closed_qty / open_qty if open_qty > 0 else Decimal("1")
+                    exit_amount = amount * ratio
+                    entry_amount = open_trade["amount"] * open_ratio
+                    if ts and ts.date() == today:
+                        realized_pnl += exit_amount - entry_amount
+                    open_trade["qty"] = open_qty - closed_qty
+                    open_trade["amount"] = open_trade["amount"] - entry_amount
+                    remaining_sell_qty -= closed_qty
+                    if open_trade["qty"] <= 0:
+                        queue.pop(0)
 
         return {"buy_count": buy_count, "realized_pnl": realized_pnl}
 
@@ -1203,10 +1297,11 @@ class LongOnlyMomentumBot:
 
     def _buy_order_error(self, symbol: str, quote_amount: Decimal, price: Decimal) -> str | None:
         rules = symbol_order_rules(self.client.exchange_info(), symbol)
-        if rules.min_notional > 0 and quote_amount < rules.min_notional:
-            return f"quote amount {quote_amount} is below min notional {rules.min_notional}"
+        gross_quote = quote_amount * self.config.leverage_multiplier if self.config.dry_run and self.config.contract_simulation_enabled else quote_amount
+        if rules.min_notional > 0 and gross_quote < rules.min_notional:
+            return f"quote amount {gross_quote} is below min notional {rules.min_notional}"
         estimate_price = price * (Decimal("1") + self.config.slippage_pct / Decimal("100")) if self.config.dry_run else price
-        estimate_quote = max(Decimal("0"), quote_amount - (quote_amount * self.config.fee_rate_pct / Decimal("100")))
+        estimate_quote = max(Decimal("0"), gross_quote - (gross_quote * self.config.fee_rate_pct / Decimal("100")))
         estimated_qty = estimate_quote / estimate_price if estimate_price > 0 else Decimal("0")
         if rules.min_qty > 0 and estimated_qty < rules.min_qty:
             return f"estimated quantity {estimated_qty} is below min quantity {rules.min_qty}"
@@ -1223,11 +1318,12 @@ class LongOnlyMomentumBot:
 
     def _dry_run_buy_fill(self, market_price: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         fill_price = market_price * (Decimal("1") + self.config.slippage_pct / Decimal("100"))
-        gross_quote = self.config.order_quote_amount
+        margin_quote = self.config.order_quote_amount
+        gross_quote = margin_quote * self.config.leverage_multiplier if self.config.contract_simulation_enabled else margin_quote
         fee_amount = gross_quote * self.config.fee_rate_pct / Decimal("100")
         net_quote = max(Decimal("0"), gross_quote - fee_amount)
         quantity = net_quote / fill_price if fill_price > 0 else Decimal("0")
-        return fill_price, quantity, fee_amount, gross_quote
+        return fill_price, quantity, fee_amount, margin_quote
 
     def _dry_run_sell_fill(self, market_price: Decimal, quantity: Decimal) -> tuple[Decimal, Decimal, Decimal]:
         fill_price = market_price * (Decimal("1") - self.config.slippage_pct / Decimal("100"))
@@ -1714,6 +1810,7 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         order_quote_amount=order_quote_amount,
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
         leverage_multiplier=leverage_multiplier,
+        contract_simulation_enabled=bool_env("CONTRACT_SIMULATION_ENABLED", True),
         min_quote_volume=decimal_env("MIN_QUOTE_VOLUME_USDT", "5000000") or Decimal("5000000"),
         min_price_change_percent=decimal_env("MIN_PRICE_CHANGE_PERCENT", "3") or Decimal("3"),
         min_volatility_percent=decimal_env("MIN_VOLATILITY_PERCENT", "5") or Decimal("5"),
@@ -1721,12 +1818,12 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         top_coin_limit=int(os.getenv("TOP_COIN_LIMIT", "10")),
         poll_seconds=int(os.getenv("POLL_SECONDS", "300")),
         recv_window_ms=int(os.getenv("RECV_WINDOW_MS", "5000")),
-        initial_stop_loss_pct=decimal_env("INITIAL_STOP_LOSS_PCT", "20") or Decimal("20"),
-        take_profit_pct=decimal_env("TAKE_PROFIT_PCT", "12"),
-        breakeven_trigger_pct=decimal_env("BREAKEVEN_TRIGGER_PCT", "6"),
-        breakeven_offset_pct=decimal_env("BREAKEVEN_OFFSET_PCT", "0"),
-        trailing_start_pct=decimal_env("TRAILING_START_PCT", "8"),
-        trailing_stop_pct=decimal_env("TRAILING_STOP_PCT", "5"),
+        initial_stop_loss_pct=decimal_env("INITIAL_STOP_LOSS_PCT", "4") or Decimal("4"),
+        take_profit_pct=decimal_env("TAKE_PROFIT_PCT", "0"),
+        breakeven_trigger_pct=decimal_env("BREAKEVEN_TRIGGER_PCT", "3"),
+        breakeven_offset_pct=decimal_env("BREAKEVEN_OFFSET_PCT", "0.2"),
+        trailing_start_pct=decimal_env("TRAILING_START_PCT", "6"),
+        trailing_stop_pct=decimal_env("TRAILING_STOP_PCT", "3"),
         fixed_stop_loss_usdt=fixed_stop_loss_usdt,
         fixed_stop_after_first_round_trip=bool_env("FIXED_STOP_AFTER_FIRST_ROUND_TRIP", False),
         fixed_stop_equity_usdt=decimal_env("FIXED_STOP_EQUITY_USDT"),

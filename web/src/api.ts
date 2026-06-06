@@ -22,6 +22,19 @@ export async function postAction(path: string, payload: SettingsState): Promise<
   return data;
 }
 
+export async function postPositionClose(payload: SettingsState & { symbol: string; close_quantity: string }): Promise<DashboardStatus> {
+  const response = await fetch("/api/close-position", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = (await response.json()) as DashboardStatus;
+  if (!response.ok) {
+    throw new Error(data.error || response.statusText);
+  }
+  return data;
+}
+
 export async function fetchMarketChart(symbol: string, range: ChartRangeKey, testnet: boolean): Promise<MarketChart> {
   const params = new URLSearchParams({ symbol, range, testnet: String(testnet) });
   const response = await fetch(`/api/market-chart?${params.toString()}`, { cache: "no-store" });

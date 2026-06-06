@@ -7,6 +7,7 @@ export type SettingsState = {
   order_quote_amount: string;
   max_open_positions: string;
   leverage_multiplier: string;
+  contract_simulation_enabled: boolean;
   state_file: string;
   min_price_change_percent: string;
   min_volatility_percent: string;
@@ -51,6 +52,7 @@ export type Candidate = {
   price_change_percent?: Primitive;
   combined_score?: Primitive;
   volatility_percent?: Primitive;
+  last_price?: Primitive;
 };
 
 export type HotAsset = {
@@ -60,6 +62,7 @@ export type HotAsset = {
   market_score?: Primitive;
   square_score?: Primitive;
   mentions?: Primitive;
+  last_price?: Primitive;
   price_change_percent?: Primitive;
   volatility_percent?: Primitive;
 };
@@ -111,18 +114,24 @@ export type PositionSnapshot = {
   quote_asset?: string;
   dry_run?: boolean;
   mode_label?: string;
+  position_mode?: string;
+  contract_simulation?: boolean;
   quantity?: Primitive;
   entry_price?: Primitive;
   highest_price?: Primitive;
   quote_spent?: Primitive;
+  margin_quote?: Primitive;
+  notional_quote?: Primitive;
   opened_at?: string;
   current_price?: Primitive;
   price_error?: string;
   market_value?: Primitive;
   unrealized_pnl?: Primitive;
   unrealized_pnl_pct?: Primitive;
+  price_change_pct?: Primitive;
   leveraged_unrealized_pnl_pct?: Primitive;
   leverage_multiplier?: Primitive;
+  liquidation_price?: Primitive;
   active_stop_mode?: string;
   dynamic_stop_price?: Primitive;
   take_profit_price?: Primitive;
@@ -253,6 +262,6 @@ export type DashboardStatus = {
   error?: string;
 };
 
-export type TabKey = "positions" | "hot" | "trades" | "diag" | "logs" | "settings";
+export type TabKey = "positions" | "hot" | "favorites" | "strategy" | "trades" | "diag" | "logs" | "notify" | "settings";
 
-export type SettingsTabKey = "basic" | "signal" | "scope" | "risk" | "cost" | "runtime" | "notify";
+export type SettingsTabKey = "basic" | "signal" | "scope" | "risk" | "cost" | "runtime";

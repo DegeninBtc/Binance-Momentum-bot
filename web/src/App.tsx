@@ -5,11 +5,13 @@ import {
   Activity,
   AlertCircle,
   BarChart3,
+  BellRing,
   BookOpen,
   CheckCircle2,
   CircleDollarSign,
   Clock3,
   Database,
+  ExternalLink,
   Flame,
   Home,
   KeyRound,
@@ -30,7 +32,7 @@ import {
   TrendingUp,
   Wallet,
 } from "lucide-react";
-import { fetchMarketChart, fetchStatus, postAction } from "./api";
+import { fetchMarketChart, fetchStatus, postAction, postPositionClose } from "./api";
 import {
   actionLabel,
   asNumber,
@@ -71,6 +73,7 @@ const DEFAULT_SETTINGS: SettingsState = {
   order_quote_amount: "50",
   max_open_positions: "1",
   leverage_multiplier: "10",
+  contract_simulation_enabled: true,
   state_file: "bot_state.json",
   min_price_change_percent: "3",
   min_volatility_percent: "5",
@@ -81,12 +84,12 @@ const DEFAULT_SETTINGS: SettingsState = {
   asset_blacklist: "",
   market_filter_assets: "BTC,ETH",
   market_filter_min_change_pct: "-1",
-  initial_stop_loss_pct: "20",
-  take_profit_pct: "12",
-  breakeven_trigger_pct: "6",
-  breakeven_offset_pct: "0",
-  trailing_start_pct: "8",
-  trailing_stop_pct: "5",
+  initial_stop_loss_pct: "4",
+  take_profit_pct: "0",
+  breakeven_trigger_pct: "3",
+  breakeven_offset_pct: "0.2",
+  trailing_start_pct: "6",
+  trailing_stop_pct: "3",
   fixed_stop_loss_usdt: "10",
   fixed_stop_equity_usdt: "",
   cooldown_minutes: "30",
@@ -112,9 +115,12 @@ const DEFAULT_SETTINGS: SettingsState = {
 const TAB_ITEMS: Array<{ key: TabKey; label: string; icon: LucideIcon }> = [
   { key: "positions", label: "当前仓位", icon: Wallet },
   { key: "hot", label: "热门币种", icon: Flame },
+  { key: "strategy", label: "策略", icon: Activity },
+  { key: "favorites", label: "收藏", icon: Star },
   { key: "trades", label: "交易记录", icon: CircleDollarSign },
   { key: "diag", label: "广场诊断", icon: Search },
   { key: "logs", label: "日志", icon: Database },
+  { key: "notify", label: "通知", icon: BellRing },
   { key: "settings", label: "设置", icon: SettingsIcon },
 ];
 
@@ -125,7 +131,6 @@ const SETTINGS_TABS: Array<{ key: SettingsTabKey; label: string }> = [
   { key: "risk", label: "风控退出" },
   { key: "cost", label: "交易成本" },
   { key: "runtime", label: "运行模式" },
-  { key: "notify", label: "通知" },
 ];
 
 const STRATEGY_PRESETS = {
@@ -175,6 +180,8 @@ const PRESET_LABELS: Record<StrategyPresetKey, string> = {
 const CHART_RANGES: ChartRangeKey[] = ["1H", "6H", "24H", "7D", "30D"];
 const SETTINGS_STORAGE_KEY = "dashboard-settings";
 const SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY = "dashboard-settings-browser-default-v1";
+const SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY = "dashboard-settings-contract-default-v1";
+const FAVORITES_STORAGE_KEY = "dashboard-favorite-symbols";
 
 function App() {
   const [status, setStatus] = useState<DashboardStatus | null>(null);
@@ -192,6 +199,7 @@ function App() {
   const [chartLoading, setChartLoading] = useState(false);
   const [chartError, setChartError] = useState("");
   const [positionsExpanded, setPositionsExpanded] = useState(false);
+  const [favoriteSymbols, setFavoriteSymbols] = useState<string[]>(() => loadFavoriteSymbols());
 
   const refresh = useCallback(async () => {
     try {
@@ -221,6 +229,10 @@ function App() {
     }
   }, [settingsHydrated, status?.config]);
 
+  useEffect(() => {
+    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favoriteSymbols));
+  }, [favoriteSymbols]);
+
   const config = status?.config || {};
   const state = status?.state || {};
   const signal = status?.last_signal || {};
@@ -242,6 +254,8 @@ function App() {
   const heroSymbol = candidate?.symbol || position?.symbol || "OPNUSDT";
   const updatedAt = status?.last_finished_at || status?.last_started_at || "--";
   const totals = useMemo(() => positionTotals(positionViews), [positionViews]);
+  const hotAssets = signal.hot_assets || [];
+  const favoriteSet = useMemo(() => new Set(favoriteSymbols), [favoriteSymbols]);
 
   const riskTone = useMemo(() => {
     if (hasError || snapshot?.stop_triggered || guard?.entry_blocked) {
@@ -313,6 +327,26 @@ function App() {
     setActivePreset(name);
   }
 
+  function openDashboardTab(tab: TabKey, settingsTab?: SettingsTabKey) {
+    setActiveTab(tab);
+    if (settingsTab) {
+      setActiveSettingsTab(settingsTab);
+    }
+  }
+
+  function toggleFavorite(symbol: string) {
+    const normalized = normalizeSymbol(symbol);
+    if (!normalized) {
+      return;
+    }
+    setFavoriteSymbols((current) => {
+      if (current.includes(normalized)) {
+        return current.filter((item) => item !== normalized);
+      }
+      return [...current, normalized].sort();
+    });
+  }
+
   async function submit(path: string, nextTab?: TabKey) {
     setBusyPath(path);
     if (nextTab) {
@@ -320,6 +354,28 @@ function App() {
     }
     try {
       const data = await postAction(path, settings);
+      setStatus(data);
+      setRequestError("");
+      window.setTimeout(refresh, 800);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "Request failed");
+    } finally {
+      setBusyPath("");
+    }
+  }
+
+  async function closePosition(symbol: string, quantity: string) {
+    const quantityText = trimNumber(quantity, 8);
+    const message = settings.live
+      ? `确认实盘市价平仓 ${symbol} 数量 ${quantityText}？这个操作会真实下单。`
+      : `确认模拟平仓 ${symbol} 数量 ${quantityText}？`;
+    if (!window.confirm(message)) {
+      return;
+    }
+    const busyKey = `/api/close-position:${symbol}`;
+    setBusyPath(busyKey);
+    try {
+      const data = await postPositionClose({ ...settings, symbol, close_quantity: quantity });
       setStatus(data);
       setRequestError("");
       window.setTimeout(refresh, 800);
@@ -350,22 +406,28 @@ function App() {
       <aside className="side-rail" aria-label="主导航">
         <div className="rail-logo">B</div>
         <nav className="rail-nav">
-          <button className="is-active" type="button" title="首页">
+          <button className={activeTab === "positions" ? "is-active" : ""} type="button" title="首页" onClick={() => openDashboardTab("positions")}>
             <Home size={20} />
           </button>
-          <button type="button" title="行情">
+          <button className={activeTab === "hot" ? "is-active" : ""} type="button" title="行情" onClick={() => openDashboardTab("hot")}>
             <BarChart3 size={20} />
           </button>
-          <button type="button" title="策略">
+          <button className={activeTab === "strategy" ? "is-active" : ""} type="button" title="策略" onClick={() => openDashboardTab("strategy")}>
             <Activity size={20} />
           </button>
-          <button type="button" title="记录">
+          <button className={activeTab === "favorites" ? "is-active" : ""} type="button" title="收藏" onClick={() => openDashboardTab("favorites")}>
+            <Star size={20} />
+          </button>
+          <button className={activeTab === "trades" ? "is-active" : ""} type="button" title="记录" onClick={() => openDashboardTab("trades")}>
             <Database size={20} />
           </button>
-          <button type="button" title="说明">
+          <button className={activeTab === "logs" ? "is-active" : ""} type="button" title="说明" onClick={() => openDashboardTab("logs")}>
             <BookOpen size={20} />
           </button>
-          <button type="button" title="设置" onClick={() => setActiveTab("settings")}>
+          <button className={activeTab === "notify" ? "is-active" : ""} type="button" title="通知" onClick={() => openDashboardTab("notify")}>
+            <BellRing size={20} />
+          </button>
+          <button className={activeTab === "settings" ? "is-active" : ""} type="button" title="设置" onClick={() => openDashboardTab("settings", "basic")}>
             <SettingsIcon size={20} />
           </button>
         </nav>
@@ -381,6 +443,14 @@ function App() {
           </div>
         </div>
         <div className="top-status">
+          <button
+            className={`icon-button top-notify-button ${activeTab === "notify" ? "is-active" : ""}`}
+            type="button"
+            title="通知设置"
+            onClick={() => openDashboardTab("notify")}
+          >
+            <BellRing size={17} />
+          </button>
           <StatusBadge
             tone={hasError ? "danger" : running ? "warning" : "success"}
             icon={running ? Activity : hasError ? AlertCircle : CheckCircle2}
@@ -410,16 +480,25 @@ function App() {
             <div className="hero-title-row">
               <div>
                 <p><span>市场指令</span> <strong>Market Command</strong></p>
-                <h1>{heroSymbol}</h1>
+                <a className="hero-symbol-link" href={tradingViewChartUrl(heroSymbol)} target="_blank" rel="noreferrer">
+                  <h1>{heroSymbol}</h1>
+                </a>
               </div>
-              <Star className="hero-star" size={28} />
+              <button
+                className={`hero-star-button ${favoriteSet.has(normalizeSymbol(heroSymbol)) ? "is-active" : ""}`}
+                type="button"
+                title={favoriteSet.has(normalizeSymbol(heroSymbol)) ? "取消收藏" : "收藏币种"}
+                onClick={() => toggleFavorite(heroSymbol)}
+              >
+                <Star size={28} fill="currentColor" />
+              </button>
             </div>
             <div className="hero-score-row">
               <HeroScore label="综合分" value={formatScore(candidate?.combined_score ?? candidate?.price_change_percent ?? 0)} />
               <HeroScore label="24h 涨幅" value={formatPercent(candidate?.price_change_percent ?? 0)} tone="positive" />
               <HeroScore label="波动率" value={formatPercent(candidate?.volatility_percent ?? 0)} tone="warning" />
             </div>
-            <MarketCurve chart={marketChart} loading={chartLoading} error={chartError} />
+            <MarketCurve chart={marketChart} loading={chartLoading} error={chartError} chartUrl={tradingViewChartUrl(heroSymbol)} />
             <div className="range-tabs" aria-label="行情周期">
               {CHART_RANGES.map((range) => (
                 <button
@@ -462,6 +541,7 @@ function App() {
             detail={totals.marketValue !== null ? `市值 ${formatMoney(totals.marketValue, quoteAsset)} · 持仓 ${positionViews.length}` : snapshot?.price_error || "等待当前价格"}
             icon={totals.unrealizedPnl !== null && totals.unrealizedPnl < 0 ? TrendingDown : TrendingUp}
             tone={totals.unrealizedPnl !== null && totals.unrealizedPnl < 0 ? "danger" : "success"}
+            onClick={() => openDashboardTab("positions")}
           />
           <MetricCard
             label="运行 / 风控"
@@ -469,6 +549,7 @@ function App() {
             detail={riskSummary(snapshot, guard, state.completed_round_trips)}
             icon={Target}
             tone={riskTone}
+            onClick={() => openDashboardTab("settings", "risk")}
           />
         </section>
 
@@ -511,8 +592,36 @@ function App() {
         </nav>
 
         <section className="tab-surface">
-          {activeTab === "positions" && <PositionsPanel positions={positionViews} snapshots={snapshots} />}
-          {activeTab === "hot" && <HotAssetsTable items={signal.hot_assets || []} />}
+          {activeTab === "positions" && (
+            <PositionsPanel
+              positions={positionViews}
+              snapshots={snapshots}
+              onClosePosition={closePosition}
+              busySymbol={busyPath.startsWith("/api/close-position:") ? busyPath.split(":")[1] : ""}
+            />
+          )}
+          {activeTab === "hot" && (
+            <HotAssetsTable
+              items={hotAssets}
+              favoriteSymbols={favoriteSet}
+              onToggleFavorite={toggleFavorite}
+            />
+          )}
+          {activeTab === "favorites" && (
+            <FavoritesPanel
+              favoriteSymbols={favoriteSymbols}
+              hotAssets={hotAssets}
+              onToggleFavorite={toggleFavorite}
+            />
+          )}
+          {activeTab === "strategy" && (
+            <StrategyPanel
+              activePreset={activePreset}
+              applyStrategyPreset={applyStrategyPreset}
+              openSettingsTab={(tab) => openDashboardTab("settings", tab)}
+              settings={settings}
+            />
+          )}
           {activeTab === "trades" && <TradesPanel stats={performance} trades={trades} />}
           {activeTab === "diag" && (
             <DiagnosticsPanel
@@ -524,14 +633,18 @@ function App() {
             />
           )}
           {activeTab === "logs" && <LogsPanel logs={status?.logs || []} requestError={requestError} />}
+          {activeTab === "notify" && (
+            <NotificationPanel
+              settings={settings}
+              updateSetting={updateSetting}
+            />
+          )}
           {activeTab === "settings" && (
             <SettingsPanel
               activeTab={activeSettingsTab}
               settings={settings}
-              activePreset={activePreset}
               setActiveTab={setActiveSettingsTab}
               setFixedStopEdited={setFixedStopEdited}
-              applyStrategyPreset={applyStrategyPreset}
               updateSetting={updateSetting}
             />
           )}
@@ -569,14 +682,14 @@ function HeroScore({ label, value, tone = "default" }: { label: string; value: s
   );
 }
 
-function MarketCurve({ chart, loading, error }: { chart: MarketChart | null; loading: boolean; error: string }) {
+function MarketCurve({ chart, loading, error, chartUrl }: { chart: MarketChart | null; loading: boolean; error: string; chartUrl: string }) {
   const closes = (chart?.points || []).map((item) => asNumber(item.close)).filter((item): item is number => item !== null && Number.isFinite(item));
   const paths = buildMarketCurvePaths(closes);
   const change = asNumber(chart?.change_percent);
   const tone = change !== null && change < 0 ? "negative" : "positive";
   const label = loading ? "加载行情..." : error || (change !== null ? `${chart?.range || "24H"} ${signedPercent(change)}` : chart?.range || "24H");
   return (
-    <div className={`market-curve tone-${tone}`} aria-label={label} title={label}>
+    <a className={`market-curve tone-${tone}`} href={chartUrl} target="_blank" rel="noreferrer" aria-label={`${label}，在 TradingView 打开`} title="在 TradingView 打开走势图">
       <svg viewBox="0 0 760 150" preserveAspectRatio="none">
         <defs>
           <linearGradient id="curveFill" x1="0" x2="0" y1="0" y2="1">
@@ -589,7 +702,7 @@ function MarketCurve({ chart, loading, error }: { chart: MarketChart | null; loa
         <line x1="0" y1={paths.baseline} x2="760" y2={paths.baseline} />
       </svg>
       <span>{label}</span>
-    </div>
+    </a>
   );
 }
 
@@ -620,29 +733,53 @@ function roundPathNumber(value: number): string {
   return value.toFixed(2).replace(/\.?0+$/, "");
 }
 
+function normalizeSymbol(symbol?: Primitive): string {
+  const clean = String(symbol || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!clean) {
+    return "";
+  }
+  return clean.endsWith("USDT") ? clean : `${clean}USDT`;
+}
+
+function tradingViewChartUrl(symbol: string): string {
+  const cleanSymbol = normalizeSymbol(symbol) || "BTCUSDT";
+  const params = new URLSearchParams({ symbol: `BINANCE:${cleanSymbol}` });
+  return `https://www.tradingview.com/chart/?${params.toString()}`;
+}
+
 function MetricCard({
   label,
   value,
   detail,
   icon: Icon,
   tone = "muted",
+  onClick,
 }: {
   label: string;
   value: string;
   detail: string;
   icon: LucideIcon;
   tone?: "success" | "warning" | "danger" | "muted";
+  onClick?: () => void;
 }) {
-  return (
-    <article className={`metric-card tone-${tone}`}>
+  const content = (
+    <>
       <div className="metric-icon">
         <Icon size={18} />
       </div>
       <span>{label}</span>
       <strong>{value}</strong>
       <p>{detail}</p>
-    </article>
+    </>
   );
+  if (onClick) {
+    return (
+      <button className={`metric-card metric-card-button tone-${tone}`} type="button" onClick={onClick}>
+        {content}
+      </button>
+    );
+  }
+  return <article className={`metric-card tone-${tone}`}>{content}</article>;
 }
 
 type PositionView = {
@@ -660,6 +797,25 @@ type PositionView = {
 function formatAbsQty(value: Primitive): string {
   const parsed = asNumber(value);
   return parsed === null ? formatQty(value) : formatQty(Math.abs(parsed));
+}
+
+function formatOrderQuantity(value: Primitive, fraction: number): string {
+  const parsed = asNumber(value);
+  if (parsed === null) {
+    return "";
+  }
+  const quantity = Math.abs(parsed) * fraction;
+  return quantity.toFixed(8).replace(/\.?0+$/, "");
+}
+
+function isPositiveNumber(value: string): boolean {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0;
+}
+
+function formatLeverageBadge(value: Primitive): string {
+  const parsed = asNumber(value);
+  return parsed === null ? "--x" : `${trimNumber(parsed, 2)}x`;
 }
 
 function positionRawSide(item: PositionView): string {
@@ -698,7 +854,23 @@ function PositionsSummaryCard({
 }) {
   const visible = expanded ? positions : positions.slice(0, 3);
   return (
-    <article className="metric-card positions-summary-card">
+    <article
+      className="metric-card positions-summary-card metric-card-button"
+      role="button"
+      tabIndex={0}
+      onClick={(event) => {
+        if ((event.target as HTMLElement).closest("button")) {
+          return;
+        }
+        onOpenTab();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpenTab();
+        }
+      }}
+    >
       <div className="metric-icon">
         <Wallet size={18} />
       </div>
@@ -745,7 +917,17 @@ function PositionSummaryLine({ item }: { item: PositionView }) {
   );
 }
 
-function PositionsPanel({ positions, snapshots }: { positions: PositionView[]; snapshots: PositionSnapshot[] }) {
+function PositionsPanel({
+  positions,
+  snapshots,
+  onClosePosition,
+  busySymbol,
+}: {
+  positions: PositionView[];
+  snapshots: PositionSnapshot[];
+  onClosePosition: (symbol: string, quantity: string) => void;
+  busySymbol: string;
+}) {
   if (!positions.length) {
     return <EmptyState title="暂无当前仓位" text="开仓后这里会显示完整仓位、浮动盈亏和价格线。" />;
   }
@@ -761,7 +943,12 @@ function PositionsPanel({ positions, snapshots }: { positions: PositionView[]; s
         </div>
         <div className="position-card-grid">
           {positions.map((item) => (
-            <PositionDetailCard item={item} key={item.symbol} />
+            <PositionDetailCard
+              item={item}
+              key={`${item.symbol}-${formatOrderQuantity(item.quantity, 1)}`}
+              onClosePosition={onClosePosition}
+              busy={busySymbol === item.symbol}
+            />
           ))}
         </div>
       </section>
@@ -770,17 +957,32 @@ function PositionsPanel({ positions, snapshots }: { positions: PositionView[]; s
   );
 }
 
-function PositionDetailCard({ item }: { item: PositionView }) {
+function PositionDetailCard({
+  item,
+  onClosePosition,
+  busy,
+}: {
+  item: PositionView;
+  onClosePosition: (symbol: string, quantity: string) => void;
+  busy: boolean;
+}) {
   const pnl = asNumber(item.snapshot?.unrealized_pnl);
   const side = positionSide(item);
   const quoteAsset = item.snapshot?.quote_asset || "USDT";
+  const isContractSim = Boolean(item.snapshot?.contract_simulation);
+  const [closeQuantity, setCloseQuantity] = useState(() => formatOrderQuantity(item.quantity, 1));
+  const closeOptions = [25, 50, 75, 100];
   return (
     <article className="position-detail-card">
       <div className="position-detail-head">
         <div className="position-title">
           <div>
-            <strong>{item.symbol}</strong>
+            <a className="position-symbol-link" href={tradingViewChartUrl(item.symbol)} target="_blank" rel="noreferrer" title="在 TradingView 打开">
+              <strong>{item.symbol}</strong>
+              <ExternalLink size={15} aria-hidden="true" />
+            </a>
             <b className={`position-side-badge ${side.tone}`}>{side.label}</b>
+            <b className="position-leverage-badge">{formatLeverageBadge(item.snapshot?.leverage_multiplier)}</b>
           </div>
           <span>{item.modeLabel || "持仓"}</span>
         </div>
@@ -793,11 +995,37 @@ function PositionDetailCard({ item }: { item: PositionView }) {
         <PositionFact label="仓位数量" value={formatAbsQty(item.quantity)} />
         <PositionFact label="开仓均价" value={formatPrice(item.entryPrice)} />
         <PositionFact label="现价" value={formatPrice(item.snapshot?.current_price)} />
-        <PositionFact label="最高" value={formatPrice(item.highestPrice)} />
+        <PositionFact label={isContractSim ? "名义仓位" : "最高"} value={isContractSim ? formatMoney(item.snapshot?.notional_quote, quoteAsset) : formatPrice(item.highestPrice)} />
         <PositionFact label="动态止损" value={formatPrice(item.snapshot?.dynamic_stop_price)} tone={item.snapshot?.stop_triggered ? "danger" : undefined} />
-        <PositionFact label="止盈价" value={formatPrice(item.snapshot?.take_profit_price)} tone={item.snapshot?.take_profit_triggered ? "success" : undefined} />
-        <PositionFact label="投入金额" value={formatMoney(item.quoteSpent, quoteAsset)} />
+        <PositionFact label={isContractSim ? "预估强平" : "止盈价"} value={isContractSim ? formatPrice(item.snapshot?.liquidation_price) : formatPrice(item.snapshot?.take_profit_price)} tone={item.snapshot?.take_profit_triggered ? "success" : undefined} />
+        <PositionFact label={isContractSim ? "保证金" : "投入金额"} value={formatMoney(isContractSim ? item.snapshot?.margin_quote : item.quoteSpent, quoteAsset)} />
         <PositionFact label="开仓时间" value={item.openedAt ? formatTime(item.openedAt) : "--"} />
+      </div>
+      <div className="position-close-panel">
+        <span>平仓</span>
+        <div className="position-close-options">
+          {closeOptions.map((percent) => (
+            <button
+              type="button"
+              key={percent}
+              disabled={busy}
+              onClick={() => onClosePosition(item.symbol, formatOrderQuantity(item.quantity, percent / 100))}
+            >
+              {percent}%
+            </button>
+          ))}
+        </div>
+        <div className="position-close-custom">
+          <input
+            value={closeQuantity}
+            inputMode="decimal"
+            onChange={(event) => setCloseQuantity(event.target.value)}
+            aria-label={`${item.symbol} 平仓数量`}
+          />
+          <button type="button" disabled={busy || !isPositiveNumber(closeQuantity)} onClick={() => onClosePosition(item.symbol, closeQuantity)}>
+            {busy ? "处理中" : "平仓"}
+          </button>
+        </div>
       </div>
     </article>
   );
@@ -913,7 +1141,15 @@ function ActionButton({
   );
 }
 
-function HotAssetsTable({ items }: { items: HotAsset[] }) {
+function HotAssetsTable({
+  items,
+  favoriteSymbols,
+  onToggleFavorite,
+}: {
+  items: HotAsset[];
+  favoriteSymbols: Set<string>;
+  onToggleFavorite: (symbol: string) => void;
+}) {
   if (!items.length) {
     return <EmptyState title="暂无热门币种" text="点击刷新信号后查看广场热度与市场动能排行。" />;
   }
@@ -928,6 +1164,7 @@ function HotAssetsTable({ items }: { items: HotAsset[] }) {
               <th>综合分</th>
               <th>市场分</th>
               <th>广场分</th>
+              <th>实时价格</th>
             <th>24h 涨幅</th>
             <th>波动率</th>
           </tr>
@@ -936,10 +1173,18 @@ function HotAssetsTable({ items }: { items: HotAsset[] }) {
           {items.map((item, index) => (
             <tr key={`${item.symbol || item.asset || index}-${index}`} className={index === 0 ? "is-leader" : ""}>
               <td className="mono muted">{index + 1}</td>
-              <td className="favorite-cell"><Star size={16} /></td>
+              <td className="favorite-cell">
+                <FavoriteButton
+                  symbol={item.symbol || item.asset || ""}
+                  active={favoriteSymbols.has(normalizeSymbol(item.symbol || item.asset))}
+                  onToggle={onToggleFavorite}
+                />
+              </td>
               <td className="symbol-cell">
-                <span className="coin-avatar">{coinInitial(item.symbol || item.asset)}</span>
-                {item.symbol || item.asset || "--"}
+                <a href={tradingViewChartUrl(item.symbol || item.asset || "")} target="_blank" rel="noreferrer">
+                  <span className="coin-avatar">{coinInitial(item.symbol || item.asset)}</span>
+                  {item.symbol || item.asset || "--"}
+                </a>
               </td>
               <td className="mono accent">{formatScore(item.score)}</td>
               <td className="mono">{formatScore(item.market_score)}</td>
@@ -947,6 +1192,7 @@ function HotAssetsTable({ items }: { items: HotAsset[] }) {
                 {formatScore(item.square_score)}
                 {item.mentions ? <span className="muted"> ({item.mentions})</span> : null}
               </td>
+              <td className="mono">{formatPrice(item.last_price)}</td>
               <td className="mono positive">
                 <span className="trend-wrap">
                   <span>{formatPercent(item.price_change_percent)}</span>
@@ -963,6 +1209,116 @@ function HotAssetsTable({ items }: { items: HotAsset[] }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function FavoriteButton({
+  symbol,
+  active,
+  onToggle,
+}: {
+  symbol: string;
+  active: boolean;
+  onToggle: (symbol: string) => void;
+}) {
+  return (
+    <button
+      className={`favorite-button ${active ? "is-active" : ""}`}
+      type="button"
+      disabled={!normalizeSymbol(symbol)}
+      title={active ? "取消收藏" : "收藏币种"}
+      onClick={() => onToggle(symbol)}
+    >
+      <Star size={16} fill="currentColor" />
+    </button>
+  );
+}
+
+function FavoritesPanel({
+  favoriteSymbols,
+  hotAssets,
+  onToggleFavorite,
+}: {
+  favoriteSymbols: string[];
+  hotAssets: HotAsset[];
+  onToggleFavorite: (symbol: string) => void;
+}) {
+  if (!favoriteSymbols.length) {
+    return <EmptyState title="暂无收藏币种" text="点击市场指令或热门币种列表里的星标，把关注的币种加入收藏。" />;
+  }
+  const hotAssetBySymbol = new Map(hotAssets.map((item) => [normalizeSymbol(item.symbol || item.asset), item]));
+  const favoriteRows = favoriteSymbols.map((symbol) => hotAssetBySymbol.get(symbol) || { symbol });
+  return (
+    <div className="favorites-panel">
+      <div className="section-heading compact">
+        <div>
+          <p className="eyebrow">Favorites</p>
+          <h2>收藏币种</h2>
+          <span>收藏会保存在本地浏览器，币种名称点击打开 TradingView。</span>
+        </div>
+      </div>
+      <HotAssetsTable items={favoriteRows} favoriteSymbols={new Set(favoriteSymbols)} onToggleFavorite={onToggleFavorite} />
+    </div>
+  );
+}
+
+function StrategyPanel({
+  activePreset,
+  applyStrategyPreset,
+  openSettingsTab,
+  settings,
+}: {
+  activePreset: StrategyPresetKey;
+  applyStrategyPreset: (name: StrategyPresetKey) => void;
+  openSettingsTab: (tab: SettingsTabKey) => void;
+  settings: SettingsState;
+}) {
+  const strategyLinks: Array<{ title: string; detail: string; tab: SettingsTabKey }> = [
+    { title: "信号筛选", detail: "涨幅、波动率、成交额、热门帖子数和热门币种数。", tab: "signal" },
+    { title: "交易范围", detail: "白名单、黑名单、大盘过滤和交易资产范围。", tab: "scope" },
+    { title: "风控退出", detail: "止损、止盈、保本、移动止损和日内风控。", tab: "risk" },
+    { title: "运行模式", detail: "循环秒数、测试网、实盘和浏览器抓广场。", tab: "runtime" },
+  ];
+  return (
+    <div className="strategy-panel">
+      <section className="strategy-hero">
+        <div>
+          <p className="eyebrow">Strategy</p>
+          <h2>策略中枢</h2>
+          <span>策略相关入口单独收纳，后续可以继续扩展独立策略、回测和参数模板。</span>
+        </div>
+        <strong>{PRESET_LABELS[activePreset]}</strong>
+      </section>
+      <section className="strategy-preset-panel">
+        <span>策略参数预设</span>
+        <div className="preset-row">
+          {(Object.keys(STRATEGY_PRESETS) as StrategyPresetKey[]).map((name) => (
+            <button
+              className={activePreset === name ? "is-active" : ""}
+              type="button"
+              key={name}
+              onClick={() => applyStrategyPreset(name)}
+            >
+              {PRESET_LABELS[name]}
+            </button>
+          ))}
+        </div>
+        <small>
+          {settings.contract_simulation_enabled ? `合约模拟 ${settings.leverage_multiplier}x` : "现货模拟"}
+          {" · "}最大持仓 {settings.max_open_positions}
+          {" · "}单笔保证金 {settings.order_quote_amount} {settings.quote_asset}
+          {" · "}固定止盈 {Number(settings.take_profit_pct) > 0 ? `${settings.take_profit_pct}%` : "关闭"}
+        </small>
+      </section>
+      <section className="strategy-link-grid">
+        {strategyLinks.map((item) => (
+          <button type="button" key={item.tab} onClick={() => openSettingsTab(item.tab)}>
+            <strong>{item.title}</strong>
+            <span>{item.detail}</span>
+          </button>
+        ))}
+      </section>
     </div>
   );
 }
@@ -1219,27 +1575,17 @@ function LogsPanel({ logs, requestError }: { logs: string[]; requestError: strin
   );
 }
 
-function SettingsPanel({
-  activeTab,
+function NotificationPanel({
   settings,
-  activePreset,
-  setActiveTab,
-  setFixedStopEdited,
-  applyStrategyPreset,
   updateSetting,
 }: {
-  activeTab: SettingsTabKey;
   settings: SettingsState;
-  activePreset: StrategyPresetKey;
-  setActiveTab: (tab: SettingsTabKey) => void;
-  setFixedStopEdited: (value: boolean) => void;
-  applyStrategyPreset: (name: StrategyPresetKey) => void;
   updateSetting: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
 }) {
   const [telegramTestBusy, setTelegramTestBusy] = useState(false);
   const [telegramTestResult, setTelegramTestResult] = useState("");
   const [saveMessage, setSaveMessage] = useState("");
-  const fieldProps = { settings, updateSetting, setFixedStopEdited };
+  const fieldProps = { settings, updateSetting, setFixedStopEdited: (_value: boolean) => undefined };
   const toggleProps = { settings, updateSetting };
 
   function saveCurrentSettings() {
@@ -1270,6 +1616,49 @@ function SettingsPanel({
   }
 
   return (
+    <div className="notification-panel">
+      <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="Telegram 通知" description="交易事件和异常通过 Telegram Bot 推送。">
+        <div className="toggle-grid">
+          <SettingsToggle {...toggleProps} name="telegram_enabled" label="启用 Telegram 通知" />
+        </div>
+        <SettingsField {...fieldProps} name="telegram_bot_token" label="Bot Token" type="password" placeholder="123456:ABC-DEF..." help="从 @BotFather 获取的 Bot Token；页面不会从后端回显 Token。" full />
+        <SettingsField {...fieldProps} name="telegram_chat_id" label="Chat ID" placeholder="-100123456789" help="目标聊天 ID，可以是个人或群组。" />
+        <div className="telegram-test-row">
+          <button className="action-button tone-secondary" type="button" disabled={telegramTestBusy} onClick={testTelegram}>
+            <Send size={16} />
+            <span>{telegramTestBusy ? "发送中" : "测试通知"}</span>
+          </button>
+          {telegramTestResult ? <small>{telegramTestResult}</small> : null}
+        </div>
+      </SettingsSection>
+    </div>
+  );
+}
+
+function SettingsPanel({
+  activeTab,
+  settings,
+  setActiveTab,
+  setFixedStopEdited,
+  updateSetting,
+}: {
+  activeTab: SettingsTabKey;
+  settings: SettingsState;
+  setActiveTab: (tab: SettingsTabKey) => void;
+  setFixedStopEdited: (value: boolean) => void;
+  updateSetting: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
+}) {
+  const [saveMessage, setSaveMessage] = useState("");
+  const fieldProps = { settings, updateSetting, setFixedStopEdited };
+  const toggleProps = { settings, updateSetting };
+
+  function saveCurrentSettings() {
+    saveSettings(settings);
+    setSaveMessage("已保存");
+    window.setTimeout(() => setSaveMessage(""), 1800);
+  }
+
+  return (
     <div className="settings-layout">
       <aside className="settings-menu">
         {SETTINGS_TABS.map((item) => (
@@ -1284,27 +1673,16 @@ function SettingsPanel({
         ))}
       </aside>
       <div className="settings-content">
-        <div className="preset-row">
-          <span>策略参数预设</span>
-          {(Object.keys(STRATEGY_PRESETS) as StrategyPresetKey[]).map((name) => (
-            <button
-              className={activePreset === name ? "is-active" : ""}
-              type="button"
-              key={name}
-              onClick={() => applyStrategyPreset(name)}
-            >
-              {PRESET_LABELS[name]}
-            </button>
-          ))}
-          <small>当前：{PRESET_LABELS[activePreset]}</small>
-        </div>
         {activeTab === "basic" && (
           <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="基础交易" description="控制交易计价、单笔投入和本地状态文件。">
             <SettingsField {...fieldProps} name="quote_asset" label="计价币种" />
             <SettingsField {...fieldProps} name="order_quote_amount" label="单笔金额" type="number" min="1" step="1" />
             <SettingsField {...fieldProps} name="max_open_positions" label="最大持仓数" type="number" min="1" step="1" help="允许同时持有的仓位数量；保守默认为 1，标准预设为 5，激进预设为 10。" />
-            <SettingsField {...fieldProps} name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="默认 10 倍，可自由输入；当前现货策略仅用于风险和收益率展示。" />
+            <SettingsField {...fieldProps} name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="合约模拟中用于计算名义仓位、保证金收益和强平风险；实盘仍不会自动切换为合约下单。" />
             <SettingsField {...fieldProps} name="state_file" label="状态文件" full />
+            <div className="toggle-grid is-full">
+              <SettingsToggle {...toggleProps} name="contract_simulation_enabled" label="Dry-run 使用合约模拟" />
+            </div>
           </SettingsSection>
         )}
         {activeTab === "signal" && (
@@ -1330,7 +1708,7 @@ function SettingsPanel({
           </SettingsSection>
         )}
         {activeTab === "risk" && (
-          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="风控退出" description="控制止损、止盈、保本、移动止盈和开仓节流。">
+          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="风控退出" description="控制初始止损、保本、移动止盈和开仓节流；止盈为 0 时让移动止损负责退出。">
             <SettingsField {...fieldProps} name="initial_stop_loss_pct" label="初始止损 %" type="number" min="0.1" step="0.1" />
             <SettingsField {...fieldProps} name="take_profit_pct" label="止盈 %" type="number" min="0" step="0.1" />
             <SettingsField {...fieldProps} name="breakeven_trigger_pct" label="保本触发 %" type="number" min="0" step="0.1" help="最高价达到该涨幅后，把动态止损抬到成本附近；填 0 关闭。" />
@@ -1360,22 +1738,6 @@ function SettingsPanel({
             <div className="toggle-grid">
               <SettingsToggle {...toggleProps} name="testnet" label="Testnet" />
               <SettingsToggle {...toggleProps} name="live" label="Live 实盘" />
-            </div>
-          </SettingsSection>
-        )}
-        {activeTab === "notify" && (
-          <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="Telegram 通知" description="交易事件和异常通过 Telegram Bot 推送。">
-            <div className="toggle-grid">
-              <SettingsToggle {...toggleProps} name="telegram_enabled" label="启用 Telegram 通知" />
-            </div>
-            <SettingsField {...fieldProps} name="telegram_bot_token" label="Bot Token" type="password" placeholder="123456:ABC-DEF..." help="从 @BotFather 获取的 Bot Token；页面不会从后端回显 Token。" full />
-            <SettingsField {...fieldProps} name="telegram_chat_id" label="Chat ID" placeholder="-100123456789" help="目标聊天 ID，可以是个人或群组。" />
-            <div className="telegram-test-row">
-              <button className="action-button tone-secondary" type="button" disabled={telegramTestBusy} onClick={testTelegram}>
-                <Send size={16} />
-                <span>{telegramTestBusy ? "发送中" : "测试通知"}</span>
-              </button>
-              {telegramTestResult ? <small>{telegramTestResult}</small> : null}
             </div>
           </SettingsSection>
         )}
@@ -1503,6 +1865,7 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
     order_quote_amount: textValue(config.order_quote_amount) || DEFAULT_SETTINGS.order_quote_amount,
     max_open_positions: textValue(config.max_open_positions) || DEFAULT_SETTINGS.max_open_positions,
     leverage_multiplier: textValue(config.leverage_multiplier) || DEFAULT_SETTINGS.leverage_multiplier,
+    contract_simulation_enabled: config.contract_simulation_enabled !== false,
     state_file: textValue(config.state_file) || DEFAULT_SETTINGS.state_file,
     min_price_change_percent: textValue(config.min_price_change_percent) || DEFAULT_SETTINGS.min_price_change_percent,
     min_volatility_percent: textValue(config.min_volatility_percent) || DEFAULT_SETTINGS.min_volatility_percent,
@@ -1553,6 +1916,16 @@ function loadSavedSettings(): Partial<SettingsState> {
       parsed.square_browser_mode = true;
       localStorage.setItem(SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY, "1");
     }
+    if (!localStorage.getItem(SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY)) {
+      if (parsed.initial_stop_loss_pct === "20") parsed.initial_stop_loss_pct = DEFAULT_SETTINGS.initial_stop_loss_pct;
+      if (parsed.take_profit_pct === "12") parsed.take_profit_pct = DEFAULT_SETTINGS.take_profit_pct;
+      if (parsed.breakeven_trigger_pct === "6") parsed.breakeven_trigger_pct = DEFAULT_SETTINGS.breakeven_trigger_pct;
+      if (parsed.breakeven_offset_pct === "0") parsed.breakeven_offset_pct = DEFAULT_SETTINGS.breakeven_offset_pct;
+      if (parsed.trailing_start_pct === "8") parsed.trailing_start_pct = DEFAULT_SETTINGS.trailing_start_pct;
+      if (parsed.trailing_stop_pct === "5") parsed.trailing_stop_pct = DEFAULT_SETTINGS.trailing_stop_pct;
+      parsed.contract_simulation_enabled = parsed.contract_simulation_enabled !== false;
+      localStorage.setItem(SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY, "1");
+    }
     const allowedKeys = new Set(Object.keys(DEFAULT_SETTINGS));
     return Object.fromEntries(Object.entries(parsed).filter(([key]) => allowedKeys.has(key))) as Partial<SettingsState>;
   } catch {
@@ -1560,9 +1933,23 @@ function loadSavedSettings(): Partial<SettingsState> {
   }
 }
 
+function loadFavoriteSymbols(): string[] {
+  try {
+    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return Array.from(new Set(parsed.map((item) => normalizeSymbol(item)).filter(Boolean))).sort();
+  } catch {
+    return [];
+  }
+}
+
 function saveSettings(settings: SettingsState) {
   localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   localStorage.setItem(SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY, "1");
+  localStorage.setItem(SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY, "1");
 }
 
 function formatDefaultFixedStop(value: number): string {

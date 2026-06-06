@@ -159,6 +159,14 @@ class BotRunner:
         self.worker.start()
         return self.status()
 
+    def close_position(self, config: Any, symbol: str, quantity: Decimal) -> dict[str, Any]:
+        if not self._claim("close-position-live" if not config.dry_run else "close-position-dry-run", config):
+            LOGGER.info("position close ignored because another bot task is already running")
+            return self.status()
+        self.worker = threading.Thread(target=self._close_position_worker, args=(config, symbol, quantity), daemon=True)
+        self.worker.start()
+        return self.status()
+
     def start_loop(self, config: Any) -> dict[str, Any]:
         if not self._claim("loop-live" if not config.dry_run else "loop-dry-run", config):
             LOGGER.info("start-loop ignored because another bot task is already running")
@@ -234,6 +242,15 @@ class BotRunner:
             return
         self._finish()
 
+    def _close_position_worker(self, config: Any, symbol: str, quantity: Decimal) -> None:
+        try:
+            bot_module().LongOnlyMomentumBot(config).manual_close_position(symbol=symbol, quantity=quantity)
+        except Exception as exc:
+            LOGGER.exception("position close failed")
+            self._finish(str(exc))
+            return
+        self._finish()
+
     def _loop_worker(self, config: Any) -> None:
         try:
             bot = bot_module().LongOnlyMomentumBot(config)
@@ -304,6 +321,7 @@ def candidate_score_row(candidate: Any) -> dict[str, Any]:
             "market_score": candidate.market_score,
             "square_score": candidate.square_score,
             "mentions": candidate.mention_count,
+            "last_price": candidate.last_price,
             "price_change_percent": candidate.price_change_percent,
             "volatility_percent": candidate.volatility_percent,
             "quote_volume": candidate.quote_volume,
@@ -396,6 +414,20 @@ def reset_dry_run_state(runner: BotRunner, config: Any) -> dict[str, Any]:
     return runner.status()
 
 
+def close_position_from_payload(runner: BotRunner, config: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{3,20}", symbol):
+        raise ValueError("symbol must be a Binance spot symbol")
+    raw_quantity = payload.get("close_quantity")
+    try:
+        quantity = Decimal(str(raw_quantity))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("close_quantity must be a positive number") from None
+    if quantity <= 0:
+        raise ValueError("close_quantity must be a positive number")
+    return runner.close_position(config, symbol, quantity)
+
+
 def test_telegram(config: Any) -> dict[str, Any]:
     module = bot_module()
     if not config.telegram_bot_token or not config.telegram_chat_id:
@@ -477,28 +509,43 @@ def build_performance_stats(state: dict[str, Any], quote_asset: str) -> dict[str
             open_trades.setdefault(symbol, []).append(
                 {
                     "symbol": symbol,
+                    "qty": qty,
                     "amount": amount,
                     "ts": ts,
                     "dry_run": bool(item.get("dry_run", True)),
                 }
             )
         elif "SELL" in action and open_trades.get(symbol):
-            open_trade = open_trades[symbol].pop(0)
-            pnl = amount - open_trade["amount"]
-            return_pct = pnl / open_trade["amount"] * Decimal("100") if open_trade["amount"] > 0 else Decimal("0")
-            completed.append(
-                {
-                    "symbol": symbol,
-                    "pnl": pnl,
-                    "return_pct": return_pct,
-                    "entry_amount": open_trade["amount"],
-                    "exit_amount": amount,
-                    "opened_at": open_trade["ts"],
-                    "closed_at": ts,
-                    "dry_run": open_trade["dry_run"],
-                    "exit_action": action,
-                }
-            )
+            remaining_sell_qty = qty
+            queue = open_trades[symbol]
+            while remaining_sell_qty > 0 and queue:
+                open_trade = queue[0]
+                open_qty = open_trade["qty"]
+                closed_qty = min(open_qty, remaining_sell_qty)
+                ratio = closed_qty / qty if qty > 0 else Decimal("1")
+                open_ratio = closed_qty / open_qty if open_qty > 0 else Decimal("1")
+                exit_amount = amount * ratio
+                entry_amount = open_trade["amount"] * open_ratio
+                pnl = exit_amount - entry_amount
+                return_pct = pnl / entry_amount * Decimal("100") if entry_amount > 0 else Decimal("0")
+                completed.append(
+                    {
+                        "symbol": symbol,
+                        "pnl": pnl,
+                        "return_pct": return_pct,
+                        "entry_amount": entry_amount,
+                        "exit_amount": exit_amount,
+                        "opened_at": open_trade["ts"],
+                        "closed_at": ts,
+                        "dry_run": open_trade["dry_run"],
+                        "exit_action": action,
+                    }
+                )
+                open_trade["qty"] = open_qty - closed_qty
+                open_trade["amount"] = open_trade["amount"] - entry_amount
+                remaining_sell_qty -= closed_qty
+                if open_trade["qty"] <= 0:
+                    queue.pop(0)
 
     total = len(completed)
     wins = [item for item in completed if item["pnl"] > 0]
@@ -558,7 +605,7 @@ def build_entry_guard_snapshot(state: dict[str, Any], config: Any) -> dict[str, 
     today = module.datetime.now(module.timezone.utc).date()
     buy_count = 0
     realized_pnl = Decimal("0")
-    open_costs: dict[str, list[Decimal]] = {}
+    open_costs: dict[str, list[dict[str, Decimal]]] = {}
 
     for item in state.get("trade_log") or []:
         action = str(item.get("action", ""))
@@ -570,14 +617,27 @@ def build_entry_guard_snapshot(state: dict[str, Any], config: Any) -> dict[str, 
             continue
         amount = decimal_from_state(item.get("quote_amount")) or qty * price
         if "BUY" in action:
-            open_costs.setdefault(symbol, []).append(amount)
+            open_costs.setdefault(symbol, []).append({"qty": qty, "amount": amount})
             if ts and ts.date() == today:
                 buy_count += 1
         elif "SELL" in action:
             queue = open_costs.get(symbol) or []
-            open_cost = queue.pop(0) if queue else None
-            if ts and ts.date() == today and open_cost is not None:
-                realized_pnl += amount - open_cost
+            remaining_sell_qty = qty
+            while remaining_sell_qty > 0 and queue:
+                open_trade = queue[0]
+                open_qty = open_trade["qty"]
+                closed_qty = min(open_qty, remaining_sell_qty)
+                ratio = closed_qty / qty if qty > 0 else Decimal("1")
+                open_ratio = closed_qty / open_qty if open_qty > 0 else Decimal("1")
+                exit_amount = amount * ratio
+                entry_amount = open_trade["amount"] * open_ratio
+                if ts and ts.date() == today:
+                    realized_pnl += exit_amount - entry_amount
+                open_trade["qty"] = open_qty - closed_qty
+                open_trade["amount"] = open_trade["amount"] - entry_amount
+                remaining_sell_qty -= closed_qty
+                if open_trade["qty"] <= 0:
+                    queue.pop(0)
 
     trade_limit_hit = config.max_daily_trades > 0 and buy_count >= config.max_daily_trades
     loss_limit_hit = config.max_daily_loss_usdt > 0 and realized_pnl <= -config.max_daily_loss_usdt
@@ -605,6 +665,13 @@ def build_position_snapshot(
         return None
 
     quote_spent = decimal_from_state(position.get("quote_spent")) or quantity * entry_price
+    position_mode = str(position.get("position_mode") or "spot")
+    is_contract_sim = position_mode == "contract-sim"
+    leverage_multiplier = decimal_from_state(position.get("leverage_multiplier")) or config.leverage_multiplier
+    if leverage_multiplier <= 0:
+        leverage_multiplier = Decimal("1")
+    margin_quote = decimal_from_state(position.get("margin_quote")) or (quote_spent if is_contract_sim else Decimal("0"))
+    notional_quote = decimal_from_state(position.get("notional_quote")) or quantity * entry_price
     symbol = str(position.get("symbol") or "")
     current_price, price_error = runner.ticker_price_for_status(config, symbol)
     highest_price = decimal_from_state(position.get("highest_price")) or entry_price
@@ -628,9 +695,13 @@ def build_position_snapshot(
         "symbol": symbol,
         "base_asset": position.get("base_asset") or symbol.removesuffix(config.quote_asset),
         "quote_asset": config.quote_asset,
-        "leverage_multiplier": config.leverage_multiplier,
+        "leverage_multiplier": leverage_multiplier,
+        "position_mode": position_mode,
+        "contract_simulation": is_contract_sim,
+        "margin_quote": margin_quote,
+        "notional_quote": notional_quote,
         "dry_run": is_dry_run,
-        "mode_label": "模拟" if is_dry_run else "实盘",
+        "mode_label": "合约模拟" if is_contract_sim else "模拟" if is_dry_run else "实盘",
         "quantity": quantity,
         "entry_price": entry_price,
         "highest_price": highest_price,
@@ -656,9 +727,19 @@ def build_position_snapshot(
         return snapshot
 
     market_value = quantity * current_price
-    unrealized_pnl = market_value - quote_spent
-    unrealized_pnl_pct = (current_price - entry_price) / entry_price * Decimal("100")
-    leveraged_unrealized_pnl_pct = unrealized_pnl_pct * config.leverage_multiplier
+    unrealized_pnl = (current_price - entry_price) * quantity if is_contract_sim else market_value - quote_spent
+    price_change_pct = (current_price - entry_price) / entry_price * Decimal("100")
+    unrealized_pnl_pct = (
+        unrealized_pnl / margin_quote * Decimal("100")
+        if is_contract_sim and margin_quote > 0
+        else price_change_pct
+    )
+    leveraged_unrealized_pnl_pct = price_change_pct * leverage_multiplier
+    liquidation_price = (
+        entry_price * (Decimal("1") - (Decimal("1") / leverage_multiplier))
+        if is_contract_sim and leverage_multiplier > 0
+        else None
+    )
     unrealized_loss = max(Decimal("0"), -unrealized_pnl)
     stop_triggered = (
         unrealized_loss >= config.fixed_stop_loss_usdt
@@ -666,7 +747,7 @@ def build_position_snapshot(
         else current_price <= dynamic_stop_price
     )
     stop_triggered = stop_triggered or current_price <= dynamic_stop_price
-    take_profit_triggered = config.take_profit_pct > 0 and current_price >= take_profit_price
+    take_profit_triggered = config.take_profit_pct > 0 and dynamic_stop_mode != "trailing" and current_price >= take_profit_price
     stop_distance_pct = (current_price - dynamic_stop_price) / current_price * Decimal("100") if current_price > 0 else None
     take_profit_distance_pct = (
         (take_profit_price - current_price) / current_price * Decimal("100")
@@ -678,7 +759,9 @@ def build_position_snapshot(
             "market_value": market_value,
             "unrealized_pnl": unrealized_pnl,
             "unrealized_pnl_pct": unrealized_pnl_pct,
+            "price_change_pct": price_change_pct,
             "leveraged_unrealized_pnl_pct": leveraged_unrealized_pnl_pct,
+            "liquidation_price": liquidation_price,
             "unrealized_loss": unrealized_loss,
             "stop_distance_pct": stop_distance_pct,
             "stop_triggered": stop_triggered,
@@ -747,6 +830,7 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         order_quote_amount=order_quote_amount,
         max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 1),
         leverage_multiplier=leverage_multiplier,
+        contract_simulation_enabled=bool_value(payload, "contract_simulation_enabled", True),
         min_quote_volume=decimal_value(payload, "min_quote_volume", "MIN_QUOTE_VOLUME_USDT", "5000000"),
         min_price_change_percent=decimal_value(payload, "min_price_change_percent", "MIN_PRICE_CHANGE_PERCENT", "3"),
         min_volatility_percent=decimal_value(payload, "min_volatility_percent", "MIN_VOLATILITY_PERCENT", "5"),
@@ -754,12 +838,12 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         top_coin_limit=int_value(payload, "top_coin_limit", "TOP_COIN_LIMIT", 10),
         poll_seconds=int_value(payload, "poll_seconds", "POLL_SECONDS", 300),
         recv_window_ms=int_value(payload, "recv_window_ms", "RECV_WINDOW_MS", 5000),
-        initial_stop_loss_pct=decimal_value(payload, "initial_stop_loss_pct", "INITIAL_STOP_LOSS_PCT", "20"),
-        take_profit_pct=decimal_value(payload, "take_profit_pct", "TAKE_PROFIT_PCT", "12"),
-        breakeven_trigger_pct=decimal_value(payload, "breakeven_trigger_pct", "BREAKEVEN_TRIGGER_PCT", "6"),
-        breakeven_offset_pct=decimal_value(payload, "breakeven_offset_pct", "BREAKEVEN_OFFSET_PCT", "0"),
-        trailing_start_pct=decimal_value(payload, "trailing_start_pct", "TRAILING_START_PCT", "8"),
-        trailing_stop_pct=decimal_value(payload, "trailing_stop_pct", "TRAILING_STOP_PCT", "5"),
+        initial_stop_loss_pct=decimal_value(payload, "initial_stop_loss_pct", "INITIAL_STOP_LOSS_PCT", "4"),
+        take_profit_pct=decimal_value(payload, "take_profit_pct", "TAKE_PROFIT_PCT", "0"),
+        breakeven_trigger_pct=decimal_value(payload, "breakeven_trigger_pct", "BREAKEVEN_TRIGGER_PCT", "3"),
+        breakeven_offset_pct=decimal_value(payload, "breakeven_offset_pct", "BREAKEVEN_OFFSET_PCT", "0.2"),
+        trailing_start_pct=decimal_value(payload, "trailing_start_pct", "TRAILING_START_PCT", "6"),
+        trailing_stop_pct=decimal_value(payload, "trailing_stop_pct", "TRAILING_STOP_PCT", "3"),
         fixed_stop_loss_usdt=fixed_stop_loss_usdt,
         fixed_stop_after_first_round_trip=bool_value(payload, "fixed_stop_after_first_round_trip", False),
         fixed_stop_equity_usdt=optional_decimal(payload, "fixed_stop_equity_usdt", "FIXED_STOP_EQUITY_USDT"),
@@ -898,6 +982,8 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
                     self._send_json(runner.run_once(config))
                 elif route == "/api/manual-close":
                     self._send_json(runner.manual_close(config))
+                elif route == "/api/close-position":
+                    self._send_json(close_position_from_payload(runner, config, payload))
                 elif route == "/api/start-loop":
                     self._send_json(runner.start_loop(config))
                 elif route == "/api/reset-dry-run-state":
