@@ -115,10 +115,10 @@ const DEFAULT_SETTINGS: SettingsState = {
 const TAB_ITEMS: Array<{ key: TabKey; label: string; icon: LucideIcon }> = [
   { key: "positions", label: "当前仓位", icon: Wallet },
   { key: "hot", label: "热门币种", icon: Flame },
+  { key: "diag", label: "广场诊断", icon: Search },
   { key: "strategy", label: "策略", icon: Activity },
   { key: "favorites", label: "收藏", icon: Star },
   { key: "trades", label: "交易记录", icon: CircleDollarSign },
-  { key: "diag", label: "广场诊断", icon: Search },
   { key: "logs", label: "日志", icon: Database },
   { key: "notify", label: "通知", icon: BellRing },
   { key: "settings", label: "设置", icon: SettingsIcon },
@@ -1483,7 +1483,22 @@ function DiagnosticsPanel({
           {diagnostics.browser_posts_raw !== undefined ? ` · 浏览器 ${diagnostics.browser_posts_raw}` : ""}
           {diagnostics.display_limit !== undefined ? ` · 展示 ${diagnostics.displayed_posts ?? 0}/${diagnostics.display_limit}` : ""}
         </p>
-        <p>帖子分 = 币种符号分 + 交易语境分 + 非看空/做空语境分 + 流量/长度分。有效帖子仍按原策略过滤；下方列表展示真实抓到的原始帖子。</p>
+        <p>
+          模式 {diagnostics.extractor_mode || "--"}
+          {diagnostics.square_fetch_latency_ms !== undefined ? ` · 耗时 ${trimNumber(diagnostics.square_fetch_latency_ms, 0)}ms` : ""}
+          {diagnostics.api_response_count !== undefined ? ` · API 响应 ${diagnostics.api_response_count}` : ""}
+          {diagnostics.api_post_count !== undefined ? ` · API 帖子 ${diagnostics.api_post_count}` : ""}
+          {diagnostics.json_post_count !== undefined ? ` · JSON ${diagnostics.json_post_count}` : ""}
+          {diagnostics.html_post_count !== undefined ? ` · HTML ${diagnostics.html_post_count}` : ""}
+          {diagnostics.rendered_text_post_count !== undefined ? ` · 文本 ${diagnostics.rendered_text_post_count}` : ""}
+        </p>
+        <p>
+          新帖 {diagnostics.new_post_count ?? 0}
+          {diagnostics.duplicate_post_count !== undefined ? ` · 重复 ${diagnostics.duplicate_post_count}` : ""}
+          {diagnostics.latest_post_time ? ` · 最新 ${formatTime(diagnostics.latest_post_time)}` : ""}
+          {diagnostics.consecutive_failures !== undefined ? ` · 连续失败 ${diagnostics.consecutive_failures}` : ""}
+        </p>
+        <p>帖子分 = 币种符号分 + 交易语境分 + 非看空/做空语境分 + 流量/长度分 + 时间衰减分。有效帖子仍按原策略过滤；下方列表展示真实抓到的原始帖子。</p>
         {diagnostics.browser_error ? <p className="negative">浏览器错误：{diagnostics.browser_error}</p> : null}
         {diagnostics.hint ? <p className="warning">{diagnostics.hint}</p> : null}
       </div>
@@ -1533,8 +1548,12 @@ function DiagnosticPostList({ posts }: { posts: DiagnosticsPost[] }) {
           </div>
           <p>{post.text || "--"}</p>
           <div className="post-meta-row">
+            {post.extractor_mode ? <span>来源 {post.extractor_mode}</span> : null}
+            {post.author ? <span>作者 {post.author}</span> : null}
+            {post.created_at ? <span>时间 {formatTime(post.created_at)}</span> : null}
             <span>流量 {trimNumber(post.traffic_score, 0)}</span>
             <span>长度 {trimNumber(post.score_basis?.text_length, 0)}</span>
+            {post.post_id ? <span>ID {post.post_id}</span> : null}
             {post.url ? <span className="url-cell">{post.url}</span> : null}
           </div>
           <div className="symbol-chip-row">
@@ -1554,6 +1573,7 @@ function DiagnosticPostList({ posts }: { posts: DiagnosticsPost[] }) {
             <span>非看空/做空 {formatScore(post.score_basis?.long_context_score)}</span>
             <span>流量 {formatScore(post.score_basis?.traffic_score)}</span>
             <span>长度 {formatScore(post.score_basis?.length_score)}</span>
+            <span>时间 {formatScore(post.score_basis?.time_decay_score)}</span>
           </div>
           <div className="reason-row">
             {(post.filter_reasons || []).map((reason) => (

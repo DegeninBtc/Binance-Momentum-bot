@@ -274,6 +274,8 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
     symbols = bot.client.tradable_quote_symbols(config.quote_asset)
     base_assets = {data["baseAsset"] for data in symbols.values()}
     posts = bot.square.fetch_top_posts(config.top_post_limit, browser_mode=config.square_browser_mode)
+    bot._sync_square_feed_state()
+    module.save_state(config.state_file, bot.state)
     mentions = module.count_coin_mentions(posts, base_assets)
     candidates = bot._rank_trade_candidates(symbols, mentions)
     hot_assets = candidates[: config.top_coin_limit]
@@ -337,6 +339,8 @@ def build_square_diagnostics(config: Any) -> dict[str, Any]:
         browser_mode=config.square_browser_mode,
         display_limit=config.square_diagnostic_limit,
     )
+    bot._sync_square_feed_state()
+    module.save_state(config.state_file, bot.state)
     diagnostics["mode"] = "browser" if config.square_browser_mode else "static"
     if not config.square_browser_mode:
         diagnostics["hint"] = "当前是静态抓取；Binance Square 可能返回空响应。到诊断页开启“浏览器抓广场”后再诊断。"

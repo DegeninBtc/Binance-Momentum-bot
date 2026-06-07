@@ -204,6 +204,8 @@ export type DiagnosticsPostScoreBasis = {
   long_context_score?: Primitive;
   traffic_score?: Primitive;
   length_score?: Primitive;
+  time_decay_score?: Primitive;
+  time_weight?: Primitive;
   symbol_mentions?: Primitive;
   has_trading_context?: boolean;
   long_only_context?: boolean;
@@ -215,6 +217,10 @@ export type DiagnosticsPost = DiagnosticsSample & {
   traffic_score?: Primitive;
   url?: string;
   created_at?: string;
+  post_id?: string;
+  author?: string;
+  source?: string;
+  extractor_mode?: string;
   valid_trading_post?: boolean;
   filter_reasons?: string[];
   symbols?: Array<{ asset?: string; mentions?: Primitive }>;
@@ -230,6 +236,17 @@ export type Diagnostics = {
   raw_posts?: Primitive;
   filtered_out_posts?: Primitive;
   browser_posts_raw?: Primitive;
+  extractor_mode?: string;
+  square_fetch_latency_ms?: Primitive;
+  api_response_count?: Primitive;
+  api_post_count?: Primitive;
+  json_post_count?: Primitive;
+  html_post_count?: Primitive;
+  rendered_text_post_count?: Primitive;
+  new_post_count?: Primitive;
+  duplicate_post_count?: Primitive;
+  latest_post_time?: string;
+  consecutive_failures?: Primitive;
   browser_error?: string;
   hint?: string;
   urls?: DiagnosticsUrl[];

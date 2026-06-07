@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -204,13 +205,25 @@ class SquarePost:
     traffic_score: float = 0.0
     url: str | None = None
     created_at: str | None = None
+    post_id: str | None = None
+    author: str | None = None
+    source: str = "binance_square"
+    extractor_mode: str = "unknown"
+
+
+@dataclass
+class SquareFeedState:
+    seen_post_ids: set[str] = field(default_factory=set)
+    latest_post_time: str | None = None
+    consecutive_failures: int = 0
+    interface_hits: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass
 class TradeCandidate:
     symbol: str
     base_asset: str
-    mention_count: int
+    mention_count: float
     price_change_percent: Decimal
     volatility_percent: Decimal
     quote_volume: Decimal
@@ -252,6 +265,9 @@ class BotState:
     positions: list[PositionState] = field(default_factory=list)
     updated_at: str = ""
     trade_log: list[dict[str, Any]] = field(default_factory=list)
+    square_seen_post_ids: list[str] = field(default_factory=list)
+    square_latest_post_time: str = ""
+    square_consecutive_failures: int = 0
 
 
 class BinanceAPIError(RuntimeError):
@@ -394,18 +410,28 @@ class BinanceSquareScraper:
     def __init__(self, session: requests.Session, urls: Iterable[str]) -> None:
         self.session = session
         self.urls = tuple(urls)
+        self.feed_state = SquareFeedState()
+        self.last_diagnostics: dict[str, Any] = {}
 
     def fetch_top_posts(self, limit: int, browser_mode: bool = False) -> list[SquarePost]:
+        self.last_diagnostics = {}
+        started_at = time.perf_counter()
         if browser_mode:
             try:
-                posts = self._fetch_top_posts_with_browser(limit)
+                posts, diagnostics = self._fetch_top_posts_with_browser(limit)
+                self.last_diagnostics = diagnostics
                 if posts:
                     LOGGER.info("Binance Square browser mode extracted %s posts", len(posts))
-                    return posts[:limit]
+                    self._record_fetch_success(posts)
+                    return self._rank_posts_for_signal(posts)[:limit]
             except Exception as exc:
+                self._record_fetch_failure()
+                self.last_diagnostics = {"browser_error": str(exc)}
                 LOGGER.warning("Binance Square browser mode failed: %s", exc)
 
         posts: list[SquarePost] = []
+        json_post_count = 0
+        html_post_count = 0
         for url in self.urls:
             try:
                 response = self.session.get(
@@ -421,15 +447,28 @@ class BinanceSquareScraper:
                     },
                 )
                 response.raise_for_status()
-                posts.extend(self._extract_posts(response.text, url))
+                extracted = self._extract_posts(response.text, url)
+                posts.extend(extracted)
+                json_post_count += len([post for post in extracted if post.extractor_mode == "script_json"])
+                html_post_count += len([post for post in extracted if post.extractor_mode == "html"])
             except requests.RequestException as exc:
                 LOGGER.warning("Binance Square fetch failed for %s: %s", url, exc)
 
         deduped = dedupe_posts(posts)
-        deduped.sort(key=lambda item: item.traffic_score, reverse=True)
-        return deduped[:limit]
+        self._record_fetch_success(deduped) if deduped else self._record_fetch_failure()
+        self.last_diagnostics = {
+            "extractor_mode": "static_json" if json_post_count else "static_html" if html_post_count else "none",
+            "square_fetch_latency_ms": int((time.perf_counter() - started_at) * 1000),
+            "json_post_count": json_post_count,
+            "html_post_count": html_post_count,
+            "api_response_count": 0,
+            "api_post_count": 0,
+            "rendered_text_post_count": 0,
+        }
+        return self._rank_posts_for_signal(deduped)[:limit]
 
     def diagnose(self, limit: int, browser_mode: bool = False, display_limit: int = 10) -> dict[str, Any]:
+        started_at = time.perf_counter()
         result: dict[str, Any] = {
             "checked_at": utc_now(),
             "browser_mode": browser_mode,
@@ -439,6 +478,17 @@ class BinanceSquareScraper:
             "samples": [],
             "display_posts": [],
             "browser_hint": "",
+            "extractor_mode": "none",
+            "square_fetch_latency_ms": 0,
+            "api_response_count": 0,
+            "api_post_count": 0,
+            "json_post_count": 0,
+            "html_post_count": 0,
+            "rendered_text_post_count": 0,
+            "new_post_count": 0,
+            "duplicate_post_count": 0,
+            "latest_post_time": self.feed_state.latest_post_time or "",
+            "consecutive_failures": self.feed_state.consecutive_failures,
         }
         all_posts: list[SquarePost] = []
         for url in self.urls:
@@ -466,6 +516,8 @@ class BinanceSquareScraper:
                 html_posts = self._extract_posts_from_html(response.text, url)
                 item["json_posts"] = len(json_posts)
                 item["html_posts"] = len(html_posts)
+                result["json_post_count"] += len(json_posts)
+                result["html_post_count"] += len(html_posts)
                 all_posts.extend(json_posts or html_posts)
             except requests.RequestException as exc:
                 item["error"] = str(exc)
@@ -473,10 +525,12 @@ class BinanceSquareScraper:
 
         if browser_mode:
             try:
-                browser_posts = self._fetch_top_posts_with_browser(limit, validate=False)
+                browser_posts, browser_diagnostics = self._fetch_top_posts_with_browser(limit, validate=False)
                 result["browser_posts_raw"] = len(browser_posts)
+                result.update(browser_diagnostics)
                 all_posts.extend(browser_posts)
             except Exception as exc:
+                self._record_fetch_failure()
                 result["browser_error"] = str(exc)
                 result["browser_hint"] = (
                     "Install or repair browser scraping support by running fix_playwright_browser.bat, "
@@ -485,16 +539,32 @@ class BinanceSquareScraper:
 
         raw_deduped = dedupe_posts(all_posts, validate=False)
         deduped = dedupe_posts(all_posts)
-        deduped.sort(key=lambda item: item.traffic_score, reverse=True)
+        ranked = self._rank_posts_for_signal(deduped)
+        new_post_count = self._count_new_posts(raw_deduped)
+        self._record_fetch_success(raw_deduped) if raw_deduped else self._record_fetch_failure()
+        latest_post_time = latest_post_time_from_posts(raw_deduped) or self.feed_state.latest_post_time or ""
         result["raw_posts"] = len(raw_deduped)
+        result["duplicate_post_count"] = max(0, len(all_posts) - len(raw_deduped))
         result["filtered_out_posts"] = max(0, len(raw_deduped) - len(deduped))
         result["total_posts"] = len(deduped)
+        result["new_post_count"] = new_post_count
+        result["latest_post_time"] = latest_post_time
+        result["consecutive_failures"] = self.feed_state.consecutive_failures
+        if result.get("api_post_count"):
+            result["extractor_mode"] = "network_api"
+        elif result.get("json_post_count"):
+            result["extractor_mode"] = "script_json"
+        elif result.get("html_post_count"):
+            result["extractor_mode"] = "html"
+        elif result.get("rendered_text_post_count"):
+            result["extractor_mode"] = "rendered_text"
         result["displayed_posts"] = min(max(1, display_limit), len(raw_deduped))
         result["display_posts"] = score_diagnostic_posts(raw_deduped, max(1, display_limit))
-        result["samples"] = [post_to_dict(post) for post in deduped[: min(limit, 8)]]
+        result["samples"] = [post_to_dict(post) for post in ranked[: min(limit, 8)]]
+        result["square_fetch_latency_ms"] = int((time.perf_counter() - started_at) * 1000)
         return result
 
-    def _fetch_top_posts_with_browser(self, limit: int, validate: bool = True) -> list[SquarePost]:
+    def _fetch_top_posts_with_browser(self, limit: int, validate: bool = True) -> tuple[list[SquarePost], dict[str, Any]]:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -504,6 +574,15 @@ class BinanceSquareScraper:
             ) from exc
 
         posts: list[SquarePost] = []
+        diagnostics: dict[str, Any] = {
+            "api_response_count": 0,
+            "api_post_count": 0,
+            "json_post_count": 0,
+            "html_post_count": 0,
+            "rendered_text_post_count": 0,
+            "extractor_mode": "none",
+            "candidate_api_urls": [],
+        }
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             try:
@@ -515,6 +594,26 @@ class BinanceSquareScraper:
                     ),
                     locale="en-US",
                 )
+                page.route("**/*", block_square_heavy_resource)
+
+                def handle_response(response: Any) -> None:
+                    url = str(getattr(response, "url", "") or "")
+                    if not is_candidate_square_api_url(url):
+                        return
+                    diagnostics["api_response_count"] += 1
+                    candidate_urls = diagnostics.setdefault("candidate_api_urls", [])
+                    if len(candidate_urls) < 12 and url not in candidate_urls:
+                        candidate_urls.append(url)
+                    try:
+                        data = response.json()
+                    except Exception:
+                        return
+                    extracted = extract_square_posts_from_api_payload(data, url)
+                    if extracted:
+                        diagnostics["api_post_count"] += len(extracted)
+                        posts.extend(extracted)
+
+                page.on("response", handle_response)
                 for url in self.urls:
                     page.goto(url, wait_until="domcontentloaded", timeout=45000)
                     page.wait_for_timeout(5000)
@@ -522,19 +621,32 @@ class BinanceSquareScraper:
                         page.mouse.wheel(0, 1400)
                         page.wait_for_timeout(1200)
                     html = page.content()
-                    posts.extend(self._extract_posts(html, url))
+                    page_posts = self._extract_posts(html, url)
+                    diagnostics["json_post_count"] += len([post for post in page_posts if post.extractor_mode == "script_json"])
+                    diagnostics["html_post_count"] += len([post for post in page_posts if post.extractor_mode == "html"])
+                    posts.extend(page_posts)
                     if len(posts) < limit:
                         try:
                             body_text = page.locator("body").inner_text(timeout=5000)
-                            posts.extend(self._extract_posts_from_rendered_text(body_text, url))
+                            rendered_posts = self._extract_posts_from_rendered_text(body_text, url)
+                            diagnostics["rendered_text_post_count"] += len(rendered_posts)
+                            posts.extend(rendered_posts)
                         except Exception:
                             LOGGER.debug("failed to extract rendered Square text", exc_info=True)
             finally:
                 browser.close()
 
         deduped = dedupe_posts(posts, validate=validate)
-        deduped.sort(key=lambda item: item.traffic_score, reverse=True)
-        return deduped[:limit]
+        ranked = self._rank_posts_for_signal(deduped)
+        if diagnostics.get("api_post_count"):
+            diagnostics["extractor_mode"] = "network_api"
+        elif diagnostics.get("json_post_count"):
+            diagnostics["extractor_mode"] = "script_json"
+        elif diagnostics.get("html_post_count"):
+            diagnostics["extractor_mode"] = "html"
+        elif diagnostics.get("rendered_text_post_count"):
+            diagnostics["extractor_mode"] = "rendered_text"
+        return ranked[:limit], diagnostics
 
     def _extract_posts(self, html: str, source_url: str) -> list[SquarePost]:
         posts = self._extract_posts_from_json_blobs(html, source_url)
@@ -547,36 +659,7 @@ class BinanceSquareScraper:
         for blob in re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.DOTALL | re.IGNORECASE):
             if "Square" not in blob and "article" not in blob and "feed" not in blob:
                 continue
-            for obj in iter_json_objects(blob):
-                title = first_string(obj, ("title", "subject", "headline"))
-                content = first_string(obj, ("content", "text", "summary", "description", "body"))
-                if not (title or content):
-                    continue
-                traffic = sum_numeric_fields(
-                    obj,
-                    (
-                        "viewCount",
-                        "views",
-                        "readCount",
-                        "likeCount",
-                        "likes",
-                        "commentCount",
-                        "comments",
-                        "shareCount",
-                        "shares",
-                    ),
-                )
-                url = first_string(obj, ("url", "link", "shareUrl")) or source_url
-                created_at = first_string(obj, ("createdAt", "publishTime", "releaseTime"))
-                posts.append(
-                    SquarePost(
-                        title=clean_text(title),
-                        text=clean_text(content),
-                        traffic_score=traffic,
-                        url=url,
-                        created_at=created_at,
-                    )
-                )
+            posts.extend(extract_square_posts_from_api_payload(blob, source_url, extractor_mode="script_json"))
         return posts
 
     def _extract_posts_from_html(self, html: str, source_url: str) -> list[SquarePost]:
@@ -593,7 +676,15 @@ class BinanceSquareScraper:
 
         posts = []
         for block in text_blocks[:100]:
-            posts.append(SquarePost(title=block[:120], text=block, traffic_score=float(len(block)), url=source_url))
+            posts.append(
+                SquarePost(
+                    title=block[:120],
+                    text=block,
+                    traffic_score=float(len(block)),
+                    url=source_url,
+                    extractor_mode="html",
+                )
+            )
         return posts
 
     def _extract_posts_from_rendered_text(self, text: str, source_url: str) -> list[SquarePost]:
@@ -605,13 +696,55 @@ class BinanceSquareScraper:
             if len(buffer) >= 8 or (buffer and is_square_boundary_line(line)):
                 block = clean_text(" ".join(buffer))
                 if len(block) >= 80 and contains_market_symbol_hint(block):
-                    posts.append(SquarePost(title=block[:120], text=block, traffic_score=float(len(block)), url=source_url))
+                    posts.append(
+                        SquarePost(
+                            title=block[:120],
+                            text=block,
+                            traffic_score=float(len(block)),
+                            url=source_url,
+                            extractor_mode="rendered_text",
+                        )
+                    )
                 buffer = []
             buffer.append(line)
         block = clean_text(" ".join(buffer))
         if len(block) >= 80 and contains_market_symbol_hint(block):
-            posts.append(SquarePost(title=block[:120], text=block, traffic_score=float(len(block)), url=source_url))
+            posts.append(
+                SquarePost(
+                    title=block[:120],
+                    text=block,
+                    traffic_score=float(len(block)),
+                    url=source_url,
+                    extractor_mode="rendered_text",
+                )
+            )
         return posts
+
+    def _post_identity(self, post: SquarePost) -> str:
+        if post.post_id:
+            return f"id:{post.post_id}"
+        return "text:" + clean_text(f"{post.title} {post.text}")[:300].lower()
+
+    def _count_new_posts(self, posts: list[SquarePost]) -> int:
+        return sum(1 for post in posts if self._post_identity(post) not in self.feed_state.seen_post_ids)
+
+    def _record_fetch_success(self, posts: list[SquarePost]) -> None:
+        self.feed_state.consecutive_failures = 0
+        for post in posts:
+            self.feed_state.seen_post_ids.add(self._post_identity(post))
+            if post.extractor_mode:
+                self.feed_state.interface_hits[post.extractor_mode] += 1
+        if len(self.feed_state.seen_post_ids) > 2000:
+            self.feed_state.seen_post_ids = set(list(self.feed_state.seen_post_ids)[-1500:])
+        latest = latest_post_time_from_posts(posts)
+        if latest:
+            self.feed_state.latest_post_time = latest
+
+    def _record_fetch_failure(self) -> None:
+        self.feed_state.consecutive_failures += 1
+
+    def _rank_posts_for_signal(self, posts: list[SquarePost]) -> list[SquarePost]:
+        return sorted(posts, key=post_signal_weight, reverse=True)
 
 
 class LongOnlyMomentumBot:
@@ -620,6 +753,7 @@ class LongOnlyMomentumBot:
         self.client = BinanceSpotClient(config)
         self.square = BinanceSquareScraper(build_retry_session(), config.square_urls)
         self.state = load_state(config.state_file)
+        self._load_square_feed_state()
         self._sync_legacy_position()
         self.stop_requested = False
         self.notifier: TelegramNotifier | None = (
@@ -656,6 +790,7 @@ class LongOnlyMomentumBot:
             self._manage_open_position()
             if len(self._active_positions()) < max(1, self.config.max_open_positions):
                 self._scan_and_enter()
+            self._sync_square_feed_state()
             save_state(self.config.state_file, self.state)
         except Exception:
             LOGGER.exception("cycle failed")
@@ -667,6 +802,17 @@ class LongOnlyMomentumBot:
             if all(item.symbol != self.state.position.symbol for item in positions):
                 positions.insert(0, self.state.position)
         return positions
+
+    def _load_square_feed_state(self) -> None:
+        self.square.feed_state.seen_post_ids = set(self.state.square_seen_post_ids or [])
+        self.square.feed_state.latest_post_time = self.state.square_latest_post_time or None
+        self.square.feed_state.consecutive_failures = int(self.state.square_consecutive_failures or 0)
+
+    def _sync_square_feed_state(self) -> None:
+        seen = list(self.square.feed_state.seen_post_ids)
+        self.state.square_seen_post_ids = seen[-1500:]
+        self.state.square_latest_post_time = self.square.feed_state.latest_post_time or ""
+        self.state.square_consecutive_failures = self.square.feed_state.consecutive_failures
 
     def _set_positions(self, positions: list[PositionState]) -> None:
         self.state.positions = [item for item in positions if item and item.symbol]
@@ -1399,6 +1545,9 @@ def load_state(path: str) -> BotState:
         positions=positions,
         updated_at=raw.get("updated_at", ""),
         trade_log=list(raw.get("trade_log", [])),
+        square_seen_post_ids=list(raw.get("square_seen_post_ids", []))[-1500:],
+        square_latest_post_time=str(raw.get("square_latest_post_time", "")),
+        square_consecutive_failures=int(raw.get("square_consecutive_failures", 0)),
     )
 
 
@@ -1417,12 +1566,120 @@ def dedupe_posts(posts: list[SquarePost], validate: bool = True) -> list[SquareP
             continue
         if validate and not is_valid_square_post(post):
             continue
-        key = clean_text(f"{post.title} {post.text}")[:300].lower()
+        key = f"id:{post.post_id}" if post.post_id else "text:" + clean_text(f"{post.title} {post.text}")[:300].lower()
         if key in seen:
             continue
         seen.add(key)
         result.append(post)
     return result
+
+
+def is_candidate_square_api_url(url: str) -> bool:
+    lowered = url.lower()
+    return any(token in lowered for token in ("square", "feed", "article", "content", "bapi"))
+
+
+def block_square_heavy_resource(route: Any) -> None:
+    if route.request.resource_type in {"image", "media", "font", "stylesheet"}:
+        route.abort()
+    else:
+        route.continue_()
+
+
+def extract_square_posts_from_api_payload(
+    data: Any,
+    source_url: str,
+    extractor_mode: str = "network_api",
+) -> list[SquarePost]:
+    posts: list[SquarePost] = []
+    objects = iter_json_objects(data) if isinstance(data, str) else walk_dicts(data)
+    for obj in objects:
+        post_id = first_string(obj, ("articleId", "postId", "id", "code", "article_id", "post_id"))
+        title = first_string(obj, ("title", "subject", "headline"))
+        text = first_string(obj, ("content", "text", "summary", "description", "body", "articleContent"))
+        if not (title or text):
+            continue
+        cleaned_title = clean_text(title)
+        cleaned_text = clean_text(text)
+        if len(f"{cleaned_title} {cleaned_text}".strip()) < 20:
+            continue
+        traffic = sum_numeric_fields(
+            obj,
+            (
+                "viewCount",
+                "views",
+                "readCount",
+                "likeCount",
+                "likes",
+                "commentCount",
+                "comments",
+                "shareCount",
+                "shares",
+                "favoriteCount",
+                "collectCount",
+            ),
+        )
+        url = first_string(obj, ("url", "link", "shareUrl", "webLink")) or source_url
+        created_at = first_string(obj, ("publishTime", "releaseTime", "createdAt", "createTime", "created_at"))
+        author = first_string(obj, ("nickName", "nickname", "authorName", "username", "displayName"))
+        posts.append(
+            SquarePost(
+                title=cleaned_title,
+                text=cleaned_text,
+                traffic_score=traffic,
+                url=url,
+                created_at=normalize_square_timestamp(created_at),
+                post_id=post_id or None,
+                author=author or None,
+                extractor_mode=extractor_mode,
+            )
+        )
+    return posts
+
+
+def normalize_square_timestamp(value: Any) -> str | None:
+    parsed = parse_square_timestamp(value)
+    return parsed.isoformat() if parsed else str(value).strip() if value else None
+
+
+def parse_square_timestamp(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{10,13}", text):
+        timestamp = int(text)
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp / 1000
+        return datetime.fromtimestamp(timestamp, timezone.utc)
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def latest_post_time_from_posts(posts: list[SquarePost]) -> str | None:
+    parsed = [item for item in (parse_square_timestamp(post.created_at) for post in posts) if item]
+    if not parsed:
+        return None
+    return max(parsed).isoformat()
+
+
+def post_time_weight(created_at: str | None, half_life_minutes: float = 90.0) -> float:
+    parsed = parse_square_timestamp(created_at)
+    if not parsed:
+        return 0.6
+    age_minutes = max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 60)
+    return max(0.1, math.exp(-age_minutes / half_life_minutes))
+
+
+def post_signal_weight(post: SquarePost) -> float:
+    traffic = max(1.0, float(post.traffic_score or 0))
+    return traffic * post_time_weight(post.created_at)
 
 
 def is_momentum_asset(asset: str, quote_asset: str = "USDT") -> bool:
@@ -1447,19 +1704,20 @@ def volume_rank_score(quote_volume: Decimal, min_quote_volume: Decimal) -> Decim
     return min(Decimal("80"), (quote_volume / min_quote_volume) * Decimal("8"))
 
 
-def square_rank_score(mention_count: int, max_mentions: int) -> Decimal:
+def square_rank_score(mention_count: float, max_mentions: float) -> Decimal:
     if mention_count <= 0 or max_mentions <= 0:
         return Decimal("0")
-    return (Decimal(mention_count) / Decimal(max_mentions)) * Decimal("180")
+    return (Decimal(str(mention_count)) / Decimal(str(max_mentions))) * Decimal("180")
 
 
 def count_coin_mentions(posts: list[SquarePost], base_assets: set[str]) -> Counter[str]:
     valid_assets = {item for item in base_assets if is_square_mention_asset(item)}
     mentions: Counter[str] = Counter()
-    weighted_posts = sorted(posts, key=lambda item: item.traffic_score, reverse=True)
+    weighted_posts = sorted(posts, key=post_signal_weight, reverse=True)
     for rank, post in enumerate(weighted_posts, start=1):
         text = f"{post.title} {post.text}".upper()
         rank_weight = max(1, len(weighted_posts) - rank + 1)
+        recency_weight = post_time_weight(post.created_at)
         for asset in valid_assets:
             if asset in PREFIX_REQUIRED_SYMBOLS or (len(asset) <= 3 and asset not in STRONG_BARE_SYMBOLS):
                 pattern = rf"(?<![A-Z0-9])(?:\$|#){re.escape(asset)}(?![A-Z0-9])"
@@ -1467,7 +1725,7 @@ def count_coin_mentions(posts: list[SquarePost], base_assets: set[str]) -> Count
                 pattern = rf"(?<![A-Z0-9])(?:\$|#)?{re.escape(asset)}(?![A-Z0-9])"
             count = len(re.findall(pattern, text))
             if count:
-                mentions[asset] += count * rank_weight
+                mentions[asset] += count * rank_weight * recency_weight
     return mentions
 
 
@@ -1509,7 +1767,9 @@ def score_diagnostic_post(post: SquarePost) -> dict[str, Any]:
     else:
         traffic_score = min(10.0, traffic / 120.0)
     length_score = min(10.0, len(text) / 120.0)
-    total_score = max(0.0, symbol_score + context_score + long_score + traffic_score + length_score)
+    time_weight = post_time_weight(post.created_at)
+    time_score = round(time_weight * 10.0, 1)
+    total_score = max(0.0, symbol_score + context_score + long_score + traffic_score + length_score + time_score)
 
     filter_reasons: list[str] = []
     if is_square_noise_post(post):
@@ -1536,6 +1796,8 @@ def score_diagnostic_post(post: SquarePost) -> dict[str, Any]:
                 "long_context_score": round(long_score, 1),
                 "traffic_score": round(traffic_score, 1),
                 "length_score": round(length_score, 1),
+                "time_decay_score": time_score,
+                "time_weight": round(time_weight, 3),
                 "symbol_mentions": symbol_total,
                 "has_trading_context": has_context,
                 "long_only_context": long_context,
@@ -1572,6 +1834,8 @@ def first_string(obj: dict[str, Any], keys: tuple[str, ...]) -> str:
         value = obj.get(key)
         if isinstance(value, str) and value.strip():
             return value
+        if isinstance(value, (int, float)):
+            return str(value)
     return ""
 
 
@@ -1644,6 +1908,10 @@ def post_to_dict(post: SquarePost) -> dict[str, Any]:
         "traffic_score": post.traffic_score,
         "url": post.url,
         "created_at": post.created_at,
+        "post_id": post.post_id,
+        "author": post.author,
+        "source": post.source,
+        "extractor_mode": post.extractor_mode,
     }
 
 
