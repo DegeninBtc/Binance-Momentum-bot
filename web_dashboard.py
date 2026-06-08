@@ -176,7 +176,7 @@ class BotRunner:
     def preview_signal(self, config: Any) -> dict[str, Any]:
         if not self._claim("preview", config):
             LOGGER.info("preview ignored because another bot task is already running")
-            return self.status()
+            return self._busy_status("刷新信号")
         self.worker = threading.Thread(target=self._preview_worker, args=(config,), daemon=True)
         self.worker.start()
         return self.status()
@@ -184,7 +184,7 @@ class BotRunner:
     def diagnose_square(self, config: Any) -> dict[str, Any]:
         if not self._claim("square-diagnostics", config):
             LOGGER.info("Square diagnostics ignored because another bot task is already running")
-            return self.status()
+            return self._busy_status("广场诊断")
         self.worker = threading.Thread(target=self._diagnostics_worker, args=(config,), daemon=True)
         self.worker.start()
         return self.status()
@@ -192,7 +192,7 @@ class BotRunner:
     def run_once(self, config: Any) -> dict[str, Any]:
         if not self._claim("once-live" if not config.dry_run else "once-dry-run", config):
             LOGGER.info("run-once ignored because another bot task is already running")
-            return self.status()
+            return self._busy_status("执行一次")
         self.worker = threading.Thread(target=self._once_worker, args=(config,), daemon=True)
         self.worker.start()
         return self.status()
@@ -200,7 +200,7 @@ class BotRunner:
     def manual_close(self, config: Any) -> dict[str, Any]:
         if not self._claim("manual-close-live" if not config.dry_run else "manual-close-dry-run", config):
             LOGGER.info("manual close ignored because another bot task is already running")
-            return self.status()
+            return self._busy_status("手动平仓")
         self.worker = threading.Thread(target=self._manual_close_worker, args=(config,), daemon=True)
         self.worker.start()
         return self.status()
@@ -208,7 +208,7 @@ class BotRunner:
     def close_position(self, config: Any, symbol: str, quantity: Decimal) -> dict[str, Any]:
         if not self._claim("close-position-live" if not config.dry_run else "close-position-dry-run", config):
             LOGGER.info("position close ignored because another bot task is already running")
-            return self.status()
+            return self._busy_status("仓位平仓")
         self.worker = threading.Thread(target=self._close_position_worker, args=(config, symbol, quantity), daemon=True)
         self.worker.start()
         return self.status()
@@ -216,7 +216,7 @@ class BotRunner:
     def start_loop(self, config: Any) -> dict[str, Any]:
         if not self._claim("loop-live" if not config.dry_run else "loop-dry-run", config):
             LOGGER.info("start-loop ignored because another bot task is already running")
-            return self.status()
+            return self._busy_status("启动循环")
         self.stop_event.clear()
         self.worker = threading.Thread(target=self._loop_worker, args=(config,), daemon=True)
         self.worker.start()
@@ -240,6 +240,12 @@ class BotRunner:
             self.last_finished_at = ""
             self.last_config = config
             return True
+
+    def _busy_status(self, action_label: str) -> dict[str, Any]:
+        with self.lock:
+            mode = self.mode or "running"
+            self.last_error = f"{action_label}未执行：当前已有任务正在运行（{mode}），请先停止或等待完成。"
+        return self.status()
 
     def _finish(self, error: str = "") -> None:
         with self.lock:

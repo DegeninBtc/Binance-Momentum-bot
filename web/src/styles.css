@@ -567,6 +567,11 @@ input:focus-visible {
   box-shadow: var(--shadow);
 }
 
+.security-page {
+  display: grid;
+  gap: 14px;
+}
+
 .safety-panel.tone-success {
   border-color: rgba(15, 170, 99, 0.28);
 }

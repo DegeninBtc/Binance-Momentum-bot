@@ -414,6 +414,6 @@ export type DashboardSecurity = {
   warning?: string;
 };
 
-export type TabKey = "positions" | "hot" | "favorites" | "strategy" | "trades" | "diag" | "logs" | "notify" | "settings";
+export type TabKey = "positions" | "hot" | "favorites" | "strategy" | "trades" | "diag" | "security" | "logs" | "notify" | "settings";
 
 export type SettingsTabKey = "basic" | "signal" | "scope" | "risk" | "cost" | "runtime";

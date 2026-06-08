@@ -138,6 +138,7 @@ const TAB_ITEMS: Array<{ key: TabKey; label: string; icon: LucideIcon }> = [
   { key: "strategy", label: "策略", icon: Activity },
   { key: "favorites", label: "收藏", icon: Star },
   { key: "trades", label: "交易记录", icon: CircleDollarSign },
+  { key: "security", label: "安全状态", icon: Shield },
   { key: "logs", label: "日志", icon: Database },
   { key: "notify", label: "通知", icon: BellRing },
   { key: "settings", label: "设置", icon: SettingsIcon },
@@ -274,6 +275,11 @@ function App() {
   const readOnlyReason = readOnlyMode ? "Dashboard read-only mode is enabled" : "";
   const hasError = Boolean(requestError || status?.last_error);
   const running = Boolean(status?.running);
+  const runningMode = textValue(status?.mode);
+  const previewBusy = busyPath === "/api/preview" || (running && runningMode === "preview");
+  const diagnosticsBusy = busyPath === "/api/square-diagnose" || busyPath === "/api/update-signal-returns" || (running && runningMode === "square-diagnostics");
+  const taskLocked = running && !["preview", "square-diagnostics"].includes(runningMode);
+  const taskLockReason = taskLocked ? `当前已有任务运行中：${runningMode}。请先停止或等待完成。` : readOnlyReason;
   const keysLoaded = Boolean(config.api_key_loaded && config.api_secret_loaded);
   const liveMode = settings.live || config.dry_run === false;
   const quoteAsset = snapshot?.quote_asset || textValue(config.quote_asset) || settings.quote_asset || "USDT";
@@ -597,22 +603,19 @@ function App() {
           />
         </section>
 
-        <SafetyPanel safety={safety} liveMode={liveMode} entryConfirmation={entryConfirmation} squareConfidence={squareConfidence} accountRisk={accountRisk} />
-        <DashboardSecurityPanel security={dashboardSecurity} />
-
         <section className="command-panel">
           <div className="command-title">
             <p className="eyebrow">Actions</p>
             <h2>操作中枢</h2>
           </div>
           <div className="command-grid">
-            <ActionButton icon={RefreshCw} label="刷新信号" busy={busyPath === "/api/preview"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/preview", "hot")} />
-            <ActionButton icon={Search} label="诊断广场" busy={busyPath === "/api/square-diagnose"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/square-diagnose", "diag")} />
-            <ActionButton icon={Play} label="执行一次" tone="primary" busy={busyPath === "/api/run-once"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/run-once", "hot")} />
-            <ActionButton icon={Activity} label="启动循环" busy={busyPath === "/api/start-loop"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/start-loop")} />
+            <ActionButton icon={RefreshCw} label="刷新信号" busy={previewBusy} disabled={readOnlyMode || taskLocked} title={taskLockReason} onClick={() => submit("/api/preview", "hot")} />
+            <ActionButton icon={Search} label="诊断广场" busy={diagnosticsBusy} disabled={readOnlyMode || taskLocked} title={taskLockReason} onClick={() => submit("/api/square-diagnose", "diag")} />
+            <ActionButton icon={Play} label="执行一次" tone="primary" busy={busyPath === "/api/run-once"} disabled={readOnlyMode || running} title={running ? taskLockReason : readOnlyReason} onClick={() => submit("/api/run-once", "hot")} />
+            <ActionButton icon={Activity} label="启动循环" busy={busyPath === "/api/start-loop"} disabled={readOnlyMode || running} title={running ? taskLockReason : readOnlyReason} onClick={() => submit("/api/start-loop")} />
             <ActionButton icon={Square} label="停止" tone="danger" busy={busyPath === "/api/stop"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/stop")} />
-            <ActionButton icon={Power} label="手动平仓" tone="danger" busy={busyPath === "/api/manual-close"} disabled={readOnlyMode} title={readOnlyReason} onClick={manualClose} />
-            <ActionButton icon={Trash2} label="清空模拟仓位" tone="danger" busy={busyPath === "/api/reset-dry-run-state"} disabled={readOnlyMode} title={readOnlyReason} onClick={resetState} />
+            <ActionButton icon={Power} label="手动平仓" tone="danger" busy={busyPath === "/api/manual-close"} disabled={readOnlyMode || running} title={running ? taskLockReason : readOnlyReason} onClick={manualClose} />
+            <ActionButton icon={Trash2} label="清空模拟仓位" tone="danger" busy={busyPath === "/api/reset-dry-run-state"} disabled={readOnlyMode || running} title={running ? taskLockReason : readOnlyReason} onClick={resetState} />
           </div>
         </section>
 
@@ -645,8 +648,8 @@ function App() {
               snapshots={snapshots}
               onClosePosition={closePosition}
               busySymbol={busyPath.startsWith("/api/close-position:") ? busyPath.split(":")[1] : ""}
-              readOnly={readOnlyMode}
-              readOnlyReason={readOnlyReason}
+              readOnly={readOnlyMode || running}
+              readOnlyReason={running ? taskLockReason : readOnlyReason}
             />
           )}
           {activeTab === "hot" && (
@@ -672,13 +675,23 @@ function App() {
             />
           )}
           {activeTab === "trades" && <TradesPanel stats={performance} trades={trades} />}
+          {activeTab === "security" && (
+            <SecurityStatusPanel
+              safety={safety}
+              liveMode={liveMode}
+              entryConfirmation={entryConfirmation}
+              squareConfidence={squareConfidence}
+              accountRisk={accountRisk}
+              dashboardSecurity={dashboardSecurity}
+            />
+          )}
           {activeTab === "diag" && (
             <DiagnosticsPanel
               diagnostics={diagnostics}
               settings={settings}
-              busy={busyPath === "/api/square-diagnose" || busyPath === "/api/update-signal-returns"}
-              readOnly={readOnlyMode}
-              readOnlyReason={readOnlyReason}
+              busy={diagnosticsBusy}
+              readOnly={readOnlyMode || taskLocked}
+              readOnlyReason={taskLockReason}
               updateSetting={updateSetting}
               onDiagnose={() => submit("/api/square-diagnose", "diag")}
               onUpdateReturns={() => submit("/api/update-signal-returns", "diag")}
@@ -725,6 +738,29 @@ function StatusBadge({
   );
 }
 
+function SecurityStatusPanel({
+  safety,
+  liveMode,
+  entryConfirmation,
+  squareConfidence,
+  accountRisk,
+  dashboardSecurity,
+}: {
+  safety: SafetySnapshot | null;
+  liveMode: boolean;
+  entryConfirmation: EntryConfirmation | null;
+  squareConfidence: SquareConfidence | null;
+  accountRisk: AccountRiskSnapshot | null;
+  dashboardSecurity: DashboardSecurity | null;
+}) {
+  return (
+    <div className="security-page">
+      <SafetyPanel safety={safety} liveMode={liveMode} entryConfirmation={entryConfirmation} squareConfidence={squareConfidence} accountRisk={accountRisk} />
+      <DashboardSecurityPanel security={dashboardSecurity} />
+    </div>
+  );
+}
+
 function SafetyPanel({
   safety,
   liveMode,
@@ -751,40 +787,40 @@ function SafetyPanel({
       <div className="safety-head">
         <Shield size={18} />
         <div>
-          <strong>Live Safety</strong>
-          <span>{liveMode ? "Spot live actions require confirmation" : "Dry-run mode, contract display is simulation only"}</span>
+          <strong>实盘安全</strong>
+          <span>{liveMode ? "现货实盘操作需要二次确认" : "当前为 dry-run，合约显示仅为模拟"}</span>
         </div>
       </div>
       <div className="safety-grid">
         <div>
-          <span>Pending order</span>
-          <strong>{pending ? `${pending.side || "--"} ${pending.symbol || "--"}` : "None"}</strong>
-          <small>{pending?.client_order_id || "No unresolved clientOrderId"}</small>
+          <span>未决订单</span>
+          <strong>{pending ? `${pending.side || "--"} ${pending.symbol || "--"}` : "无"}</strong>
+          <small>{pending?.client_order_id || "没有未恢复的 clientOrderId"}</small>
         </div>
         <div>
-          <span>Protection</span>
-          <strong>{protectionOk ? "OK" : "Attention"}</strong>
+          <span>保护单</span>
+          <strong>{protectionOk ? "正常" : "需要关注"}</strong>
           <small>
-            {missing.length ? `Missing: ${missing.join(", ")}` : failed.length ? `Failed: ${failed.map((item) => item.symbol).join(", ")}` : "Exchange or simulated protection recorded"}
+            {missing.length ? `缺失：${missing.join(", ")}` : failed.length ? `失败：${failed.map((item) => item.symbol).join(", ")}` : "已记录交易所或模拟保护单"}
           </small>
         </div>
         <div>
-          <span>API key</span>
-          <strong>{api.api_key_loaded ? `Loaded ****${api.api_key_suffix || ""}` : "Missing"}</strong>
-          <small>{api.error || (api.spot_trading_allowed === false ? "SPOT permission not reported" : "Manually check withdraw off and IP whitelist on")}</small>
+          <span>API Key</span>
+          <strong>{api.api_key_loaded ? `已加载 ****${api.api_key_suffix || ""}` : "未加载"}</strong>
+          <small>{api.error || (api.spot_trading_allowed === false ? "未检测到 SPOT 权限" : "请人工确认关闭提现并开启 IP 白名单")}</small>
         </div>
         <div>
-          <span>Entry confirmation</span>
-          <strong>{entryConfirmation ? (entryConfirmation.passed ? "Passed" : "Blocked") : "Waiting"}</strong>
+          <span>入场确认</span>
+          <strong>{entryConfirmation ? (entryConfirmation.passed ? "通过" : "阻止") : "等待"}</strong>
           <small>
-            {entryConfirmation?.reason || `Square confidence ${textValue(squareConfidence?.score) || "--"}`}
+            {entryConfirmation?.reason || `Square 置信度 ${textValue(squareConfidence?.score) || "--"}`}
           </small>
         </div>
         <div>
-          <span>Account risk</span>
-          <strong>{accountRisk ? (accountRisk.entry_blocked ? "Blocked" : "OK") : "Waiting"}</strong>
+          <span>账户风控</span>
+          <strong>{accountRisk ? (accountRisk.entry_blocked ? "阻止" : "正常") : "等待"}</strong>
           <small>
-            {accountRisk?.reason || `Exposure ${formatPercent(accountRisk?.total_exposure_pct ?? 0)} · suggested ${formatMoney(accountRisk?.risk_based_quote_suggestion ?? 0, textValue(accountRisk?.quote_asset) || "USDT")}`}
+            {accountRisk?.reason || `敞口 ${formatPercent(accountRisk?.total_exposure_pct ?? 0)} · 建议 ${formatMoney(accountRisk?.risk_based_quote_suggestion ?? 0, textValue(accountRisk?.quote_asset) || "USDT")}`}
           </small>
         </div>
       </div>
@@ -802,25 +838,25 @@ function DashboardSecurityPanel({ security }: { security: DashboardSecurity | nu
       <div className="safety-head">
         <KeyRound size={18} />
         <div>
-          <strong>Dashboard Security</strong>
-          <span>{readOnly ? "Read-only mode blocks POST controls" : "Trading controls are enabled for allowed local requests"}</span>
+          <strong>控制台安全</strong>
+          <span>{readOnly ? "只读模式会阻止 POST 控制操作" : "允许本地通过校验的控制请求"}</span>
         </div>
       </div>
       <div className="safety-grid">
         <div>
-          <span>Read-only</span>
-          <strong>{readOnly ? "Enabled" : "Disabled"}</strong>
-          <small>{readOnly ? "POST control routes are blocked" : "Control routes can run after configured checks"}</small>
+          <span>只读模式</span>
+          <strong>{readOnly ? "已启用" : "未启用"}</strong>
+          <small>{readOnly ? "POST 控制接口已阻止" : "控制接口通过配置校验后可执行"}</small>
         </div>
         <div>
-          <span>Dashboard token</span>
-          <strong>{tokenEnabled ? "Enabled" : "Disabled"}</strong>
-          <small>{tokenEnabled ? "Token is required for POST requests" : "Local default, no token set"}</small>
+          <span>控制台 Token</span>
+          <strong>{tokenEnabled ? "已启用" : "未启用"}</strong>
+          <small>{tokenEnabled ? "POST 请求需要 Token" : "本地默认，未设置 Token"}</small>
         </div>
         <div>
           <span>Host / Origin</span>
-          <strong>{security?.host_origin_check_enabled ? "Checked" : "Unknown"}</strong>
-          <small>{localOnly ? `Bound to ${security?.bound_host || "localhost"}` : security?.warning || "Non-local bind detected"}</small>
+          <strong>{security?.host_origin_check_enabled ? "已检查" : "未知"}</strong>
+          <small>{localOnly ? `绑定到 ${security?.bound_host || "localhost"}` : security?.warning || "检测到非本机绑定"}</small>
         </div>
       </div>
     </section>
@@ -841,9 +877,10 @@ function MarketCurve({ chart, loading, error, chartUrl }: { chart: MarketChart |
   const paths = buildMarketCurvePaths(closes);
   const change = asNumber(chart?.change_percent);
   const tone = change !== null && change < 0 ? "negative" : "positive";
-  const label = loading ? "加载行情..." : error || (change !== null ? `${chart?.range || "24H"} ${signedPercent(change)}` : chart?.range || "24H");
+  const label = loading ? "加载行情..." : error ? "行情接口异常" : change !== null ? `${chart?.range || "24H"} ${signedPercent(change)}` : chart?.range || "24H";
+  const titleText = error ? error : "在 TradingView 打开走势图";
   return (
-    <a className={`market-curve tone-${tone}`} href={chartUrl} target="_blank" rel="noreferrer" aria-label={`${label}，在 TradingView 打开`} title="在 TradingView 打开走势图">
+    <a className={`market-curve tone-${tone}`} href={chartUrl} target="_blank" rel="noreferrer" aria-label={`${label}，在 TradingView 打开`} title={titleText}>
       <svg viewBox="0 0 760 150" preserveAspectRatio="none">
         <defs>
           <linearGradient id="curveFill" x1="0" x2="0" y1="0" y2="1">
