@@ -9,10 +9,10 @@ export async function fetchStatus(): Promise<DashboardStatus> {
   return data;
 }
 
-export async function postAction(path: string, payload: SettingsState): Promise<DashboardStatus> {
+export async function postAction(path: string, payload: SettingsState & { live_confirmed?: boolean }): Promise<DashboardStatus> {
   const response = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: dashboardHeaders(payload),
     body: JSON.stringify(payload),
   });
   const data = (await response.json()) as DashboardStatus;
@@ -22,10 +22,10 @@ export async function postAction(path: string, payload: SettingsState): Promise<
   return data;
 }
 
-export async function postPositionClose(payload: SettingsState & { symbol: string; close_quantity: string }): Promise<DashboardStatus> {
+export async function postPositionClose(payload: SettingsState & { symbol: string; close_quantity: string; live_confirmed?: boolean }): Promise<DashboardStatus> {
   const response = await fetch("/api/close-position", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: dashboardHeaders(payload),
     body: JSON.stringify(payload),
   });
   const data = (await response.json()) as DashboardStatus;
@@ -33,6 +33,15 @@ export async function postPositionClose(payload: SettingsState & { symbol: strin
     throw new Error(data.error || response.statusText);
   }
   return data;
+}
+
+export function dashboardHeaders(payload: Pick<SettingsState, "dashboard_auth_token">): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = String(payload.dashboard_auth_token || "").trim();
+  if (token) {
+    headers["X-Dashboard-Token"] = token;
+  }
+  return headers;
 }
 
 export async function fetchMarketChart(symbol: string, range: ChartRangeKey, testnet: boolean): Promise<MarketChart> {

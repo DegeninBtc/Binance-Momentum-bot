@@ -23,6 +23,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlencode
 
@@ -38,6 +39,7 @@ except ImportError:  # The scraper can still extract from raw HTML without bs4.
 
 LOGGER = logging.getLogger("square-momentum-bot")
 DEFAULT_STATE_FILE = "bot_state.json"
+DEFAULT_SIGNAL_RECORD_FILE = "signal_records.jsonl"
 DEFAULT_BASE_URL = "https://api.binance.com"
 DEFAULT_FIXED_STOP_LOSS_RATIO = Decimal("0.2")
 MIN_FIXED_STOP_LOSS_USDT = Decimal("1")
@@ -179,6 +181,11 @@ class BotConfig:
     cooldown_minutes: int = 30
     max_daily_trades: int = 5
     max_daily_loss_usdt: Decimal = Decimal("25")
+    max_total_exposure_pct: Decimal = Decimal("0")
+    max_symbol_exposure_pct: Decimal = Decimal("0")
+    max_consecutive_losses: int = 0
+    max_intraday_drawdown_pct: Decimal = Decimal("0")
+    risk_per_trade_pct: Decimal = Decimal("0")
     fee_rate_pct: Decimal = Decimal("0.1")
     slippage_pct: Decimal = Decimal("0.05")
     asset_whitelist: tuple[str, ...] = ()
@@ -188,6 +195,14 @@ class BotConfig:
     market_filter_min_change_pct: Decimal = Decimal("-1")
     market_filter_require_all: bool = False
     account_sync_enabled: bool = True
+    kline_confirmation_enabled: bool = True
+    min_square_confidence_score: Decimal = Decimal("35")
+    max_spread_bps: Decimal = Decimal("50")
+    min_orderbook_depth_usdt: Decimal = Decimal("1000")
+    exchange_protection_enabled: bool = True
+    oco_stop_limit_slippage_pct: Decimal = Decimal("0.5")
+    signal_recording_enabled: bool = True
+    signal_record_file: str = DEFAULT_SIGNAL_RECORD_FILE
     state_file: str = DEFAULT_STATE_FILE
     dry_run: bool = True
     square_urls: tuple[str, ...] = DEFAULT_SQUARE_URLS
@@ -238,6 +253,7 @@ class OrderRules:
     symbol: str
     min_qty: Decimal = Decimal("0")
     step_size: Decimal = Decimal("0.00000001")
+    tick_size: Decimal = Decimal("0.00000001")
     min_notional: Decimal = Decimal("0")
 
 
@@ -258,6 +274,35 @@ class PositionState:
 
 
 @dataclass
+class PendingOrderState:
+    symbol: str = ""
+    side: str = ""
+    client_order_id: str = ""
+    quote_amount: str = ""
+    quantity: str = ""
+    created_at: str = ""
+    action: str = ""
+    status: str = "pending"
+    error: str = ""
+
+
+@dataclass
+class ProtectionOrderState:
+    symbol: str = ""
+    client_order_id: str = ""
+    order_list_id: int | None = None
+    quantity: str = "0"
+    take_profit_price: str = "0"
+    stop_price: str = "0"
+    stop_limit_price: str = "0"
+    status: str = "missing"
+    kind: str = "oco"
+    dry_run: bool = True
+    created_at: str = ""
+    error: str = ""
+
+
+@dataclass
 class BotState:
     first_buy_done: bool = False
     completed_round_trips: int = 0
@@ -265,6 +310,12 @@ class BotState:
     positions: list[PositionState] = field(default_factory=list)
     updated_at: str = ""
     trade_log: list[dict[str, Any]] = field(default_factory=list)
+    pending_order: PendingOrderState | None = None
+    protection_orders: list[ProtectionOrderState] = field(default_factory=list)
+    last_safety_check: dict[str, Any] = field(default_factory=dict)
+    entry_confirmation: dict[str, Any] = field(default_factory=dict)
+    square_confidence: dict[str, Any] = field(default_factory=dict)
+    account_risk_snapshot: dict[str, Any] = field(default_factory=dict)
     square_seen_post_ids: list[str] = field(default_factory=list)
     square_latest_post_time: str = ""
     square_consecutive_failures: int = 0
@@ -350,10 +401,16 @@ class BinanceSpotClient:
         data = self.public_get("/api/v3/ticker/price", {"symbol": symbol})
         return Decimal(str(data["price"]))
 
-    def klines(self, symbol: str, interval: str, limit: int) -> list[Any]:
-        return self.public_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    def klines(self, symbol: str, interval: str, limit: int, start_time: int | None = None) -> list[Any]:
+        params: dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+        if start_time is not None:
+            params["startTime"] = start_time
+        return self.public_get("/api/v3/klines", params)
 
-    def market_buy_quote(self, symbol: str, quote_order_qty: Decimal) -> dict[str, Any]:
+    def depth(self, symbol: str, limit: int = 50) -> dict[str, Any]:
+        return self.public_get("/api/v3/depth", {"symbol": symbol, "limit": limit})
+
+    def market_buy_quote(self, symbol: str, quote_order_qty: Decimal, client_order_id: str | None = None) -> dict[str, Any]:
         params = {
             "symbol": symbol,
             "side": "BUY",
@@ -361,9 +418,11 @@ class BinanceSpotClient:
             "quoteOrderQty": format_decimal(quote_order_qty),
             "newOrderRespType": "FULL",
         }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return self.signed_request("POST", "/api/v3/order", params)
 
-    def market_sell_quantity(self, symbol: str, quantity: Decimal) -> dict[str, Any]:
+    def market_sell_quantity(self, symbol: str, quantity: Decimal, client_order_id: str | None = None) -> dict[str, Any]:
         params = {
             "symbol": symbol,
             "side": "SELL",
@@ -371,7 +430,78 @@ class BinanceSpotClient:
             "quantity": format_decimal(quantity),
             "newOrderRespType": "FULL",
         }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return self.signed_request("POST", "/api/v3/order", params)
+
+    def get_order_by_client_id(self, symbol: str, client_order_id: str) -> dict[str, Any]:
+        return self.signed_request(
+            "GET",
+            "/api/v3/order",
+            {"symbol": symbol, "origClientOrderId": client_order_id},
+        )
+
+    def cancel_order_by_client_id(self, symbol: str, client_order_id: str) -> dict[str, Any]:
+        return self.signed_request(
+            "DELETE",
+            "/api/v3/order",
+            {"symbol": symbol, "origClientOrderId": client_order_id},
+        )
+
+    def cancel_order_list(self, symbol: str, order_list_id: int | None = None, list_client_order_id: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"symbol": symbol}
+        if order_list_id is not None:
+            params["orderListId"] = order_list_id
+        elif list_client_order_id:
+            params["listClientOrderId"] = list_client_order_id
+        else:
+            raise BinanceAPIError("order_list_id or list_client_order_id is required to cancel OCO")
+        return self.signed_request("DELETE", "/api/v3/orderList", params)
+
+    def stop_loss_limit_sell(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        stop_price: Decimal,
+        stop_limit_price: Decimal,
+        client_order_id: str,
+    ) -> dict[str, Any]:
+        params = {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "STOP_LOSS_LIMIT",
+            "timeInForce": "GTC",
+            "quantity": format_decimal(quantity),
+            "stopPrice": format_decimal(stop_price),
+            "price": format_decimal(stop_limit_price),
+            "newClientOrderId": client_order_id,
+        }
+        return self.signed_request("POST", "/api/v3/order", params)
+
+    def oco_sell(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        take_profit_price: Decimal,
+        stop_price: Decimal,
+        stop_limit_price: Decimal,
+        list_client_order_id: str,
+        limit_client_order_id: str,
+        stop_client_order_id: str,
+    ) -> dict[str, Any]:
+        params = {
+            "symbol": symbol,
+            "side": "SELL",
+            "quantity": format_decimal(quantity),
+            "price": format_decimal(take_profit_price),
+            "stopPrice": format_decimal(stop_price),
+            "stopLimitPrice": format_decimal(stop_limit_price),
+            "stopLimitTimeInForce": "GTC",
+            "listClientOrderId": list_client_order_id,
+            "limitClientOrderId": limit_client_order_id,
+            "stopClientOrderId": stop_client_order_id,
+        }
+        return self.signed_request("POST", "/api/v3/order/oco", params)
 
     @staticmethod
     def _handle_response(response: requests.Response) -> Any:
@@ -756,6 +886,7 @@ class LongOnlyMomentumBot:
         self._load_square_feed_state()
         self._sync_legacy_position()
         self.stop_requested = False
+        self.last_signal_record: dict[str, Any] | None = None
         self.notifier: TelegramNotifier | None = (
             TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
             if config.telegram_enabled and config.telegram_bot_token and config.telegram_chat_id
@@ -785,13 +916,31 @@ class LongOnlyMomentumBot:
 
     def run_once(self) -> None:
         try:
+            self.last_signal_record = None
             self.client.sync_time()
+            self._ensure_live_account_safety()
+            self._recover_pending_order()
             self._sync_open_position_with_account()
             self._manage_open_position()
             if len(self._active_positions()) < max(1, self.config.max_open_positions):
                 self._scan_and_enter()
+            else:
+                self.last_signal_record = build_signal_record(
+                    self.config,
+                    source="run_once",
+                    posts=[],
+                    candidates=[],
+                    candidate=None,
+                    entry_confirmation=self.state.entry_confirmation,
+                    square_confidence=self.state.square_confidence,
+                    account_risk_snapshot=self.state.account_risk_snapshot,
+                    final_action="skipped",
+                    note="max open positions reached",
+                )
             self._sync_square_feed_state()
             save_state(self.config.state_file, self.state)
+            if self.config.signal_recording_enabled and self.last_signal_record:
+                append_signal_record(self.config.signal_record_file, self.last_signal_record)
         except Exception:
             LOGGER.exception("cycle failed")
             self._notify("Cycle failed. Check dashboard logs.")
@@ -827,8 +976,106 @@ class LongOnlyMomentumBot:
         if self.state.position and all(item.symbol != self.state.position.symbol for item in self.state.positions):
             self.state.positions.insert(0, self.state.position)
 
+    def _set_pending_order(
+        self,
+        symbol: str,
+        side: str,
+        client_order_id: str,
+        action: str,
+        quote_amount: Decimal | None = None,
+        quantity: Decimal | None = None,
+    ) -> None:
+        self.state.pending_order = PendingOrderState(
+            symbol=symbol,
+            side=side,
+            client_order_id=client_order_id,
+            quote_amount=format_decimal(quote_amount) if quote_amount is not None else "",
+            quantity=format_decimal(quantity) if quantity is not None else "",
+            created_at=utc_now(),
+            action=action,
+        )
+        self._touch_state()
+
+    def _clear_pending_order(self, client_order_id: str | None = None) -> None:
+        if client_order_id and self.state.pending_order and self.state.pending_order.client_order_id != client_order_id:
+            return
+        self.state.pending_order = None
+        self._touch_state()
+
+    def _recover_pending_order(self) -> None:
+        pending = self.state.pending_order
+        if self.config.dry_run or not pending or not pending.client_order_id or not pending.symbol:
+            return
+        try:
+            order = self.client.get_order_by_client_id(pending.symbol, pending.client_order_id)
+        except Exception as exc:
+            LOGGER.warning("pending order lookup failed for %s %s: %s", pending.symbol, pending.client_order_id, exc)
+            return
+        status = str(order.get("status", "")).upper()
+        if status in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW"}:
+            LOGGER.warning("pending order still open: %s %s status=%s", pending.symbol, pending.client_order_id, status)
+            return
+        if status in {"CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+            LOGGER.warning("clearing failed pending order: %s %s status=%s", pending.symbol, pending.client_order_id, status)
+            self._clear_pending_order(pending.client_order_id)
+            return
+        if status != "FILLED":
+            LOGGER.warning("keeping pending order with unknown status: %s %s status=%s", pending.symbol, pending.client_order_id, status)
+            return
+
+        if pending.side.upper() == "BUY":
+            if pending.symbol in self._held_symbols():
+                self._clear_pending_order(pending.client_order_id)
+                return
+            qty = Decimal(str(order.get("executedQty", "0")))
+            avg_price = average_fill_price(order)
+            if qty <= 0 or avg_price is None:
+                LOGGER.warning("filled pending BUY lacks executable quantity/price: %s", order)
+                return
+            candidate = TradeCandidate(
+                symbol=pending.symbol,
+                base_asset=pending.symbol.removesuffix(self.config.quote_asset),
+                mention_count=0,
+                price_change_percent=Decimal("0"),
+                volatility_percent=Decimal("0"),
+                quote_volume=Decimal("0"),
+                last_price=avg_price,
+            )
+            self._clear_pending_order(pending.client_order_id)
+            self._open_position(candidate, qty, avg_price, order)
+            LOGGER.warning("recovered filled BUY from pending order %s", pending.client_order_id)
+            return
+
+        if pending.side.upper() == "SELL":
+            LOGGER.warning("recovered filled SELL from pending order %s; syncing account state", pending.client_order_id)
+            self._clear_pending_order(pending.client_order_id)
+            self._sync_open_position_with_account()
+
+    def _order_after_submit_failure(self, symbol: str, client_order_id: str) -> dict[str, Any] | None:
+        try:
+            return self.client.get_order_by_client_id(symbol, client_order_id)
+        except Exception as exc:
+            LOGGER.warning("order lookup after submit failure failed for %s %s: %s", symbol, client_order_id, exc)
+            return None
+
+    def _ensure_live_account_safety(self) -> None:
+        if self.config.dry_run:
+            return
+        check = account_safety_snapshot(self.client, self.config)
+        self.state.last_safety_check = check
+        self._touch_state()
+        if not check.get("api_key_loaded") or not check.get("api_secret_loaded"):
+            raise BinanceAPIError("live mode requires BINANCE_API_KEY and BINANCE_API_SECRET")
+        if check.get("error"):
+            raise BinanceAPIError(f"live account safety check failed: {check['error']}")
+        if check.get("can_trade") is False:
+            raise BinanceAPIError("live account safety check failed: account canTrade is false")
+        if check.get("spot_trading_allowed") is False:
+            raise BinanceAPIError("live account safety check failed: API key/account does not report SPOT permission")
+
     def _remove_position(self, symbol: str) -> None:
         self._set_positions([item for item in self._active_positions() if item.symbol != symbol])
+        self.state.protection_orders = [item for item in self.state.protection_orders if item.symbol != symbol]
 
     def _replace_position(self, position: PositionState) -> None:
         replaced = False
@@ -916,6 +1163,11 @@ class LongOnlyMomentumBot:
         self._close_position(position, last_price, dry_action, live_action, exit_label)
 
     def manual_close_position(self, symbol: str | None = None, quantity: Decimal | None = None) -> None:
+        if not self.config.dry_run:
+            self.client.sync_time()
+            self._ensure_live_account_safety()
+            self._recover_pending_order()
+            self._sync_open_position_with_account()
         positions = list(self._active_positions())
         if not positions:
             raise BinanceAPIError("no open position to close")
@@ -944,6 +1196,8 @@ class LongOnlyMomentumBot:
         if wanted_qty <= 0:
             raise BinanceAPIError(f"close quantity for {symbol} must be positive")
         LOGGER.warning("%s triggered for %s", exit_label, symbol)
+        if not self.config.dry_run:
+            self._release_exchange_protection_for_close(position)
         sell_qty = self._safe_sell_quantity(symbol, position.base_asset, wanted_qty)
         if sell_qty <= 0:
             if self.config.dry_run and full_close_requested:
@@ -1009,7 +1263,16 @@ class LongOnlyMomentumBot:
             self._notify(f"{mode}{exit_label} {symbol} qty={sell_qty} price={fill_price}")
             return
 
-        order = self.client.market_sell_quantity(symbol, sell_qty)
+        client_order_id = build_client_order_id(live_action.lower(), symbol)
+        self._set_pending_order(symbol, "SELL", client_order_id, live_action, quantity=sell_qty)
+        try:
+            order = self.client.market_sell_quantity(symbol, sell_qty, client_order_id=client_order_id)
+        except Exception:
+            recovered = self._order_after_submit_failure(symbol, client_order_id)
+            if not recovered or str(recovered.get("status", "")).upper() != "FILLED":
+                raise
+            order = recovered
+        self._clear_pending_order(client_order_id)
         avg_price = average_fill_price(order) or last_price
         self._append_trade(live_action, symbol, sell_qty, avg_price, order)
         remaining_qty = max(Decimal("0"), qty - sell_qty)
@@ -1034,22 +1297,127 @@ class LongOnlyMomentumBot:
         if daily_guard:
             LOGGER.warning("entry skipped: %s", daily_guard)
             self._notify(f"Entry skipped: {daily_guard}")
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=[],
+                candidates=[],
+                candidate=None,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=self.state.square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="skipped",
+                note=daily_guard,
+            )
             return
         if len(self._active_positions()) >= max(1, self.config.max_open_positions):
             LOGGER.info("entry skipped: max open positions reached (%s)", self.config.max_open_positions)
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=[],
+                candidates=[],
+                candidate=None,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=self.state.square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="skipped",
+                note="max open positions reached",
+            )
             return
         market_guard = self._market_filter_reason()
         if market_guard:
             LOGGER.warning("entry skipped: %s", market_guard)
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=[],
+                candidates=[],
+                candidate=None,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=self.state.square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="skipped",
+                note=market_guard,
+            )
+            return
+        account_risk_guard = self._account_risk_guard_reason()
+        if account_risk_guard:
+            LOGGER.warning("entry skipped: %s", account_risk_guard)
+            self._notify(f"Entry skipped: {account_risk_guard}")
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=[],
+                candidates=[],
+                candidate=None,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=self.state.square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="skipped",
+                note=account_risk_guard,
+            )
             return
 
         symbols = self.client.tradable_quote_symbols(self.config.quote_asset)
         base_assets = {data["baseAsset"] for data in symbols.values()}
         posts = self.square.fetch_top_posts(self.config.top_post_limit, browser_mode=self.config.square_browser_mode)
+        square_confidence = square_confidence_snapshot(posts, self.square.last_diagnostics, self.square.feed_state)
+        self.state.square_confidence = square_confidence
         mentions = count_coin_mentions(posts, base_assets)
         source = "Binance Square browser" if self.config.square_browser_mode else "Binance Square"
+        if Decimal(str(square_confidence.get("score", "0"))) < self.config.min_square_confidence_score:
+            reason = (
+                f"Square confidence {square_confidence.get('score')} below "
+                f"{self.config.min_square_confidence_score}; automatic entry skipped"
+            )
+            LOGGER.warning(reason)
+            self.state.entry_confirmation = {
+                "passed": False,
+                "symbol": "",
+                "reason": reason,
+                "square_confidence": square_confidence,
+                "checked_at": utc_now(),
+            }
+            self._touch_state()
+            self._notify(f"Entry skipped: {reason}")
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=posts,
+                candidates=[],
+                candidate=None,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="skipped",
+                note=reason,
+            )
+            return
         if not mentions:
-            LOGGER.warning("no valid long-only Binance Square mentions found; market momentum will drive ranking")
+            reason = "no valid long-only Binance Square mentions found; automatic market-only fallback is disabled"
+            LOGGER.warning(reason)
+            self.state.entry_confirmation = {
+                "passed": False,
+                "symbol": "",
+                "reason": reason,
+                "square_confidence": square_confidence,
+                "checked_at": utc_now(),
+            }
+            self._touch_state()
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=posts,
+                candidates=[],
+                candidate=None,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="skipped",
+                note=reason,
+            )
+            return
 
         candidates = self._rank_trade_candidates(symbols, mentions)
         ranked_assets = [item.base_asset for item in candidates[: self.config.top_coin_limit]]
@@ -1057,10 +1425,35 @@ class LongOnlyMomentumBot:
 
         if not candidates:
             LOGGER.info("no candidate passed momentum filters")
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=posts,
+                candidates=[],
+                candidate=None,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="skipped",
+                note="no candidate passed momentum filters",
+            )
             return
         candidate = self._first_allowed_candidate(candidates)
         if candidate is None:
             LOGGER.info("all candidates are blocked by entry guards")
+            self._touch_state()
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=posts,
+                candidates=candidates[: self.config.top_coin_limit],
+                candidate=None,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="skipped",
+                note="all candidates are blocked by entry guards",
+            )
             return
 
         LOGGER.info("selected candidate: %s", asdict(candidate))
@@ -1077,9 +1470,36 @@ class LongOnlyMomentumBot:
                 self.config.leverage_multiplier if self.config.contract_simulation_enabled else Decimal("1"),
             )
             self._open_position(candidate, qty, fill_price, None, quote_spent=quote_spent, fee_amount=fee_amount)
+            self.last_signal_record = build_signal_record(
+                self.config,
+                source="run_once",
+                posts=posts,
+                candidates=candidates[: self.config.top_coin_limit],
+                candidate=candidate,
+                entry_confirmation=self.state.entry_confirmation,
+                square_confidence=square_confidence,
+                account_risk_snapshot=self.state.account_risk_snapshot,
+                final_action="entered",
+                note="dry-run position opened",
+            )
             return
 
-        order = self.client.market_buy_quote(candidate.symbol, self.config.order_quote_amount)
+        client_order_id = build_client_order_id("buy", candidate.symbol)
+        self._set_pending_order(
+            candidate.symbol,
+            "BUY",
+            client_order_id,
+            "BUY",
+            quote_amount=self.config.order_quote_amount,
+        )
+        try:
+            order = self.client.market_buy_quote(candidate.symbol, self.config.order_quote_amount, client_order_id=client_order_id)
+        except Exception:
+            recovered = self._order_after_submit_failure(candidate.symbol, client_order_id)
+            if not recovered or str(recovered.get("status", "")).upper() != "FILLED":
+                raise
+            order = recovered
+        self._clear_pending_order(client_order_id)
         qty = Decimal(str(order.get("executedQty", "0")))
         avg_price = average_fill_price(order) or candidate.last_price
         if qty <= 0:
@@ -1093,6 +1513,18 @@ class LongOnlyMomentumBot:
                 LOGGER.warning("account sync reduced buy quantity for %s from %s to %s", candidate.symbol, qty, synced_qty)
                 qty = synced_qty
         self._open_position(candidate, qty, avg_price, order)
+        self.last_signal_record = build_signal_record(
+            self.config,
+            source="run_once",
+            posts=posts,
+            candidates=candidates[: self.config.top_coin_limit],
+            candidate=candidate,
+            entry_confirmation=self.state.entry_confirmation,
+            square_confidence=square_confidence,
+            account_risk_snapshot=self.state.account_risk_snapshot,
+            final_action="entered",
+            note="live spot position opened",
+        )
 
     def _position_leverage(self, position: PositionState) -> Decimal:
         parsed = decimal_from_any(position.leverage_multiplier)
@@ -1249,8 +1681,123 @@ class LongOnlyMomentumBot:
         self.state.first_buy_done = True
         self._append_trade("BUY", candidate.symbol, quantity, entry_price, order, fee_amount=fee_amount, quote_amount=spent)
         self._touch_state()
+        self._ensure_exchange_protection(new_position)
         mode = "[dry-run] " if self.config.dry_run else ""
         self._notify(f"{mode}BUY {candidate.symbol} qty={quantity} price={entry_price} spent={spent}")
+
+    def _ensure_exchange_protection(self, position: PositionState) -> None:
+        if not self.config.exchange_protection_enabled:
+            return
+        protection = self._build_protection_order_state(position)
+        if self.config.dry_run:
+            protection.status = "simulated"
+            protection.dry_run = True
+            self._store_protection_order(protection)
+            LOGGER.info("[dry-run] simulated protection order for %s: %s", position.symbol, asdict(protection))
+            return
+        try:
+            if protection.kind == "oco":
+                result = self.client.oco_sell(
+                    position.symbol,
+                    Decimal(protection.quantity),
+                    Decimal(protection.take_profit_price),
+                    Decimal(protection.stop_price),
+                    Decimal(protection.stop_limit_price),
+                    protection.client_order_id,
+                    f"{protection.client_order_id}-tp"[:36],
+                    f"{protection.client_order_id}-sl"[:36],
+                )
+                protection.order_list_id = int(result["orderListId"]) if "orderListId" in result else None
+            else:
+                result = self.client.stop_loss_limit_sell(
+                    position.symbol,
+                    Decimal(protection.quantity),
+                    Decimal(protection.stop_price),
+                    Decimal(protection.stop_limit_price),
+                    protection.client_order_id,
+                )
+                protection.order_list_id = int(result["orderId"]) if "orderId" in result else None
+            protection.status = "active"
+            protection.dry_run = False
+            self._store_protection_order(protection)
+            LOGGER.info("exchange protection created for %s: %s", position.symbol, asdict(protection))
+        except Exception as exc:
+            protection.status = "failed"
+            protection.dry_run = False
+            protection.error = str(exc)
+            self._store_protection_order(protection)
+            LOGGER.error("exchange protection missing for %s: %s", position.symbol, exc)
+            self._notify(f"Exchange protection missing for {position.symbol}: {exc}")
+
+    def _build_protection_order_state(self, position: PositionState) -> ProtectionOrderState:
+        rules = symbol_order_rules(self.client.exchange_info(), position.symbol)
+        entry = Decimal(position.entry_price)
+        quantity = round_down_to_step(Decimal(position.quantity), rules.step_size)
+        stop_price = round_down_to_step(
+            entry * (Decimal("1") - self.config.initial_stop_loss_pct / Decimal("100")),
+            rules.tick_size,
+        )
+        stop_limit_price = round_down_to_step(
+            stop_price * (Decimal("1") - self.config.oco_stop_limit_slippage_pct / Decimal("100")),
+            rules.tick_size,
+        )
+        take_profit_price = Decimal("0")
+        kind = "stop_loss_limit"
+        if self.config.take_profit_pct > 0:
+            take_profit_price = round_down_to_step(
+                entry * (Decimal("1") + self.config.take_profit_pct / Decimal("100")),
+                rules.tick_size,
+            )
+            kind = "oco"
+        if quantity <= 0:
+            raise BinanceAPIError(f"cannot create protection for {position.symbol}: quantity is zero after step rounding")
+        sell_error = self._sell_order_error(position.symbol, quantity, stop_limit_price)
+        if sell_error:
+            raise BinanceAPIError(f"cannot create protection for {position.symbol}: {sell_error}")
+        return ProtectionOrderState(
+            symbol=position.symbol,
+            client_order_id=build_client_order_id("protect", position.symbol),
+            quantity=format_decimal(quantity),
+            take_profit_price=format_decimal(take_profit_price),
+            stop_price=format_decimal(stop_price),
+            stop_limit_price=format_decimal(stop_limit_price),
+            kind=kind,
+            dry_run=self.config.dry_run,
+            created_at=utc_now(),
+        )
+
+    def _store_protection_order(self, protection: ProtectionOrderState) -> None:
+        orders = [item for item in self.state.protection_orders if item.symbol != protection.symbol]
+        orders.append(protection)
+        self.state.protection_orders = orders[-50:]
+        self._touch_state()
+
+    def _release_exchange_protection_for_close(self, position: PositionState) -> None:
+        active = [
+            item
+            for item in self.state.protection_orders
+            if item.symbol == position.symbol and item.status in {"active", "simulated"}
+        ]
+        for protection in active:
+            if protection.dry_run:
+                continue
+            try:
+                if protection.kind == "oco":
+                    self.client.cancel_order_list(
+                        position.symbol,
+                        order_list_id=protection.order_list_id,
+                        list_client_order_id=protection.client_order_id,
+                    )
+                else:
+                    self.client.cancel_order_by_client_id(position.symbol, protection.client_order_id)
+                protection.status = "cancelled"
+                LOGGER.info("cancelled protection order before close: %s %s", position.symbol, protection.client_order_id)
+            except Exception as exc:
+                protection.status = "cancel_failed"
+                protection.error = str(exc)
+                LOGGER.warning("failed to cancel protection order before close for %s: %s", position.symbol, exc)
+        if active:
+            self._touch_state()
 
     def _dynamic_stop_price(self, entry_price: Decimal, highest_price: Decimal, pct_stop: Decimal) -> tuple[Decimal, str]:
         return dynamic_stop_price(self.config, entry_price, highest_price, pct_stop)
@@ -1267,13 +1814,99 @@ class LongOnlyMomentumBot:
         for candidate in candidates:
             cooldown_until = self._cooldown_until(candidate.symbol)
             if cooldown_until is None:
+                account_risk_guard = self._account_risk_guard_reason(candidate)
+                if account_risk_guard:
+                    LOGGER.info("candidate %s skipped by account risk: %s", candidate.symbol, account_risk_guard)
+                    self.state.entry_confirmation = self._entry_confirmation_payload(candidate, False, account_risk_guard)
+                    continue
                 buy_error = self._buy_order_error(candidate.symbol, self.config.order_quote_amount, candidate.last_price)
                 if buy_error:
                     LOGGER.info("candidate %s skipped by order rules: %s", candidate.symbol, buy_error)
+                    self.state.entry_confirmation = self._entry_confirmation_payload(candidate, False, buy_error)
+                    continue
+                confirmation = self._confirm_candidate_entry(candidate)
+                self.state.entry_confirmation = confirmation
+                if not confirmation.get("passed"):
+                    LOGGER.info("candidate %s skipped by entry confirmation: %s", candidate.symbol, confirmation.get("reason"))
                     continue
                 return candidate
             LOGGER.info("candidate %s skipped for cooldown until %s", candidate.symbol, cooldown_until.isoformat())
+            self.state.entry_confirmation = self._entry_confirmation_payload(candidate, False, f"cooldown until {cooldown_until.isoformat()}")
         return None
+
+    def _confirm_candidate_entry(self, candidate: TradeCandidate) -> dict[str, Any]:
+        checks: dict[str, Any] = {}
+        if self.config.kline_confirmation_enabled:
+            kline_check = self._kline_confirmation(candidate)
+            checks["kline"] = kline_check
+            if not kline_check.get("passed"):
+                return self._entry_confirmation_payload(candidate, False, str(kline_check.get("reason", "kline confirmation failed")), checks)
+        liquidity_check = self._orderbook_liquidity_confirmation(candidate)
+        checks["liquidity"] = liquidity_check
+        if not liquidity_check.get("passed"):
+            return self._entry_confirmation_payload(candidate, False, str(liquidity_check.get("reason", "liquidity filter failed")), checks)
+        return self._entry_confirmation_payload(candidate, True, "entry confirmation passed", checks)
+
+    def _entry_confirmation_payload(
+        self,
+        candidate: TradeCandidate,
+        passed: bool,
+        reason: str,
+        checks: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "passed": passed,
+            "symbol": candidate.symbol,
+            "base_asset": candidate.base_asset,
+            "reason": reason,
+            "checks": checks or {},
+            "square_confidence": self.state.square_confidence,
+            "checked_at": utc_now(),
+        }
+
+    def _kline_confirmation(self, candidate: TradeCandidate) -> dict[str, Any]:
+        snapshots = {
+            "5m": kline_confirmation_snapshot(self.client.klines(candidate.symbol, "5m", 24)),
+            "15m": kline_confirmation_snapshot(self.client.klines(candidate.symbol, "15m", 24)),
+            "1h": kline_confirmation_snapshot(self.client.klines(candidate.symbol, "1h", 24)),
+        }
+        failures = []
+        if snapshots["15m"]["roc_pct"] <= Decimal("0"):
+            failures.append("15m ROC is not positive")
+        if snapshots["1h"]["roc_pct"] <= Decimal("0"):
+            failures.append("1h ROC is not positive")
+        if snapshots["5m"]["roc_pct"] < Decimal("-0.2"):
+            failures.append("5m pullback is deeper than -0.2%")
+        if not snapshots["5m"]["above_ema9"]:
+            failures.append("5m close is below EMA9")
+        if candidate.price_change_percent >= Decimal("20") and (
+            snapshots["5m"]["roc_pct"] < Decimal("0") or snapshots["15m"]["roc_pct"] < Decimal("0")
+        ):
+            failures.append("24h mover is high but short-term ROC is rolling over")
+        return stringify_decimals(
+            {
+                "passed": not failures,
+                "reason": "; ".join(failures) if failures else "short-term trend confirmed",
+                "intervals": snapshots,
+            }
+        )
+
+    def _orderbook_liquidity_confirmation(self, candidate: TradeCandidate) -> dict[str, Any]:
+        if self.config.max_spread_bps <= 0 and self.config.min_orderbook_depth_usdt <= 0:
+            return {"passed": True, "reason": "liquidity filter disabled"}
+        snapshot = orderbook_liquidity_snapshot(self.client.depth(candidate.symbol, 50))
+        failures = []
+        spread_bps = snapshot.get("spread_bps")
+        ask_depth = snapshot.get("ask_depth_usdt")
+        if self.config.max_spread_bps > 0 and spread_bps is not None and spread_bps > self.config.max_spread_bps:
+            failures.append(f"spread {spread_bps} bps exceeds {self.config.max_spread_bps}")
+        if self.config.min_orderbook_depth_usdt > 0 and ask_depth is not None and ask_depth < self.config.min_orderbook_depth_usdt:
+            failures.append(f"ask depth {ask_depth} below {self.config.min_orderbook_depth_usdt} {self.config.quote_asset}")
+        if spread_bps is None or ask_depth is None:
+            failures.append("orderbook depth is unavailable")
+        snapshot["passed"] = not failures
+        snapshot["reason"] = "; ".join(failures) if failures else "orderbook liquidity confirmed"
+        return stringify_decimals(snapshot)
 
     def _asset_allowed(self, symbol: str, base_asset: str) -> bool:
         whitelist = {item.upper() for item in self.config.asset_whitelist}
@@ -1314,6 +1947,103 @@ class LongOnlyMomentumBot:
         detail = ", ".join(f"{asset}={changes[asset]}%" for asset in assets)
         mode = "all" if self.config.market_filter_require_all else "any"
         return f"market filter blocked entry ({mode} of {assets} must be >= {self.config.market_filter_min_change_pct}%): {detail}"
+
+    def _account_risk_guard_reason(self, candidate: TradeCandidate | None = None) -> str | None:
+        snapshot = self._account_risk_snapshot(candidate)
+        self.state.account_risk_snapshot = snapshot
+        self._touch_state()
+        if snapshot.get("entry_blocked"):
+            return str(snapshot.get("reason") or "account risk guard blocked entry")
+        return None
+
+    def _account_risk_snapshot(self, candidate: TradeCandidate | None = None) -> dict[str, Any]:
+        positions = self._active_positions()
+        position_values: dict[str, Decimal] = {}
+        total_exposure = Decimal("0")
+        unrealized_pnl = Decimal("0")
+        for position in positions:
+            qty = Decimal(position.quantity)
+            entry_price = Decimal(position.entry_price)
+            try:
+                price = self.client.ticker_price(position.symbol)
+            except Exception:
+                price = entry_price
+            value = qty * price
+            position_values[position.symbol] = value
+            total_exposure += value
+            unrealized_pnl += (price - entry_price) * qty
+
+        quote_balance = Decimal("0")
+        if not self.config.dry_run:
+            try:
+                quote_balance = self._account_asset_balance(self.config.quote_asset)
+            except Exception:
+                LOGGER.exception("account risk quote balance lookup failed; using local exposure basis")
+        equity = quote_balance + total_exposure
+        if equity <= 0:
+            equity = max(
+                total_exposure + self.config.order_quote_amount,
+                self.config.order_quote_amount * Decimal(max(1, self.config.max_open_positions)),
+            )
+
+        proposed_quote = self.config.order_quote_amount if candidate else Decimal("0")
+        proposed_total_exposure = total_exposure + proposed_quote
+        proposed_symbol_exposure = proposed_quote
+        if candidate:
+            proposed_symbol_exposure += position_values.get(candidate.symbol, Decimal("0"))
+
+        stats = self._daily_trade_stats()
+        loss_streak = current_loss_streak(self.state.trade_log)
+        daily_unrealized_drawdown = -unrealized_pnl if unrealized_pnl < 0 else Decimal("0")
+        daily_drawdown = daily_unrealized_drawdown + (-stats["realized_pnl"] if stats["realized_pnl"] < 0 else Decimal("0"))
+        drawdown_pct = daily_drawdown / equity * Decimal("100") if equity > 0 else Decimal("0")
+        total_exposure_pct = proposed_total_exposure / equity * Decimal("100") if equity > 0 else Decimal("0")
+        symbol_exposure_pct = proposed_symbol_exposure / equity * Decimal("100") if equity > 0 else Decimal("0")
+        risk_based_quote = Decimal("0")
+        if self.config.risk_per_trade_pct > 0 and self.config.initial_stop_loss_pct > 0:
+            risk_budget = equity * self.config.risk_per_trade_pct / Decimal("100")
+            risk_based_quote = risk_budget / (self.config.initial_stop_loss_pct / Decimal("100"))
+
+        reasons: list[str] = []
+        if self.config.max_total_exposure_pct > 0 and total_exposure_pct > self.config.max_total_exposure_pct:
+            reasons.append(f"total exposure {format_decimal(total_exposure_pct)}% exceeds {self.config.max_total_exposure_pct}%")
+        if candidate and self.config.max_symbol_exposure_pct > 0 and symbol_exposure_pct > self.config.max_symbol_exposure_pct:
+            reasons.append(f"{candidate.symbol} exposure {format_decimal(symbol_exposure_pct)}% exceeds {self.config.max_symbol_exposure_pct}%")
+        if self.config.max_consecutive_losses > 0 and loss_streak >= self.config.max_consecutive_losses:
+            reasons.append(f"consecutive losses {loss_streak} reached {self.config.max_consecutive_losses}")
+        if self.config.max_intraday_drawdown_pct > 0 and drawdown_pct >= self.config.max_intraday_drawdown_pct:
+            reasons.append(f"intraday drawdown {format_decimal(drawdown_pct)}% reached {self.config.max_intraday_drawdown_pct}%")
+
+        return stringify_decimals(
+            {
+                "entry_blocked": bool(reasons),
+                "reason": "; ".join(reasons) if reasons else "account risk checks passed",
+                "quote_asset": self.config.quote_asset,
+                "equity_estimate": equity,
+                "quote_balance": quote_balance,
+                "total_exposure": total_exposure,
+                "proposed_total_exposure": proposed_total_exposure,
+                "total_exposure_pct": total_exposure_pct,
+                "symbol": candidate.symbol if candidate else "",
+                "proposed_symbol_exposure": proposed_symbol_exposure,
+                "symbol_exposure_pct": symbol_exposure_pct,
+                "realized_pnl_today": stats["realized_pnl"],
+                "unrealized_pnl": unrealized_pnl,
+                "intraday_drawdown": daily_drawdown,
+                "intraday_drawdown_pct": drawdown_pct,
+                "consecutive_losses": loss_streak,
+                "fixed_order_quote": self.config.order_quote_amount,
+                "risk_based_quote_suggestion": risk_based_quote,
+                "limits": {
+                    "max_total_exposure_pct": self.config.max_total_exposure_pct,
+                    "max_symbol_exposure_pct": self.config.max_symbol_exposure_pct,
+                    "max_consecutive_losses": self.config.max_consecutive_losses,
+                    "max_intraday_drawdown_pct": self.config.max_intraday_drawdown_pct,
+                    "risk_per_trade_pct": self.config.risk_per_trade_pct,
+                },
+                "checked_at": utc_now(),
+            }
+        )
 
     def _sync_open_position_with_account(self) -> None:
         if self.config.dry_run or not self.config.account_sync_enabled:
@@ -1538,6 +2268,13 @@ def load_state(path: str) -> BotState:
     positions = [PositionState(**item) for item in positions_raw if item]
     if position and not positions:
         positions = [PositionState(**position)]
+    pending_raw = raw.get("pending_order")
+    pending_order = PendingOrderState(**pending_raw) if isinstance(pending_raw, dict) and pending_raw else None
+    protection_orders = [
+        ProtectionOrderState(**item)
+        for item in raw.get("protection_orders", [])
+        if isinstance(item, dict) and item
+    ]
     return BotState(
         first_buy_done=bool(raw.get("first_buy_done", False)),
         completed_round_trips=int(raw.get("completed_round_trips", 0)),
@@ -1545,6 +2282,12 @@ def load_state(path: str) -> BotState:
         positions=positions,
         updated_at=raw.get("updated_at", ""),
         trade_log=list(raw.get("trade_log", [])),
+        pending_order=pending_order,
+        protection_orders=protection_orders,
+        last_safety_check=dict(raw.get("last_safety_check", {})),
+        entry_confirmation=dict(raw.get("entry_confirmation", {})),
+        square_confidence=dict(raw.get("square_confidence", {})),
+        account_risk_snapshot=dict(raw.get("account_risk_snapshot", {})),
         square_seen_post_ids=list(raw.get("square_seen_post_ids", []))[-1500:],
         square_latest_post_time=str(raw.get("square_latest_post_time", "")),
         square_consecutive_failures=int(raw.get("square_consecutive_failures", 0)),
@@ -1934,6 +2677,161 @@ def average_fill_price(order: dict[str, Any]) -> Decimal | None:
     return None
 
 
+def kline_confirmation_snapshot(rows: list[Any]) -> dict[str, Any]:
+    closes: list[Decimal] = []
+    quote_volumes: list[Decimal] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 8:
+            continue
+        closes.append(Decimal(str(row[4])))
+        quote_volumes.append(Decimal(str(row[7])))
+    if len(closes) < 3:
+        return {
+            "roc_pct": Decimal("-999"),
+            "above_ema9": False,
+            "volume_expanding": False,
+            "close": Decimal("0"),
+            "ema9": Decimal("0"),
+            "reason": "not enough kline data",
+        }
+    first_close = closes[0]
+    last_close = closes[-1]
+    roc_pct = (last_close - first_close) / first_close * Decimal("100") if first_close > 0 else Decimal("-999")
+    ema9 = ema(closes[-9:] if len(closes) >= 9 else closes)
+    recent_volume = sum(quote_volumes[-3:], Decimal("0")) / Decimal(min(3, len(quote_volumes)))
+    previous_slice = quote_volumes[-9:-3] if len(quote_volumes) >= 9 else quote_volumes[:-3]
+    previous_volume = (
+        sum(previous_slice, Decimal("0")) / Decimal(len(previous_slice))
+        if previous_slice
+        else Decimal("0")
+    )
+    return {
+        "roc_pct": roc_pct,
+        "above_ema9": last_close >= ema9,
+        "volume_expanding": previous_volume <= 0 or recent_volume >= previous_volume,
+        "close": last_close,
+        "ema9": ema9,
+        "recent_quote_volume": recent_volume,
+        "previous_quote_volume": previous_volume,
+    }
+
+
+def ema(values: list[Decimal]) -> Decimal:
+    if not values:
+        return Decimal("0")
+    multiplier = Decimal("2") / Decimal(len(values) + 1)
+    result = values[0]
+    for value in values[1:]:
+        result = (value - result) * multiplier + result
+    return result
+
+
+def orderbook_liquidity_snapshot(depth: dict[str, Any]) -> dict[str, Any]:
+    bids = depth.get("bids") or []
+    asks = depth.get("asks") or []
+    if not bids or not asks:
+        return {"spread_bps": None, "bid_depth_usdt": None, "ask_depth_usdt": None}
+    best_bid = Decimal(str(bids[0][0]))
+    best_ask = Decimal(str(asks[0][0]))
+    mid = (best_bid + best_ask) / Decimal("2")
+    spread_bps = (best_ask - best_bid) / mid * Decimal("10000") if mid > 0 else Decimal("999999")
+    bid_depth = sum(Decimal(str(price)) * Decimal(str(qty)) for price, qty, *_ in bids)
+    ask_depth = sum(Decimal(str(price)) * Decimal(str(qty)) for price, qty, *_ in asks)
+    return {
+        "spread_bps": spread_bps,
+        "bid_depth_usdt": bid_depth,
+        "ask_depth_usdt": ask_depth,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+    }
+
+
+def square_confidence_snapshot(posts: list[SquarePost], diagnostics: dict[str, Any], feed_state: SquareFeedState) -> dict[str, Any]:
+    post_count = len(posts)
+    score = Decimal("0")
+    reasons: list[str] = []
+    score += min(Decimal("25"), Decimal(post_count) * Decimal("2.5"))
+    if post_count == 0:
+        reasons.append("no Square posts extracted")
+    structured_count = sum(1 for post in posts if post.post_id or post.author or post.created_at)
+    structured_ratio = Decimal(structured_count) / Decimal(post_count) if post_count else Decimal("0")
+    score += structured_ratio * Decimal("20")
+    if structured_ratio < Decimal("0.25"):
+        reasons.append("low structured post ratio")
+    fresh_count = sum(1 for post in posts if parse_square_timestamp(post.created_at))
+    fresh_ratio = Decimal(fresh_count) / Decimal(post_count) if post_count else Decimal("0")
+    score += fresh_ratio * Decimal("15")
+    extractor_mode = str(diagnostics.get("extractor_mode") or "")
+    if extractor_mode in {"browser_network", "browser_rendered", "network_api"} or diagnostics.get("api_post_count"):
+        score += Decimal("20")
+    elif extractor_mode and extractor_mode != "none":
+        score += Decimal("10")
+    else:
+        reasons.append("extractor mode unavailable")
+    if int(diagnostics.get("new_post_count") or 0) > 0 or fresh_count > 0:
+        score += Decimal("10")
+    if feed_state.consecutive_failures:
+        penalty = min(Decimal("20"), Decimal(feed_state.consecutive_failures) * Decimal("5"))
+        score -= penalty
+        reasons.append(f"Square fetch failures={feed_state.consecutive_failures}")
+    score = max(Decimal("0"), min(Decimal("100"), score))
+    if not reasons:
+        reasons.append("Square data confidence is acceptable")
+    return stringify_decimals(
+        {
+            "score": score,
+            "post_count": post_count,
+            "structured_count": structured_count,
+            "fresh_count": fresh_count,
+            "extractor_mode": extractor_mode or "unknown",
+            "consecutive_failures": feed_state.consecutive_failures,
+            "reasons": reasons,
+            "checked_at": utc_now(),
+        }
+    )
+
+
+def current_loss_streak(trade_log: list[dict[str, Any]]) -> int:
+    completed: list[Decimal] = []
+    open_trades: dict[str, list[dict[str, Decimal]]] = {}
+    for item in trade_log:
+        action = str(item.get("action", ""))
+        symbol = str(item.get("symbol", ""))
+        qty = decimal_from_any(item.get("quantity"))
+        price = decimal_from_any(item.get("price"))
+        if not symbol or qty is None or price is None:
+            continue
+        amount = decimal_from_any(item.get("quote_amount")) or qty * price
+        if "BUY" in action:
+            open_trades.setdefault(symbol, []).append({"qty": qty, "amount": amount})
+        elif "SELL" in action and open_trades.get(symbol):
+            queue = open_trades[symbol]
+            remaining_sell_qty = qty
+            pnl = Decimal("0")
+            while remaining_sell_qty > 0 and queue:
+                open_trade = queue[0]
+                open_qty = open_trade["qty"]
+                closed_qty = min(open_qty, remaining_sell_qty)
+                ratio = closed_qty / qty if qty > 0 else Decimal("1")
+                open_ratio = closed_qty / open_qty if open_qty > 0 else Decimal("1")
+                exit_amount = amount * ratio
+                entry_amount = open_trade["amount"] * open_ratio
+                pnl += exit_amount - entry_amount
+                open_trade["qty"] = open_qty - closed_qty
+                open_trade["amount"] = open_trade["amount"] - entry_amount
+                remaining_sell_qty -= closed_qty
+                if open_trade["qty"] <= 0:
+                    queue.pop(0)
+            completed.append(pnl)
+    streak = 0
+    for pnl in reversed(completed):
+        if pnl < 0:
+            streak += 1
+            continue
+        break
+    return streak
+
+
 def symbol_order_rules(exchange_info: dict[str, Any], symbol: str) -> OrderRules:
     rules = OrderRules(symbol=symbol)
     for item in exchange_info.get("symbols", []):
@@ -1952,6 +2850,10 @@ def symbol_order_rules(exchange_info: dict[str, Any], symbol: str) -> OrderRules
                 min_notional = Decimal(str(filt.get("minNotional", "0")))
                 if min_notional > 0:
                     rules.min_notional = max(rules.min_notional, min_notional)
+            elif filter_type == "PRICE_FILTER":
+                tick_size = Decimal(str(filt.get("tickSize", "0")))
+                if tick_size > 0:
+                    rules.tick_size = tick_size
         return rules
     return rules
 
@@ -1966,6 +2868,16 @@ def round_down_to_step(quantity: Decimal, step: Decimal) -> Decimal:
     return (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+def build_client_order_id(action: str, symbol: str, timestamp: str | None = None) -> str:
+    compact_ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    normalized_action = re.sub(r"[^a-z0-9]", "", action.lower())[:6] or "order"
+    normalized_symbol = re.sub(r"[^A-Z0-9]", "", symbol.upper())[:11]
+    seed = f"{normalized_action}|{normalized_symbol}|{compact_ts}|{time.perf_counter_ns()}"
+    short_hash = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:6]
+    client_id = f"bm-{normalized_action}-{normalized_symbol}-{compact_ts}-{short_hash}"
+    return client_id[:36]
+
+
 def format_decimal(value: Decimal) -> str:
     if value.is_zero():
         return "0"
@@ -1975,8 +2887,308 @@ def format_decimal(value: Decimal) -> str:
     return text
 
 
+def stringify_decimals(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return format_decimal(value)
+    if isinstance(value, dict):
+        return {key: stringify_decimals(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [stringify_decimals(item) for item in value]
+    if isinstance(value, tuple):
+        return [stringify_decimals(item) for item in value]
+    return value
+
+
+def compact_text(value: Any, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def signal_post_summary(posts: list[SquarePost], limit: int = 5) -> list[dict[str, Any]]:
+    ranked = sorted(posts, key=post_signal_weight, reverse=True)
+    summaries: list[dict[str, Any]] = []
+    for post in ranked[:limit]:
+        summaries.append(
+            {
+                "title": compact_text(post.title, 120),
+                "text": compact_text(post.text, 220),
+                "traffic_score": post.traffic_score,
+                "url": post.url or "",
+                "created_at": post.created_at or "",
+                "post_id": post.post_id or "",
+                "author": compact_text(post.author, 80),
+                "source": post.source,
+                "extractor_mode": post.extractor_mode,
+            }
+        )
+    return stringify_decimals(summaries)
+
+
+def signal_candidate_row(candidate: TradeCandidate) -> dict[str, Any]:
+    return stringify_decimals(
+        {
+            "asset": candidate.base_asset,
+            "symbol": candidate.symbol,
+            "score": candidate.combined_score,
+            "market_score": candidate.market_score,
+            "square_score": candidate.square_score,
+            "mentions": candidate.mention_count,
+            "last_price": candidate.last_price,
+            "price_change_percent": candidate.price_change_percent,
+            "volatility_percent": candidate.volatility_percent,
+            "quote_volume": candidate.quote_volume,
+        }
+    )
+
+
+def build_signal_record(
+    config: BotConfig,
+    source: str,
+    posts: list[SquarePost],
+    candidates: list[TradeCandidate],
+    candidate: TradeCandidate | None,
+    entry_confirmation: dict[str, Any] | None,
+    square_confidence: dict[str, Any] | None,
+    account_risk_snapshot: dict[str, Any] | None,
+    final_action: str,
+    note: str = "",
+) -> dict[str, Any]:
+    return stringify_decimals(
+        {
+            "schema_version": 1,
+            "recorded_at": utc_now(),
+            "source": source,
+            "dry_run": config.dry_run,
+            "quote_asset": config.quote_asset,
+            "fixed_order_quote_usdt": config.order_quote_amount,
+            "min_square_confidence_score": config.min_square_confidence_score,
+            "square_confidence": square_confidence or {},
+            "hot_posts": signal_post_summary(posts),
+            "candidates": [signal_candidate_row(item) for item in candidates[: config.top_coin_limit]],
+            "candidate": signal_candidate_row(candidate) if candidate else None,
+            "entry_confirmation": entry_confirmation or {},
+            "checks": dict((entry_confirmation or {}).get("checks") or {}),
+            "account_risk": account_risk_snapshot or {},
+            "final_action": final_action,
+            "entered": final_action == "entered",
+            "note": compact_text(note, 300),
+        }
+    )
+
+
+def append_signal_record(path: str, record: dict[str, Any]) -> None:
+    target = Path(path)
+    if target.parent and str(target.parent) not in {"", "."}:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    safe_record = redact_signal_record(record)
+    with target.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(safe_record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def redact_signal_record(record: dict[str, Any]) -> dict[str, Any]:
+    blocked = {
+        "api_key",
+        "api_secret",
+        "telegram_bot_token",
+        "telegram_chat_id",
+        "secret",
+        "balances",
+        "account_balances",
+    }
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items() if key not in blocked}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(record)
+
+
+def read_signal_records(path: str) -> list[dict[str, Any]]:
+    target = Path(path)
+    if not target.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with target.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                LOGGER.warning("invalid signal record JSONL line skipped")
+                continue
+            if isinstance(payload, dict):
+                records.append(payload)
+    return records
+
+
+def write_signal_records(path: str, records: list[dict[str, Any]]) -> None:
+    target = Path(path)
+    if target.parent and str(target.parent) not in {"", "."}:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8", newline="\n") as handle:
+        for record in records:
+            handle.write(json.dumps(redact_signal_record(record), ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def signal_record_stats(path: str) -> dict[str, Any]:
+    records = read_signal_records(path)
+    last_record_at = records[-1].get("recorded_at", "") if records else ""
+    future_return_records = sum(1 for record in records if isinstance(record.get("future_returns"), dict) and record.get("future_returns"))
+    decision_groups: dict[str, int] = {}
+    for record in records:
+        group = signal_record_decision_group(record)
+        decision_groups[group] = decision_groups.get(group, 0) + 1
+    return {
+        "record_file": path,
+        "record_count": len(records),
+        "entered_count": sum(1 for item in records if item.get("entered") or item.get("final_action") == "entered"),
+        "skipped_count": sum(1 for item in records if not (item.get("entered") or item.get("final_action") == "entered")),
+        "last_record_at": last_record_at,
+        "future_returns_count": future_return_records,
+        "decision_groups": decision_groups,
+    }
+
+
+def signal_record_decision_group(record: dict[str, Any]) -> str:
+    if record.get("entered") or record.get("final_action") == "entered":
+        return "entered"
+    square_score = decimal_from_any((record.get("square_confidence") or {}).get("score"))
+    threshold = decimal_from_any(record.get("min_square_confidence_score")) or Decimal("35")
+    if square_score is not None and square_score < threshold:
+        return "square_low_confidence"
+    checks = record.get("checks") or (record.get("entry_confirmation") or {}).get("checks") or {}
+    if isinstance(checks, dict):
+        if isinstance(checks.get("kline"), dict) and checks["kline"].get("passed") is False:
+            return "kline_rejected"
+        if isinstance(checks.get("liquidity"), dict) and checks["liquidity"].get("passed") is False:
+            return "orderbook_rejected"
+    account_risk = record.get("account_risk") or {}
+    reason = str((record.get("entry_confirmation") or {}).get("reason") or record.get("note") or "").lower()
+    if (
+        isinstance(account_risk, dict)
+        and account_risk.get("entry_blocked")
+        or "account risk" in reason
+        or "exposure" in reason
+        or "drawdown" in reason
+        or "consecutive losses" in reason
+    ):
+        return "account_risk_rejected"
+    if (record.get("entry_confirmation") or {}).get("passed") is False:
+        return "entry_rejected"
+    return "skipped_other"
+
+
+FUTURE_RETURN_INTERVALS: tuple[tuple[str, str, int], ...] = (
+    ("5m", "5m", 5),
+    ("15m", "15m", 15),
+    ("1h", "1h", 60),
+    ("4h", "4h", 240),
+)
+
+
+def update_signal_record_future_returns(
+    config: BotConfig,
+    record_file: str | None = None,
+    client: BinanceSpotClient | None = None,
+) -> dict[str, Any]:
+    path = record_file or config.signal_record_file
+    records = read_signal_records(path)
+    if not records:
+        return {"record_file": path, "record_count": 0, "updated_count": 0}
+    market_client = client or BinanceSpotClient(config)
+    updated = 0
+    for record in records:
+        if update_record_future_returns(record, market_client):
+            updated += 1
+    if updated:
+        write_signal_records(path, records)
+    result = signal_record_stats(path)
+    result["updated_count"] = updated
+    return result
+
+
+def update_record_future_returns(record: dict[str, Any], client: BinanceSpotClient) -> bool:
+    candidate = record.get("candidate") or {}
+    symbol = str(candidate.get("symbol") or "")
+    entry_price = decimal_from_any(candidate.get("last_price"))
+    recorded_at = parse_timestamp(record.get("recorded_at") or record.get("checked_at"))
+    if not symbol or not entry_price or entry_price <= 0 or recorded_at is None:
+        return False
+    returns = dict(record.get("future_returns") or {})
+    changed = False
+    for key, interval, minutes in FUTURE_RETURN_INTERVALS:
+        if key in returns:
+            continue
+        target_ms = int((recorded_at + timedelta(minutes=minutes)).timestamp() * 1000)
+        try:
+            rows = client.klines(symbol, interval, 1, start_time=target_ms)
+        except Exception as exc:
+            returns[key] = {"error": str(exc)}
+            changed = True
+            continue
+        if not rows:
+            continue
+        close_price = decimal_from_any(rows[0][4] if isinstance(rows[0], list) and len(rows[0]) > 4 else None)
+        if close_price is None or close_price <= 0:
+            continue
+        returns[key] = stringify_decimals(
+            {
+                "close_price": close_price,
+                "return_pct": (close_price - entry_price) / entry_price * Decimal("100"),
+                "observed_at": datetime.fromtimestamp(int(rows[0][0]) / 1000, tz=timezone.utc).isoformat()
+                if isinstance(rows[0], list) and rows[0]
+                else utc_now(),
+            }
+        )
+        changed = True
+    if changed:
+        record["future_returns"] = returns
+        record["future_returns_updated_at"] = utc_now()
+    return changed
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def account_safety_snapshot(client: BinanceSpotClient, config: BotConfig) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "api_key_loaded": bool(config.api_key),
+        "api_secret_loaded": bool(config.api_secret),
+        "api_key_suffix": config.api_key[-4:] if config.api_key else "",
+        "manual_withdraw_permission_check_required": True,
+        "manual_ip_whitelist_check_required": True,
+        "checked_at": utc_now(),
+    }
+    if not config.api_key or not config.api_secret:
+        snapshot["error"] = "API key/secret not loaded"
+        return snapshot
+    try:
+        account = client.account()
+    except Exception as exc:
+        snapshot["error"] = str(exc)
+        return snapshot
+    permissions = account.get("permissions") or []
+    can_trade = account.get("canTrade")
+    can_withdraw = account.get("canWithdraw")
+    snapshot.update(
+        {
+            "can_trade": bool(can_trade),
+            "can_withdraw": bool(can_withdraw),
+            "can_deposit": bool(account.get("canDeposit")),
+            "permissions": permissions,
+            "spot_trading_allowed": True if not permissions else "SPOT" in {str(item).upper() for item in permissions},
+            "warning": "Manually verify withdraw permission is disabled and IP whitelist is enabled in Binance API settings.",
+        }
+    )
+    return snapshot
 
 
 def parse_timestamp(value: Any) -> datetime | None:
@@ -2098,6 +3310,11 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "30")),
         max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "5")),
         max_daily_loss_usdt=decimal_env("MAX_DAILY_LOSS_USDT", "25"),
+        max_total_exposure_pct=decimal_env("MAX_TOTAL_EXPOSURE_PCT", "0") or Decimal("0"),
+        max_symbol_exposure_pct=decimal_env("MAX_SYMBOL_EXPOSURE_PCT", "0") or Decimal("0"),
+        max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0")),
+        max_intraday_drawdown_pct=decimal_env("MAX_INTRADAY_DRAWDOWN_PCT", "0") or Decimal("0"),
+        risk_per_trade_pct=decimal_env("RISK_PER_TRADE_PCT", "0") or Decimal("0"),
         fee_rate_pct=decimal_env("FEE_RATE_PCT", "0.1"),
         slippage_pct=decimal_env("SLIPPAGE_PCT", "0.05"),
         asset_whitelist=tuple_env("ASSET_WHITELIST"),
@@ -2107,6 +3324,14 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         market_filter_min_change_pct=decimal_env("MARKET_FILTER_MIN_CHANGE_PCT", "-1"),
         market_filter_require_all=bool_env("MARKET_FILTER_REQUIRE_ALL", False),
         account_sync_enabled=bool_env("ACCOUNT_SYNC_ENABLED", True),
+        kline_confirmation_enabled=bool_env("KLINE_CONFIRMATION_ENABLED", True),
+        min_square_confidence_score=decimal_env("MIN_SQUARE_CONFIDENCE_SCORE", "35") or Decimal("35"),
+        max_spread_bps=decimal_env("MAX_SPREAD_BPS", "50") or Decimal("50"),
+        min_orderbook_depth_usdt=decimal_env("MIN_ORDERBOOK_DEPTH_USDT", "1000") or Decimal("1000"),
+        exchange_protection_enabled=bool_env("EXCHANGE_PROTECTION_ENABLED", True),
+        oco_stop_limit_slippage_pct=decimal_env("OCO_STOP_LIMIT_SLIPPAGE_PCT", "0.5") or Decimal("0.5"),
+        signal_recording_enabled=bool_env("SIGNAL_RECORDING_ENABLED", True),
+        signal_record_file=os.getenv("SIGNAL_RECORD_FILE", DEFAULT_SIGNAL_RECORD_FILE),
         state_file=os.getenv("STATE_FILE", DEFAULT_STATE_FILE),
         dry_run=not args.live,
         square_urls=square_urls,
@@ -2122,6 +3347,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Binance Square long-only spot momentum bot")
     parser.add_argument("--live", action="store_true", help="place real Binance Spot orders")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
+    parser.add_argument("--update-signal-returns", action="store_true", help="update future-return fields in the signal JSONL file and exit")
     parser.add_argument("--testnet", action="store_true", help="use Binance Spot testnet base URL")
     parser.add_argument("--square-browser", action="store_true", help="scrape Binance Square with Playwright browser rendering")
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
@@ -2139,6 +3365,11 @@ def main() -> int:
         LOGGER.warning("dry-run mode is enabled; no real orders will be sent")
     else:
         LOGGER.warning("LIVE mode is enabled; real Spot BUY/SELL orders may be sent")
+
+    if args.update_signal_returns:
+        result = update_signal_record_future_returns(config)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
 
     bot = LongOnlyMomentumBot(config)
     if args.once:

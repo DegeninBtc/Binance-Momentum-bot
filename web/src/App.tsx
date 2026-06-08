@@ -32,7 +32,7 @@ import {
   TrendingUp,
   Wallet,
 } from "lucide-react";
-import { fetchMarketChart, fetchStatus, postAction, postPositionClose } from "./api";
+import { dashboardHeaders, fetchMarketChart, fetchStatus, postAction, postPositionClose } from "./api";
 import {
   actionLabel,
   asNumber,
@@ -51,10 +51,12 @@ import {
 } from "./format";
 import type {
   ConfigPayload,
+  AccountRiskSnapshot,
   ChartRangeKey,
   DashboardStatus,
   Diagnostics,
   DiagnosticsPost,
+  EntryConfirmation,
   EntryGuardSnapshot,
   HotAsset,
   MarketChart,
@@ -62,6 +64,8 @@ import type {
   Position,
   PositionSnapshot,
   Primitive,
+  SafetySnapshot,
+  SquareConfidence,
   SettingsState,
   SettingsTabKey,
   TabKey,
@@ -95,6 +99,11 @@ const DEFAULT_SETTINGS: SettingsState = {
   cooldown_minutes: "30",
   max_daily_trades: "5",
   max_daily_loss_usdt: "25",
+  max_total_exposure_pct: "0",
+  max_symbol_exposure_pct: "0",
+  max_consecutive_losses: "0",
+  max_intraday_drawdown_pct: "0",
+  risk_per_trade_pct: "0",
   fee_rate_pct: "0.1",
   slippage_pct: "0.05",
   poll_seconds: "300",
@@ -105,11 +114,20 @@ const DEFAULT_SETTINGS: SettingsState = {
   square_diagnostic_limit: "10",
   telegram_bot_token: "",
   telegram_chat_id: "",
+  dashboard_auth_token: "",
+  signal_recording_enabled: true,
+  signal_record_file: "signal_records.jsonl",
   telegram_enabled: false,
   fixed_stop_after_first_round_trip: false,
   market_filter_enabled: false,
   market_filter_require_all: false,
   account_sync_enabled: true,
+  kline_confirmation_enabled: true,
+  min_square_confidence_score: "35",
+  max_spread_bps: "50",
+  min_orderbook_depth_usdt: "1000",
+  exchange_protection_enabled: true,
+  oco_stop_limit_slippage_pct: "0.5",
 };
 
 const TAB_ITEMS: Array<{ key: TabKey; label: string; icon: LucideIcon }> = [
@@ -245,6 +263,10 @@ function App() {
   const guard = state.entry_guard_snapshot || null;
   const performance = state.performance_stats || null;
   const trades = state.trade_log || [];
+  const safety = state.safety_snapshot || null;
+  const entryConfirmation = state.entry_confirmation || signal.entry_confirmation || null;
+  const squareConfidence = state.square_confidence || signal.square_confidence || null;
+  const accountRisk = state.account_risk_snapshot || null;
   const diagnostics = status?.last_diagnostics || null;
   const hasError = Boolean(requestError || status?.last_error);
   const running = Boolean(status?.running);
@@ -347,13 +369,31 @@ function App() {
     });
   }
 
+  function liveConfirmationMessage(path: string) {
+    if (!settings.live || !["/api/run-once", "/api/start-loop", "/api/manual-close"].includes(path)) {
+      return "";
+    }
+    if (path === "/api/manual-close") {
+      return "Confirm LIVE market sell for the current position? This will place a real order.";
+    }
+    if (path === "/api/start-loop") {
+      return "Confirm LIVE loop start? Future cycles may place real spot orders.";
+    }
+    return "Confirm LIVE run once? This cycle may place real spot orders.";
+  }
+
   async function submit(path: string, nextTab?: TabKey) {
+    const confirmMessage = liveConfirmationMessage(path);
+    const liveConfirmed = Boolean(confirmMessage);
+    if (confirmMessage && !window.confirm(confirmMessage)) {
+      return;
+    }
     setBusyPath(path);
     if (nextTab) {
       setActiveTab(nextTab);
     }
     try {
-      const data = await postAction(path, settings);
+      const data = await postAction(path, liveConfirmed ? { ...settings, live_confirmed: true } : settings);
       setStatus(data);
       setRequestError("");
       window.setTimeout(refresh, 800);
@@ -375,7 +415,7 @@ function App() {
     const busyKey = `/api/close-position:${symbol}`;
     setBusyPath(busyKey);
     try {
-      const data = await postPositionClose({ ...settings, symbol, close_quantity: quantity });
+      const data = await postPositionClose({ ...settings, symbol, close_quantity: quantity, live_confirmed: settings.live ? true : undefined });
       setStatus(data);
       setRequestError("");
       window.setTimeout(refresh, 800);
@@ -553,6 +593,8 @@ function App() {
           />
         </section>
 
+        <SafetyPanel safety={safety} liveMode={liveMode} entryConfirmation={entryConfirmation} squareConfidence={squareConfidence} accountRisk={accountRisk} />
+
         <section className="command-panel">
           <div className="command-title">
             <p className="eyebrow">Actions</p>
@@ -627,9 +669,10 @@ function App() {
             <DiagnosticsPanel
               diagnostics={diagnostics}
               settings={settings}
-              busy={busyPath === "/api/square-diagnose"}
+              busy={busyPath === "/api/square-diagnose" || busyPath === "/api/update-signal-returns"}
               updateSetting={updateSetting}
               onDiagnose={() => submit("/api/square-diagnose", "diag")}
+              onUpdateReturns={() => submit("/api/update-signal-returns", "diag")}
             />
           )}
           {activeTab === "logs" && <LogsPanel logs={status?.logs || []} requestError={requestError} />}
@@ -670,6 +713,73 @@ function StatusBadge({
       <Icon size={14} />
       {label}
     </span>
+  );
+}
+
+function SafetyPanel({
+  safety,
+  liveMode,
+  entryConfirmation,
+  squareConfidence,
+  accountRisk,
+}: {
+  safety: SafetySnapshot | null;
+  liveMode: boolean;
+  entryConfirmation: EntryConfirmation | null;
+  squareConfidence: SquareConfidence | null;
+  accountRisk: AccountRiskSnapshot | null;
+}) {
+  const api = safety?.api_key_check || {};
+  const pending = safety?.pending_order;
+  const missing = safety?.missing_protection_symbols || [];
+  const failed = safety?.failed_protection_orders || [];
+  const protectionOk = Boolean(safety?.protection_ok);
+  const entryBlocked = entryConfirmation && entryConfirmation.passed === false;
+  const accountBlocked = Boolean(accountRisk?.entry_blocked);
+  const tone = pending || missing.length || failed.length || api.error || entryBlocked || accountBlocked || (liveMode && api.spot_trading_allowed === false) ? "danger" : liveMode ? "warning" : "success";
+  return (
+    <section className={`safety-panel tone-${tone}`}>
+      <div className="safety-head">
+        <Shield size={18} />
+        <div>
+          <strong>Live Safety</strong>
+          <span>{liveMode ? "Spot live actions require confirmation" : "Dry-run mode, contract display is simulation only"}</span>
+        </div>
+      </div>
+      <div className="safety-grid">
+        <div>
+          <span>Pending order</span>
+          <strong>{pending ? `${pending.side || "--"} ${pending.symbol || "--"}` : "None"}</strong>
+          <small>{pending?.client_order_id || "No unresolved clientOrderId"}</small>
+        </div>
+        <div>
+          <span>Protection</span>
+          <strong>{protectionOk ? "OK" : "Attention"}</strong>
+          <small>
+            {missing.length ? `Missing: ${missing.join(", ")}` : failed.length ? `Failed: ${failed.map((item) => item.symbol).join(", ")}` : "Exchange or simulated protection recorded"}
+          </small>
+        </div>
+        <div>
+          <span>API key</span>
+          <strong>{api.api_key_loaded ? `Loaded ****${api.api_key_suffix || ""}` : "Missing"}</strong>
+          <small>{api.error || (api.spot_trading_allowed === false ? "SPOT permission not reported" : "Manually check withdraw off and IP whitelist on")}</small>
+        </div>
+        <div>
+          <span>Entry confirmation</span>
+          <strong>{entryConfirmation ? (entryConfirmation.passed ? "Passed" : "Blocked") : "Waiting"}</strong>
+          <small>
+            {entryConfirmation?.reason || `Square confidence ${textValue(squareConfidence?.score) || "--"}`}
+          </small>
+        </div>
+        <div>
+          <span>Account risk</span>
+          <strong>{accountRisk ? (accountRisk.entry_blocked ? "Blocked" : "OK") : "Waiting"}</strong>
+          <small>
+            {accountRisk?.reason || `Exposure ${formatPercent(accountRisk?.total_exposure_pct ?? 0)} · suggested ${formatMoney(accountRisk?.risk_based_quote_suggestion ?? 0, textValue(accountRisk?.quote_asset) || "USDT")}`}
+          </small>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -1432,15 +1542,18 @@ function DiagnosticsPanel({
   busy,
   updateSetting,
   onDiagnose,
+  onUpdateReturns,
 }: {
   diagnostics: Diagnostics | null;
   settings: SettingsState;
   busy: boolean;
   updateSetting: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
   onDiagnose: () => void;
+  onUpdateReturns: () => void;
 }) {
   const urls = diagnostics?.urls || [];
   const posts = diagnostics?.display_posts || [];
+  const signalStats = diagnostics?.signal_record_stats;
   const checkedAt = diagnostics?.checked_at ? formatTime(diagnostics.checked_at) : "--";
   return (
     <div className="diagnostics-layout">
@@ -1468,6 +1581,10 @@ function DiagnosticsPanel({
         <button className="action-button" type="button" disabled={busy} onClick={onDiagnose}>
           <Search size={16} />
           <span>{busy ? "诊断中" : "重新诊断"}</span>
+        </button>
+        <button className="action-button" type="button" disabled={busy} onClick={onUpdateReturns}>
+          <Database size={16} />
+          <span>Update returns</span>
         </button>
       </div>
       {!diagnostics ? <EmptyState title="暂无诊断结果" text="点击诊断广场后查看 Binance Square 抓取与解析状态。" /> : null}
@@ -1501,6 +1618,24 @@ function DiagnosticsPanel({
         <p>帖子分 = 币种符号分 + 交易语境分 + 非看空/做空语境分 + 流量/长度分 + 时间衰减分。有效帖子仍按原策略过滤；下方列表展示真实抓到的原始帖子。</p>
         {diagnostics.browser_error ? <p className="negative">浏览器错误：{diagnostics.browser_error}</p> : null}
         {diagnostics.hint ? <p className="warning">{diagnostics.hint}</p> : null}
+        {signalStats ? (
+          <p>
+            Signal records {signalStats.record_count ?? 0}
+            {signalStats.last_record_at ? ` · latest ${formatTime(signalStats.last_record_at)}` : ""}
+            {signalStats.entered_count !== undefined ? ` · entered ${signalStats.entered_count}` : ""}
+            {signalStats.skipped_count !== undefined ? ` · skipped ${signalStats.skipped_count}` : ""}
+            {signalStats.future_returns_count !== undefined ? ` · returns ${signalStats.future_returns_count}` : ""}
+            {signalStats.updated_count !== undefined ? ` · updated ${signalStats.updated_count}` : ""}
+          </p>
+        ) : null}
+        {signalStats?.decision_groups ? (
+          <p>
+            Groups{" "}
+            {Object.entries(signalStats.decision_groups)
+              .map(([key, value]) => `${key}:${value}`)
+              .join(" · ")}
+          </p>
+        ) : null}
       </div>
       {urls.length ? (
         <div className="table-shell">
@@ -1620,7 +1755,7 @@ function NotificationPanel({
     try {
       const response = await fetch("/api/test-telegram", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: dashboardHeaders(settings),
         body: JSON.stringify(settings),
       });
       const data = (await response.json()) as { ok?: boolean; error?: string };
@@ -1643,6 +1778,7 @@ function NotificationPanel({
         </div>
         <SettingsField {...fieldProps} name="telegram_bot_token" label="Bot Token" type="password" placeholder="123456:ABC-DEF..." help="从 @BotFather 获取的 Bot Token；页面不会从后端回显 Token。" full />
         <SettingsField {...fieldProps} name="telegram_chat_id" label="Chat ID" placeholder="-100123456789" help="目标聊天 ID，可以是个人或群组。" />
+        <SettingsField {...fieldProps} name="dashboard_auth_token" label="Dashboard Token" type="password" help="Set this to the same value as DASHBOARD_AUTH_TOKEN; it is stored only in this browser." full />
         <div className="telegram-test-row">
           <button className="action-button tone-secondary" type="button" disabled={telegramTestBusy} onClick={testTelegram}>
             <Send size={16} />
@@ -1712,6 +1848,10 @@ function SettingsPanel({
             <SettingsField {...fieldProps} name="min_quote_volume" label="最低成交额" type="number" min="0" step="100000" full />
             <SettingsField {...fieldProps} name="top_post_limit" label="热门帖子数" type="number" min="1" step="1" />
             <SettingsField {...fieldProps} name="top_coin_limit" label="热门币种数" type="number" min="1" step="1" />
+            <SettingsField {...fieldProps} name="min_square_confidence_score" label="Square 最低置信度" type="number" min="0" max="100" step="1" help="低于该分数时跳过自动入场，避免数据源失效后退化成纯追涨。" />
+            <div className="toggle-grid is-full">
+              <SettingsToggle {...toggleProps} name="kline_confirmation_enabled" label="启用短周期 K 线确认" />
+            </div>
           </SettingsSection>
         )}
         {activeTab === "scope" && (
@@ -1720,6 +1860,8 @@ function SettingsPanel({
             <SettingsField {...fieldProps} name="asset_blacklist" label="黑名单" placeholder="USDC,FDUSD 或 OPNUSDT" help="这些币种永不新开仓，优先级高于候选排序。" full />
             <SettingsField {...fieldProps} name="market_filter_assets" label="大盘过滤币种" help="用于判断大盘环境，默认 BTC 和 ETH。" />
             <SettingsField {...fieldProps} name="market_filter_min_change_pct" label="大盘最低涨幅 %" type="number" step="0.1" help="低于该 24h 涨幅时暂停追涨开仓。" />
+            <SettingsField {...fieldProps} name="max_spread_bps" label="最大点差 bps" type="number" min="0" step="1" help="盘口点差超过该阈值时跳过入场；填 0 关闭点差过滤。" />
+            <SettingsField {...fieldProps} name="min_orderbook_depth_usdt" label="最小盘口深度 USDT" type="number" min="0" step="100" help="买一侧深度不足时跳过入场；填 0 关闭深度过滤。" />
             <div className="toggle-grid">
               <SettingsToggle {...toggleProps} name="market_filter_enabled" label="启用 BTC/ETH 大盘过滤" />
               <SettingsToggle {...toggleProps} name="market_filter_require_all" label="要求全部大盘币满足" />
@@ -1740,8 +1882,15 @@ function SettingsPanel({
             <SettingsField {...fieldProps} name="cooldown_minutes" label="冷却分钟" type="number" min="0" step="1" help="同一币种卖出后暂停重新开仓；填 0 关闭。" />
             <SettingsField {...fieldProps} name="max_daily_trades" label="每日最大开仓" type="number" min="0" step="1" help="按 UTC 日期统计买入次数；填 0 关闭。" />
             <SettingsField {...fieldProps} name="max_daily_loss_usdt" label="每日最大亏损 USDT" type="number" min="0" step="1" help="已实现亏损达到后停止新开仓；填 0 关闭。" full />
+            <SettingsField {...fieldProps} name="max_total_exposure_pct" label="最大总敞口 %" type="number" min="0" step="1" help="所有持仓加本次拟开仓占权益估算的上限；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="max_symbol_exposure_pct" label="最大单币敞口 %" type="number" min="0" step="1" help="单一币种持仓加本次拟开仓占权益估算的上限；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="max_consecutive_losses" label="最大连亏次数" type="number" min="0" step="1" help="连续亏损达到该次数后暂停新开仓；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="max_intraday_drawdown_pct" label="日内回撤熔断 %" type="number" min="0" step="0.1" help="已实现亏损加浮亏达到该回撤比例后暂停新开仓；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="risk_per_trade_pct" label="风险定仓建议 %" type="number" min="0" step="0.1" help="仅计算建议仓位，不改变当前固定金额下单。" />
+            <SettingsField {...fieldProps} name="oco_stop_limit_slippage_pct" label="OCO stop-limit slippage %" type="number" min="0" step="0.1" help="Live protection stop-limit price offset after stop trigger." />
             <div className="toggle-grid">
               <SettingsToggle {...toggleProps} name="fixed_stop_after_first_round_trip" label="首回合后固定止损" />
+              <SettingsToggle {...toggleProps} name="exchange_protection_enabled" label="Exchange protection orders" />
             </div>
           </SettingsSection>
         )}
@@ -1755,9 +1904,11 @@ function SettingsPanel({
           <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="运行模式" description="控制循环频率、签名窗口、测试网、实盘和广场抓取方式。">
             <SettingsField {...fieldProps} name="poll_seconds" label="轮询秒数" type="number" min="5" step="1" />
             <SettingsField {...fieldProps} name="recv_window_ms" label="签名窗口 ms" type="number" min="1000" step="100" />
+            <SettingsField {...fieldProps} name="signal_record_file" label="Signal record file" full />
             <div className="toggle-grid">
               <SettingsToggle {...toggleProps} name="testnet" label="Testnet" />
               <SettingsToggle {...toggleProps} name="live" label="Live 实盘" />
+              <SettingsToggle {...toggleProps} name="signal_recording_enabled" label="Record signal JSONL" />
             </div>
           </SettingsSection>
         )}
@@ -1775,6 +1926,7 @@ function SettingsField({
   help,
   type = "text",
   min,
+  max,
   step,
   placeholder,
   full = false,
@@ -1787,6 +1939,7 @@ function SettingsField({
   help?: string;
   type?: string;
   min?: string;
+  max?: string;
   step?: string;
   placeholder?: string;
   full?: boolean;
@@ -1797,6 +1950,7 @@ function SettingsField({
       <input
         type={type}
         min={min}
+        max={max}
         step={step}
         value={String(settings[name])}
         placeholder={placeholder}
@@ -1907,6 +2061,11 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
     cooldown_minutes: textValue(config.cooldown_minutes) || DEFAULT_SETTINGS.cooldown_minutes,
     max_daily_trades: textValue(config.max_daily_trades) || DEFAULT_SETTINGS.max_daily_trades,
     max_daily_loss_usdt: textValue(config.max_daily_loss_usdt) || DEFAULT_SETTINGS.max_daily_loss_usdt,
+    max_total_exposure_pct: textValue(config.max_total_exposure_pct) || DEFAULT_SETTINGS.max_total_exposure_pct,
+    max_symbol_exposure_pct: textValue(config.max_symbol_exposure_pct) || DEFAULT_SETTINGS.max_symbol_exposure_pct,
+    max_consecutive_losses: textValue(config.max_consecutive_losses) || DEFAULT_SETTINGS.max_consecutive_losses,
+    max_intraday_drawdown_pct: textValue(config.max_intraday_drawdown_pct) || DEFAULT_SETTINGS.max_intraday_drawdown_pct,
+    risk_per_trade_pct: textValue(config.risk_per_trade_pct) || DEFAULT_SETTINGS.risk_per_trade_pct,
     fee_rate_pct: textValue(config.fee_rate_pct) || DEFAULT_SETTINGS.fee_rate_pct,
     slippage_pct: textValue(config.slippage_pct) || DEFAULT_SETTINGS.slippage_pct,
     poll_seconds: textValue(config.poll_seconds) || DEFAULT_SETTINGS.poll_seconds,
@@ -1917,11 +2076,20 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
     square_diagnostic_limit: textValue(config.square_diagnostic_limit) || DEFAULT_SETTINGS.square_diagnostic_limit,
     telegram_bot_token: "",
     telegram_chat_id: textValue(config.telegram_chat_id),
+    dashboard_auth_token: "",
+    signal_recording_enabled: config.signal_recording_enabled !== false,
+    signal_record_file: textValue(config.signal_record_file) || DEFAULT_SETTINGS.signal_record_file,
     telegram_enabled: Boolean(config.telegram_enabled),
     fixed_stop_after_first_round_trip: Boolean(config.fixed_stop_after_first_round_trip),
     market_filter_enabled: Boolean(config.market_filter_enabled),
     market_filter_require_all: Boolean(config.market_filter_require_all),
     account_sync_enabled: config.account_sync_enabled !== false,
+    kline_confirmation_enabled: config.kline_confirmation_enabled !== false,
+    min_square_confidence_score: textValue(config.min_square_confidence_score) || DEFAULT_SETTINGS.min_square_confidence_score,
+    max_spread_bps: textValue(config.max_spread_bps) || DEFAULT_SETTINGS.max_spread_bps,
+    min_orderbook_depth_usdt: textValue(config.min_orderbook_depth_usdt) || DEFAULT_SETTINGS.min_orderbook_depth_usdt,
+    exchange_protection_enabled: config.exchange_protection_enabled !== false,
+    oco_stop_limit_slippage_pct: textValue(config.oco_stop_limit_slippage_pct) || DEFAULT_SETTINGS.oco_stop_limit_slippage_pct,
   };
 }
 

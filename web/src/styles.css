@@ -553,9 +553,69 @@ input:focus-visible {
 
 .overview-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 14px;
+}
+
+.safety-panel {
+  margin-bottom: 14px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.safety-panel.tone-success {
+  border-color: rgba(15, 170, 99, 0.28);
+}
+
+.safety-panel.tone-warning {
+  border-color: rgba(216, 144, 0, 0.38);
+}
+
+.safety-panel.tone-danger {
+  border-color: rgba(240, 24, 37, 0.36);
+}
+
+.safety-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.safety-head strong,
+.safety-grid strong {
+  display: block;
+  font-size: 13px;
+}
+
+.safety-head span,
+.safety-grid span,
+.safety-grid small {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.safety-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.safety-grid > div {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.safety-grid small {
+  overflow-wrap: anywhere;
 }
 
 .metric-card {

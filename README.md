@@ -59,7 +59,7 @@ python -m pip install -r requirements.txt
 ### 前端构建
 
 ```powershell
-npm install
+npm ci
 npm run build
 ```
 
@@ -205,7 +205,7 @@ http://127.0.0.1:8787/
 - `dashboard.*.log`
 - `__pycache__/` / `*.pyc`
 - `node_modules/`
-- `package-lock.json`
+- `signal_records.jsonl`
 - `web/dist/`
 
 ## 编码说明
@@ -228,3 +228,151 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 ---
 
 **风险提示：** 自动交易可能造成真实亏损。本项目不是投资建议；任何实盘操作都应从小金额开始，并自行承担风险。
+
+## 实盘前检查清单
+
+在切换 `Live 实盘` 或使用 `python .\binance_square_momentum_bot.py --live` 前，请逐项确认：
+
+- API key 只开启现货交易权限，不开启提现权限。
+- API key 已在 Binance 后台开启 IP 白名单；Binance API 无法完整可靠读取该项，必须人工检查。
+- 页面状态只显示 API key 是否加载和后 4 位，不会显示完整 key 或 secret。
+- `run-once`、`start-loop`、`manual-close`、单仓位平仓在 live 模式下都需要二次确认；后端会拒绝没有 `live_confirmed=true` 的请求。
+- 下单前会把 `pending_order` 写入 `bot_state.json`，异常后按 `clientOrderId` 查询订单状态，避免直接重复下单。
+- live 买入成交后会尝试创建交易所端保护单：优先 OCO；当固定止盈为 `0` 时使用 stop-loss-limit 保护。保护单失败会写入日志、页面状态，并触发 Telegram 通知。
+- dry-run 不会真实挂保护单，只会在状态中记录模拟保护单参数。
+- 当前 futures/contract 显示仅是 dry-run 合约模拟；live 模式仍然只做 Binance Spot 现货交易，不会自动切换合约交易。
+
+新增配置：
+
+```powershell
+$env:EXCHANGE_PROTECTION_ENABLED="true"
+$env:OCO_STOP_LIMIT_SLIPPAGE_PCT="0.5"
+```
+
+## P1 信号可靠性过滤
+
+自动入场前会额外做三类确认，用于减少 Square 数据失效或短线冲高回落时的误入场：
+
+- `Square 置信度`：基于帖子数量、结构化信息、时间信息、抓取模式和连续失败次数评分；低于阈值时跳过自动交易。
+- `短周期 K 线确认`：检查 5m / 15m / 1h ROC、5m EMA9 和高 24h 涨幅下的短线回落风险。
+- `盘口流动性过滤`：检查 bid-ask spread 和买入侧 order book 深度，流动性不足时跳过候选币。
+
+新增配置：
+
+```powershell
+$env:KLINE_CONFIRMATION_ENABLED="true"
+$env:MIN_SQUARE_CONFIDENCE_SCORE="35"
+$env:MAX_SPREAD_BPS="50"
+$env:MIN_ORDERBOOK_DEPTH_USDT="1000"
+```
+
+当 Binance Square 没有有效做多提及时，自动入场不会再退化成纯 24h 市场动能追涨；页面首页会显示 `Entry confirmation` 的通过/阻塞原因。
+
+## P2 账户级风控
+
+账户级风控用于限制整体风险，而不是替代单笔止损。默认阈值为 `0`，表示关闭对应限制；设置后会在自动入场前检查：
+
+- 总敞口：所有持仓加本次拟开仓金额占权益估算的比例。
+- 单币敞口：当前候选币持仓加本次拟开仓金额占权益估算的比例。
+- 连亏熔断：最近已完成交易连续亏损达到阈值后暂停新开仓。
+- 日内回撤熔断：当日已实现亏损加当前浮亏达到阈值后暂停新开仓。
+- 风险定仓建议：只计算建议下单金额，不改变当前固定 `ORDER_QUOTE_USDT` 下单逻辑。
+
+新增配置：
+
+```powershell
+$env:MAX_TOTAL_EXPOSURE_PCT="0"
+$env:MAX_SYMBOL_EXPOSURE_PCT="0"
+$env:MAX_CONSECUTIVE_LOSSES="0"
+$env:MAX_INTRADAY_DRAWDOWN_PCT="0"
+$env:RISK_PER_TRADE_PCT="0"
+```
+
+页面首页会显示 `Account risk` 状态；设置页“风控退出”可以调整这些参数。
+
+## P3 Engineering Validation Baseline
+
+Use the following commands before committing local safety or dashboard changes:
+
+```powershell
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py
+python .\tests\test_safety_and_risk.py
+npm ci
+npm run build
+```
+
+`package-lock.json` is intentionally committed so `npm ci` can reproduce frontend installs. The dashboard still defaults to `127.0.0.1`; if `DASHBOARD_AUTH_TOKEN` is set, trading-control POST requests must include the same token from the browser settings page. Public deployment still requires external HTTPS, firewall rules, and IP allowlisting.
+
+```powershell
+$env:DASHBOARD_AUTH_TOKEN="your-local-token"
+```
+
+## P4 Signal Recording And Offline Dataset
+
+- `SIGNAL_RECORDING_ENABLED=true` enables JSONL recording by default.
+- `SIGNAL_RECORD_FILE=signal_records.jsonl` controls the local output file.
+- Web `preview` and `run-once` write one record with Square confidence, post summaries, candidate scores, entry confirmation, K-line/orderbook checks, account risk, and final decision.
+- Records are redacted and must not contain API keys, API secrets, Telegram tokens, or full account balance details.
+- `signal_records.jsonl` is ignored by Git.
+- Future-return updates only read market data and do not modify `bot_state.json`:
+
+```powershell
+python .\binance_square_momentum_bot.py --update-signal-returns
+```
+
+Analyze the local signal dataset:
+
+```powershell
+python .\tools\analyze_signal_records.py .\signal_records.jsonl
+python .\tools\analyze_signal_records.py .\signal_records.jsonl --csv --output .\signal_records.csv
+```
+
+## P5 Offline Validation And Replay Draft
+
+P5 adds lightweight validation on top of P4 signal records. It is not a full backtest engine and does not tune parameters automatically.
+
+- `tools/analyze_signal_records.py` groups records by decision reason: entered, low Square confidence, K-line rejection, orderbook rejection, account-risk rejection, and other skips.
+- The analyzer compares future returns for entered versus skipped records at 5m / 15m / 1h / 4h and reports mean, median, and positive-rate values.
+- `tools/replay_signal_records.py` replays recorded decisions from JSONL and reports trade count, win rate, average return, max consecutive losses, and missed-upside / avoided-downside counts by decision group.
+- Replay is read-only: it does not call Binance, does not modify `bot_state.json`, and does not place or simulate new orders outside the recorded dataset.
+
+```powershell
+python .\tools\replay_signal_records.py .\signal_records.jsonl --horizon 1h
+```
+
+## P6 CI And Dependency Stability
+
+This repository includes a lightweight GitHub Actions baseline in `.github/workflows/ci.yml`.
+It runs the same validation commands recommended for local pre-commit checks:
+
+```powershell
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py
+python .\tests\test_safety_and_risk.py
+npm ci
+npm run build
+```
+
+CI does not require Binance or Telegram credentials, does not call live trading endpoints, and does not run the bot in live mode.
+
+Dependency defaults:
+
+- Frontend installs should use `npm ci`; `package-lock.json` is intentionally committed.
+- Python dependencies remain in `requirements.txt` for now.
+- No `uv.lock`, `requirements.lock`, or pip-tools migration is included in this phase.
+
+Additional test coverage now includes symbol extraction, Square mention counting, score ordering, Decimal rounding, Binance filter parsing, state migration, signal JSONL analysis, replay summaries, and dry-run fill behavior.
+
+## Remote Dashboard Safety
+
+The web dashboard is designed for local use first. It binds to `127.0.0.1` by default, and `DASHBOARD_AUTH_TOKEN` is only a local control-layer token.
+
+If you deploy the dashboard on a VPS or expose it beyond localhost, add external protection before enabling trading controls:
+
+- HTTPS reverse proxy.
+- Firewall and IP allowlist.
+- `DASHBOARD_AUTH_TOKEN`.
+- Binance API key with no withdrawal permission.
+- Binance API IP whitelist.
+- Live-mode confirmation for every trading control request.
+
+Do not treat the dashboard token alone as a complete public-internet authentication system.

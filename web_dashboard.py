@@ -9,6 +9,7 @@ environment variables and are never displayed or accepted through the UI.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ BOT_LOGGER = logging.getLogger("square-momentum-bot")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_BASE_URL = "https://api.binance.com"
+LOCAL_DASHBOARD_HOSTS = {"127.0.0.1", "localhost", "::1"}
 WEB_DIST_DIR = Path(__file__).resolve().parent / "web" / "dist"
 DEFAULT_SQUARE_URLS = (
     "https://www.binance.com/en/square",
@@ -87,6 +89,7 @@ class BotRunner:
         self.last_diagnostics: dict[str, Any] | None = None
         self.last_config: Any | None = None
         self.price_cache: dict[str, dict[str, Any]] = {}
+        self.safety_cache: dict[str, dict[str, Any]] = {}
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -126,6 +129,35 @@ class BotRunner:
         with self.lock:
             self.price_cache[cache_key] = {"price": price, "error": error, "cached_at": now}
         return price, error
+
+    def api_key_safety_for_status(self, config: Any) -> dict[str, Any]:
+        module = bot_module()
+        if config.dry_run:
+            return {
+                "api_key_loaded": bool(config.api_key),
+                "api_secret_loaded": bool(config.api_secret),
+                "api_key_suffix": config.api_key[-4:] if config.api_key else "",
+                "spot_trading_allowed": None,
+                "can_trade": None,
+                "manual_withdraw_permission_check_required": True,
+                "manual_ip_whitelist_check_required": True,
+                "warning": "Live 前请人工确认 API key 禁用提现权限，并开启 IP 白名单。",
+            }
+        cache_key = f"{config.base_url}|{config.api_key[-4:] if config.api_key else ''}"
+        now = time.monotonic()
+        with self.lock:
+            cached = self.safety_cache.get(cache_key)
+            if cached and now - float(cached.get("cached_at", 0)) < 30:
+                return dict(cached.get("payload") or {})
+        client = module.BinanceSpotClient(config)
+        try:
+            client.sync_time()
+        except Exception:
+            pass
+        payload = module.account_safety_snapshot(client, config)
+        with self.lock:
+            self.safety_cache[cache_key] = {"payload": payload, "cached_at": now}
+        return payload
 
     def preview_signal(self, config: Any) -> dict[str, Any]:
         if not self._claim("preview", config):
@@ -275,7 +307,8 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
     base_assets = {data["baseAsset"] for data in symbols.values()}
     posts = bot.square.fetch_top_posts(config.top_post_limit, browser_mode=config.square_browser_mode)
     bot._sync_square_feed_state()
-    module.save_state(config.state_file, bot.state)
+    square_confidence = module.square_confidence_snapshot(posts, bot.square.last_diagnostics, bot.square.feed_state)
+    bot.state.square_confidence = square_confidence
     mentions = module.count_coin_mentions(posts, base_assets)
     candidates = bot._rank_trade_candidates(symbols, mentions)
     hot_assets = candidates[: config.top_coin_limit]
@@ -284,10 +317,17 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
     market_guard = bot._market_filter_reason()
     if market_guard:
         notes.append(f"大盘过滤暂停新开仓：{market_guard}")
+    if Decimal(str(square_confidence.get("score", "0"))) < config.min_square_confidence_score:
+        notes.append(f"Square 置信度 {square_confidence.get('score')} 低于 {config.min_square_confidence_score}，自动入场会跳过。")
     if not mentions:
-        LOGGER.warning("no valid long-only Binance Square mentions found; preview is using market momentum only")
-        notes.append("广场没有有效做多提及，本次按 24h 市场动能排序。")
+        LOGGER.warning("no valid long-only Binance Square mentions found; preview market-only fallback is disabled for auto entry")
+        notes.append("广场没有有效做多提及，自动入场不会退化为纯 24h 市场动能。")
     candidate = candidates[0] if candidates else None
+    entry_confirmation = None
+    if candidate is not None and Decimal(str(square_confidence.get("score", "0"))) >= config.min_square_confidence_score and mentions:
+        entry_confirmation = bot._confirm_candidate_entry(candidate)
+        bot.state.entry_confirmation = entry_confirmation
+    module.save_state(config.state_file, bot.state)
     if candidate is None:
         notes.append(
             "暂无标的同时满足 "
@@ -304,14 +344,34 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
         notes.append("白名单：" + ", ".join(config.asset_whitelist))
     if config.asset_blacklist:
         notes.append("黑名单：" + ", ".join(config.asset_blacklist))
-    return {
+    payload = {
         "checked_at": now_text(),
         "source": source,
         "note": " ".join(notes),
         "post_count": len(posts),
+        "square_confidence": square_confidence,
+        "entry_confirmation": entry_confirmation,
         "hot_assets": [candidate_score_row(item) for item in hot_assets],
         "candidate": stringify_decimals(asdict(candidate)) if candidate else None,
     }
+    if config.signal_recording_enabled:
+        final_action = "would_enter" if entry_confirmation and entry_confirmation.get("passed") else "skipped"
+        module.append_signal_record(
+            config.signal_record_file,
+            module.build_signal_record(
+                config,
+                source="preview",
+                posts=posts,
+                candidates=hot_assets,
+                candidate=candidate,
+                entry_confirmation=entry_confirmation,
+                square_confidence=square_confidence,
+                account_risk_snapshot=bot.state.account_risk_snapshot,
+                final_action=final_action,
+                note=payload["note"],
+            ),
+        )
+    return payload
 
 
 def candidate_score_row(candidate: Any) -> dict[str, Any]:
@@ -348,7 +408,13 @@ def build_square_diagnostics(config: Any) -> dict[str, Any]:
         diagnostics["hint"] = diagnostics.get("browser_hint", "") or "运行 fix_playwright_browser.bat 安装 Playwright Chromium。"
     else:
         diagnostics["hint"] = ""
+    diagnostics["signal_record_stats"] = module.signal_record_stats(config.signal_record_file)
     return stringify_decimals(diagnostics)
+
+
+def update_signal_returns(config: Any) -> dict[str, Any]:
+    module = bot_module()
+    return stringify_decimals(module.update_signal_record_future_returns(config))
 
 
 def build_market_chart(symbol: str, range_key: str, testnet: bool = False) -> dict[str, Any]:
@@ -419,6 +485,7 @@ def reset_dry_run_state(runner: BotRunner, config: Any) -> dict[str, Any]:
 
 
 def close_position_from_payload(runner: BotRunner, config: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    require_live_confirmation(config, payload, "close-position")
     symbol = str(payload.get("symbol") or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{3,20}", symbol):
         raise ValueError("symbol must be a Binance spot symbol")
@@ -430,6 +497,14 @@ def close_position_from_payload(runner: BotRunner, config: Any, payload: dict[st
     if quantity <= 0:
         raise ValueError("close_quantity must be a positive number")
     return runner.close_position(config, symbol, quantity)
+
+
+def require_live_confirmation(config: Any, payload: dict[str, Any], action: str) -> None:
+    if config.dry_run:
+        return
+    if payload.get("live_confirmed") is True:
+        return
+    raise RuntimeError(f"Live {action} requires live_confirmed=true")
 
 
 def test_telegram(config: Any) -> dict[str, Any]:
@@ -454,6 +529,9 @@ def safe_load_state(path: str) -> dict[str, Any]:
                 "positions": [],
                 "updated_at": "",
                 "trade_log": [],
+                "entry_confirmation": {},
+                "square_confidence": {},
+                "account_risk_snapshot": {},
             }
         with open(path, "r", encoding="utf-8") as handle:
             return json.load(handle)
@@ -465,6 +543,8 @@ def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunne
     enriched = dict(state)
     enriched["entry_guard_snapshot"] = stringify_decimals(build_entry_guard_snapshot(state, config))
     enriched["performance_stats"] = stringify_decimals(build_performance_stats(state, config.quote_asset))
+    enriched["safety_snapshot"] = stringify_decimals(build_safety_snapshot(state, config, runner))
+    enriched["account_risk_snapshot"] = stringify_decimals(build_account_risk_snapshot(state, config, runner))
 
     positions = active_positions_from_state(state)
     enriched["positions"] = positions
@@ -484,6 +564,97 @@ def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunne
     enriched["position_snapshot"] = stringify_decimals(snapshots[0])
     enriched["position_snapshots"] = stringify_decimals(snapshots)
     return enriched
+
+
+def build_safety_snapshot(state: dict[str, Any], config: Any, runner: BotRunner) -> dict[str, Any]:
+    positions = active_positions_from_state(state)
+    protections = [item for item in state.get("protection_orders") or [] if isinstance(item, dict)]
+    active_symbols = {str(item.get("symbol", "")) for item in positions if item.get("symbol")}
+    protected_symbols = {
+        str(item.get("symbol", ""))
+        for item in protections
+        if str(item.get("status", "")).lower() in {"active", "simulated"} and item.get("symbol")
+    }
+    failed = [item for item in protections if str(item.get("status", "")).lower() in {"failed", "missing", "cancel_failed"}]
+    missing_symbols = sorted(symbol for symbol in active_symbols if symbol and symbol not in protected_symbols)
+    return {
+        "pending_order": state.get("pending_order"),
+        "pending_order_open": bool(state.get("pending_order")),
+        "protection_enabled": bool(getattr(config, "exchange_protection_enabled", True)),
+        "protection_orders": protections,
+        "protected_symbols": sorted(protected_symbols & active_symbols),
+        "missing_protection_symbols": missing_symbols,
+        "failed_protection_orders": failed,
+        "protection_ok": not missing_symbols and not failed,
+        "live_confirm_required": not config.dry_run,
+        "live_confirmed": False,
+        "api_key_check": runner.api_key_safety_for_status(config),
+        "manual_checks": [
+            "确认 Binance API key 没有提现权限",
+            "确认 Binance API key 已开启 IP 白名单",
+            "确认当前 live 模式仍是现货交易，不会自动切换合约",
+        ],
+    }
+
+
+def build_account_risk_snapshot(state: dict[str, Any], config: Any, runner: BotRunner) -> dict[str, Any]:
+    positions = active_positions_from_state(state)
+    total_exposure = Decimal("0")
+    unrealized_pnl = Decimal("0")
+    for position in positions:
+        qty = decimal_from_state(position.get("quantity")) or Decimal("0")
+        entry = decimal_from_state(position.get("entry_price")) or Decimal("0")
+        if qty <= 0 or entry <= 0:
+            continue
+        symbol = str(position.get("symbol") or "")
+        current_price, _ = runner.ticker_price_for_status(config, symbol)
+        price = current_price or entry
+        total_exposure += qty * price
+        unrealized_pnl += (price - entry) * qty
+    equity = max(
+        total_exposure + config.order_quote_amount,
+        config.order_quote_amount * Decimal(max(1, config.max_open_positions)),
+    )
+    guard = build_entry_guard_snapshot(state, config)
+    realized_pnl = decimal_from_state(guard.get("realized_pnl")) or Decimal("0")
+    daily_drawdown = (-realized_pnl if realized_pnl < 0 else Decimal("0")) + (-unrealized_pnl if unrealized_pnl < 0 else Decimal("0"))
+    drawdown_pct = daily_drawdown / equity * Decimal("100") if equity > 0 else Decimal("0")
+    total_exposure_pct = total_exposure / equity * Decimal("100") if equity > 0 else Decimal("0")
+    loss_streak = bot_module().current_loss_streak(state.get("trade_log") or [])
+    risk_based_quote = Decimal("0")
+    if config.risk_per_trade_pct > 0 and config.initial_stop_loss_pct > 0:
+        risk_budget = equity * config.risk_per_trade_pct / Decimal("100")
+        risk_based_quote = risk_budget / (config.initial_stop_loss_pct / Decimal("100"))
+    reasons: list[str] = []
+    if config.max_total_exposure_pct > 0 and total_exposure_pct > config.max_total_exposure_pct:
+        reasons.append(f"total exposure {format_decimal(total_exposure_pct)}% exceeds {config.max_total_exposure_pct}%")
+    if config.max_consecutive_losses > 0 and loss_streak >= config.max_consecutive_losses:
+        reasons.append(f"consecutive losses {loss_streak} reached {config.max_consecutive_losses}")
+    if config.max_intraday_drawdown_pct > 0 and drawdown_pct >= config.max_intraday_drawdown_pct:
+        reasons.append(f"intraday drawdown {format_decimal(drawdown_pct)}% reached {config.max_intraday_drawdown_pct}%")
+    return {
+        "entry_blocked": bool(reasons),
+        "reason": "; ".join(reasons) if reasons else "account risk checks passed",
+        "quote_asset": config.quote_asset,
+        "equity_estimate": equity,
+        "total_exposure": total_exposure,
+        "total_exposure_pct": total_exposure_pct,
+        "realized_pnl_today": realized_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "intraday_drawdown": daily_drawdown,
+        "intraday_drawdown_pct": drawdown_pct,
+        "consecutive_losses": loss_streak,
+        "fixed_order_quote": config.order_quote_amount,
+        "risk_based_quote_suggestion": risk_based_quote,
+        "limits": {
+            "max_total_exposure_pct": config.max_total_exposure_pct,
+            "max_symbol_exposure_pct": config.max_symbol_exposure_pct,
+            "max_consecutive_losses": config.max_consecutive_losses,
+            "max_intraday_drawdown_pct": config.max_intraday_drawdown_pct,
+            "risk_per_trade_pct": config.risk_per_trade_pct,
+        },
+        "checked_at": now_text(),
+    }
 
 
 def active_positions_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -805,6 +976,7 @@ def sanitize_config(config: Any | None) -> dict[str, Any]:
     data.pop("telegram_bot_token", None)
     data["api_key_loaded"] = bool(config.api_key)
     data["api_secret_loaded"] = bool(config.api_secret)
+    data["api_key_suffix"] = config.api_key[-4:] if config.api_key else ""
     data["telegram_token_loaded"] = bool(config.telegram_bot_token)
     return data
 
@@ -854,6 +1026,11 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         cooldown_minutes=int_value(payload, "cooldown_minutes", "COOLDOWN_MINUTES", 30),
         max_daily_trades=int_value(payload, "max_daily_trades", "MAX_DAILY_TRADES", 5),
         max_daily_loss_usdt=decimal_value(payload, "max_daily_loss_usdt", "MAX_DAILY_LOSS_USDT", "25"),
+        max_total_exposure_pct=decimal_value(payload, "max_total_exposure_pct", "MAX_TOTAL_EXPOSURE_PCT", "0"),
+        max_symbol_exposure_pct=decimal_value(payload, "max_symbol_exposure_pct", "MAX_SYMBOL_EXPOSURE_PCT", "0"),
+        max_consecutive_losses=int_value_allow_zero(payload, "max_consecutive_losses", "MAX_CONSECUTIVE_LOSSES", 0),
+        max_intraday_drawdown_pct=decimal_value(payload, "max_intraday_drawdown_pct", "MAX_INTRADAY_DRAWDOWN_PCT", "0"),
+        risk_per_trade_pct=decimal_value(payload, "risk_per_trade_pct", "RISK_PER_TRADE_PCT", "0"),
         fee_rate_pct=decimal_value(payload, "fee_rate_pct", "FEE_RATE_PCT", "0.1"),
         slippage_pct=decimal_value(payload, "slippage_pct", "SLIPPAGE_PCT", "0.05"),
         asset_whitelist=symbol_list_value(payload, "asset_whitelist", "ASSET_WHITELIST"),
@@ -863,6 +1040,14 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         market_filter_min_change_pct=decimal_value(payload, "market_filter_min_change_pct", "MARKET_FILTER_MIN_CHANGE_PCT", "-1"),
         market_filter_require_all=bool_value(payload, "market_filter_require_all", False),
         account_sync_enabled=bool_value(payload, "account_sync_enabled", True),
+        kline_confirmation_enabled=bool_value(payload, "kline_confirmation_enabled", True),
+        min_square_confidence_score=decimal_value(payload, "min_square_confidence_score", "MIN_SQUARE_CONFIDENCE_SCORE", "35"),
+        max_spread_bps=decimal_value(payload, "max_spread_bps", "MAX_SPREAD_BPS", "50"),
+        min_orderbook_depth_usdt=decimal_value(payload, "min_orderbook_depth_usdt", "MIN_ORDERBOOK_DEPTH_USDT", "1000"),
+        exchange_protection_enabled=bool_value(payload, "exchange_protection_enabled", True),
+        oco_stop_limit_slippage_pct=decimal_value(payload, "oco_stop_limit_slippage_pct", "OCO_STOP_LIMIT_SLIPPAGE_PCT", "0.5"),
+        signal_recording_enabled=bool_value(payload, "signal_recording_enabled", True),
+        signal_record_file=str(payload.get("signal_record_file") or os.getenv("SIGNAL_RECORD_FILE", module.DEFAULT_SIGNAL_RECORD_FILE)),
         state_file=str(payload.get("state_file") or os.getenv("STATE_FILE", "bot_state.json")),
         dry_run=not bool(payload.get("live")),
         square_urls=square_urls,
@@ -913,6 +1098,16 @@ def int_value(payload: dict[str, Any], key: str, env_name: str, default: int) ->
     return value
 
 
+def int_value_allow_zero(payload: dict[str, Any], key: str, env_name: str, default: int) -> int:
+    raw = payload.get(key)
+    if raw in (None, ""):
+        raw = os.getenv(env_name, str(default))
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"{key} must be zero or greater")
+    return value
+
+
 def bool_value(payload: dict[str, Any], key: str, default: bool) -> bool:
     if key not in payload:
         return default
@@ -934,15 +1129,65 @@ def stringify_decimals(value: Any) -> Any:
     return value
 
 
+def format_decimal(value: Decimal) -> str:
+    if value.is_zero():
+        return "0"
+    text = format(value.normalize(), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
+def dashboard_auth_error(required_token: str, headers: Any, route: str) -> str | None:
+    if not required_token:
+        return None
+    supplied = str(headers.get("X-Dashboard-Token") or "").strip()
+    if not supplied:
+        auth_header = str(headers.get("Authorization") or "")
+        if auth_header.lower().startswith("bearer "):
+            supplied = auth_header[7:].strip()
+    if supplied and hmac.compare_digest(supplied, required_token):
+        return None
+    return f"dashboard auth token is required for {route}"
+
+
+def dashboard_request_host_error(bound_host: str, headers: Any) -> str | None:
+    allowed_hosts = set(LOCAL_DASHBOARD_HOSTS)
+    normalized_bound = normalize_dashboard_host(bound_host)
+    if normalized_bound:
+        allowed_hosts.add(normalized_bound)
+    host = normalize_dashboard_host(str(headers.get("Host") or ""))
+    if host and host not in allowed_hosts:
+        return f"dashboard Host is not allowed: {host}"
+    origin = str(headers.get("Origin") or "").strip()
+    if origin:
+        parsed = urlparse(origin)
+        origin_host = normalize_dashboard_host(parsed.netloc or parsed.path)
+        if origin_host and origin_host not in allowed_hosts:
+            return f"dashboard Origin is not allowed: {origin_host}"
+    return None
+
+
+def normalize_dashboard_host(value: str) -> str:
+    host = value.strip().lower()
+    if not host:
+        return ""
+    if host.startswith("[") and "]" in host:
+        return host[1:host.index("]")]
+    if ":" in host:
+        return host.split(":", 1)[0]
+    return host
+
+
+def make_handler(runner: BotRunner, bound_host: str = DEFAULT_HOST) -> type[BaseHTTPRequestHandler]:
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "BinanceBotDashboard/1.0"
 
         def do_GET(self) -> None:
+            if self._reject_disallowed_request():
+                return
             parsed = urlparse(self.path)
             route = parsed.path
             if route == "/api/status":
@@ -973,6 +1218,12 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             route = urlparse(self.path).path
             try:
+                if self._reject_disallowed_request():
+                    return
+                auth_error = dashboard_auth_error(os.getenv("DASHBOARD_AUTH_TOKEN", ""), self.headers, route)
+                if auth_error:
+                    self._send_json({"error": auth_error}, HTTPStatus.UNAUTHORIZED)
+                    return
                 payload = self._read_payload()
                 if route == "/api/stop":
                     self._send_json(runner.stop())
@@ -982,13 +1233,23 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
                     self._send_json(runner.preview_signal(config))
                 elif route == "/api/square-diagnose":
                     self._send_json(runner.diagnose_square(config))
+                elif route == "/api/update-signal-returns":
+                    stats = update_signal_returns(config)
+                    with runner.lock:
+                        diagnostics = dict(runner.last_diagnostics or {})
+                        diagnostics["signal_record_stats"] = stats
+                        runner.last_diagnostics = diagnostics
+                    self._send_json(runner.status())
                 elif route == "/api/run-once":
+                    require_live_confirmation(config, payload, "run-once")
                     self._send_json(runner.run_once(config))
                 elif route == "/api/manual-close":
+                    require_live_confirmation(config, payload, "manual-close")
                     self._send_json(runner.manual_close(config))
                 elif route == "/api/close-position":
                     self._send_json(close_position_from_payload(runner, config, payload))
                 elif route == "/api/start-loop":
+                    require_live_confirmation(config, payload, "start-loop")
                     self._send_json(runner.start_loop(config))
                 elif route == "/api/reset-dry-run-state":
                     self._send_json(reset_dry_run_state(runner, config))
@@ -1011,6 +1272,13 @@ def make_handler(runner: BotRunner) -> type[BaseHTTPRequestHandler]:
             ):
                 return
             LOGGER.info(fmt, *args)
+
+        def _reject_disallowed_request(self) -> bool:
+            error = dashboard_request_host_error(bound_host, self.headers)
+            if not error:
+                return False
+            self._send_json({"error": error}, HTTPStatus.FORBIDDEN)
+            return True
 
         def _read_payload(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0"))
@@ -1116,7 +1384,7 @@ def main() -> int:
     LOGGER.addHandler(memory_handler)
 
     runner = BotRunner(memory_handler)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(runner))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(runner, args.host))
     url = f"http://{args.host}:{args.port}/"
     LOGGER.info("dashboard listening on %s", url)
     if args.open_browser:

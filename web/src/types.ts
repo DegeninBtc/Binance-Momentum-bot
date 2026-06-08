@@ -29,6 +29,11 @@ export type SettingsState = {
   cooldown_minutes: string;
   max_daily_trades: string;
   max_daily_loss_usdt: string;
+  max_total_exposure_pct: string;
+  max_symbol_exposure_pct: string;
+  max_consecutive_losses: string;
+  max_intraday_drawdown_pct: string;
+  risk_per_trade_pct: string;
   fee_rate_pct: string;
   slippage_pct: string;
   poll_seconds: string;
@@ -39,11 +44,20 @@ export type SettingsState = {
   square_diagnostic_limit: string;
   telegram_bot_token: string;
   telegram_chat_id: string;
+  dashboard_auth_token: string;
+  signal_recording_enabled: boolean;
+  signal_record_file: string;
   telegram_enabled: boolean;
   fixed_stop_after_first_round_trip: boolean;
   market_filter_enabled: boolean;
   market_filter_require_all: boolean;
   account_sync_enabled: boolean;
+  kline_confirmation_enabled: boolean;
+  min_square_confidence_score: string;
+  max_spread_bps: string;
+  min_orderbook_depth_usdt: string;
+  exchange_protection_enabled: boolean;
+  oco_stop_limit_slippage_pct: string;
 };
 
 export type Candidate = {
@@ -93,6 +107,8 @@ export type MarketChart = {
 export type LastSignal = {
   candidate?: Candidate | null;
   hot_assets?: HotAsset[];
+  entry_confirmation?: EntryConfirmation | null;
+  square_confidence?: SquareConfidence | null;
   source?: string;
   note?: string;
   checked_at?: string;
@@ -184,6 +200,98 @@ export type TradeItem = {
   quote_amount?: Primitive;
 };
 
+export type PendingOrder = {
+  symbol?: string;
+  side?: string;
+  client_order_id?: string;
+  quote_amount?: Primitive;
+  quantity?: Primitive;
+  created_at?: string;
+  action?: string;
+  status?: string;
+  error?: string;
+};
+
+export type ProtectionOrder = {
+  symbol?: string;
+  client_order_id?: string;
+  quantity?: Primitive;
+  take_profit_price?: Primitive;
+  stop_price?: Primitive;
+  stop_limit_price?: Primitive;
+  status?: string;
+  kind?: string;
+  dry_run?: boolean;
+  created_at?: string;
+  error?: string;
+};
+
+export type ApiKeyCheck = {
+  api_key_loaded?: boolean;
+  api_secret_loaded?: boolean;
+  api_key_suffix?: string;
+  can_trade?: boolean | null;
+  can_withdraw?: boolean | null;
+  spot_trading_allowed?: boolean | null;
+  error?: string;
+  warning?: string;
+};
+
+export type SquareConfidence = {
+  score?: Primitive;
+  post_count?: Primitive;
+  structured_count?: Primitive;
+  fresh_count?: Primitive;
+  extractor_mode?: string;
+  consecutive_failures?: Primitive;
+  reasons?: string[];
+  checked_at?: string;
+};
+
+export type EntryConfirmation = {
+  passed?: boolean;
+  symbol?: string;
+  base_asset?: string;
+  reason?: string;
+  checks?: Record<string, unknown>;
+  square_confidence?: SquareConfidence;
+  checked_at?: string;
+};
+
+export type AccountRiskSnapshot = {
+  entry_blocked?: boolean;
+  reason?: string;
+  quote_asset?: string;
+  equity_estimate?: Primitive;
+  total_exposure?: Primitive;
+  total_exposure_pct?: Primitive;
+  symbol_exposure_pct?: Primitive;
+  realized_pnl_today?: Primitive;
+  unrealized_pnl?: Primitive;
+  intraday_drawdown?: Primitive;
+  intraday_drawdown_pct?: Primitive;
+  consecutive_losses?: Primitive;
+  fixed_order_quote?: Primitive;
+  risk_based_quote_suggestion?: Primitive;
+  limits?: Record<string, Primitive>;
+  checked_at?: string;
+};
+
+export type SafetySnapshot = {
+  pending_order?: PendingOrder | null;
+  pending_order_open?: boolean;
+  protection_enabled?: boolean;
+  protection_orders?: ProtectionOrder[];
+  protected_symbols?: string[];
+  missing_protection_symbols?: string[];
+  failed_protection_orders?: ProtectionOrder[];
+  protection_ok?: boolean;
+  live_confirm_required?: boolean;
+  live_confirmed?: boolean;
+  api_key_check?: ApiKeyCheck;
+  manual_checks?: string[];
+};
+
 export type DiagnosticsUrl = {
   url?: string;
   status_code?: Primitive;
@@ -249,9 +357,21 @@ export type Diagnostics = {
   consecutive_failures?: Primitive;
   browser_error?: string;
   hint?: string;
+  signal_record_stats?: SignalRecordStats;
   urls?: DiagnosticsUrl[];
   samples?: DiagnosticsSample[];
   display_posts?: DiagnosticsPost[];
+};
+
+export type SignalRecordStats = {
+  record_file?: string;
+  record_count?: Primitive;
+  entered_count?: Primitive;
+  skipped_count?: Primitive;
+  last_record_at?: string;
+  updated_count?: Primitive;
+  future_returns_count?: Primitive;
+  decision_groups?: Record<string, Primitive>;
 };
 
 export type BotState = {
@@ -261,6 +381,10 @@ export type BotState = {
   position_snapshots?: PositionSnapshot[];
   entry_guard_snapshot?: EntryGuardSnapshot | null;
   performance_stats?: PerformanceStats | null;
+  safety_snapshot?: SafetySnapshot | null;
+  entry_confirmation?: EntryConfirmation | null;
+  square_confidence?: SquareConfidence | null;
+  account_risk_snapshot?: AccountRiskSnapshot | null;
   trade_log?: TradeItem[];
   completed_round_trips?: Primitive;
 };
