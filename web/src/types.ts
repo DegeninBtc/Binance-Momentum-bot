@@ -400,7 +400,18 @@ export type DashboardStatus = {
   logs?: string[];
   config?: ConfigPayload;
   state?: BotState;
+  dashboard_security?: DashboardSecurity | null;
   error?: string;
+};
+
+export type DashboardSecurity = {
+  read_only?: boolean;
+  token_enabled?: boolean;
+  host_origin_check_enabled?: boolean;
+  bound_host?: string;
+  local_only_host?: boolean;
+  allowed_hosts?: string[];
+  warning?: string;
 };
 
 export type TabKey = "positions" | "hot" | "favorites" | "strategy" | "trades" | "diag" | "logs" | "notify" | "settings";

@@ -53,6 +53,7 @@ import type {
   ConfigPayload,
   AccountRiskSnapshot,
   ChartRangeKey,
+  DashboardSecurity,
   DashboardStatus,
   Diagnostics,
   DiagnosticsPost,
@@ -268,6 +269,9 @@ function App() {
   const squareConfidence = state.square_confidence || signal.square_confidence || null;
   const accountRisk = state.account_risk_snapshot || null;
   const diagnostics = status?.last_diagnostics || null;
+  const dashboardSecurity = status?.dashboard_security || null;
+  const readOnlyMode = Boolean(dashboardSecurity?.read_only);
+  const readOnlyReason = readOnlyMode ? "Dashboard read-only mode is enabled" : "";
   const hasError = Boolean(requestError || status?.last_error);
   const running = Boolean(status?.running);
   const keysLoaded = Boolean(config.api_key_loaded && config.api_secret_loaded);
@@ -594,6 +598,7 @@ function App() {
         </section>
 
         <SafetyPanel safety={safety} liveMode={liveMode} entryConfirmation={entryConfirmation} squareConfidence={squareConfidence} accountRisk={accountRisk} />
+        <DashboardSecurityPanel security={dashboardSecurity} />
 
         <section className="command-panel">
           <div className="command-title">
@@ -601,13 +606,13 @@ function App() {
             <h2>操作中枢</h2>
           </div>
           <div className="command-grid">
-            <ActionButton icon={RefreshCw} label="刷新信号" busy={busyPath === "/api/preview"} onClick={() => submit("/api/preview", "hot")} />
-            <ActionButton icon={Search} label="诊断广场" busy={busyPath === "/api/square-diagnose"} onClick={() => submit("/api/square-diagnose", "diag")} />
-            <ActionButton icon={Play} label="执行一次" tone="primary" busy={busyPath === "/api/run-once"} onClick={() => submit("/api/run-once", "hot")} />
-            <ActionButton icon={Activity} label="启动循环" busy={busyPath === "/api/start-loop"} onClick={() => submit("/api/start-loop")} />
-            <ActionButton icon={Square} label="停止" tone="danger" busy={busyPath === "/api/stop"} onClick={() => submit("/api/stop")} />
-            <ActionButton icon={Power} label="手动平仓" tone="danger" busy={busyPath === "/api/manual-close"} onClick={manualClose} />
-            <ActionButton icon={Trash2} label="清空模拟仓位" tone="danger" busy={busyPath === "/api/reset-dry-run-state"} onClick={resetState} />
+            <ActionButton icon={RefreshCw} label="刷新信号" busy={busyPath === "/api/preview"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/preview", "hot")} />
+            <ActionButton icon={Search} label="诊断广场" busy={busyPath === "/api/square-diagnose"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/square-diagnose", "diag")} />
+            <ActionButton icon={Play} label="执行一次" tone="primary" busy={busyPath === "/api/run-once"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/run-once", "hot")} />
+            <ActionButton icon={Activity} label="启动循环" busy={busyPath === "/api/start-loop"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/start-loop")} />
+            <ActionButton icon={Square} label="停止" tone="danger" busy={busyPath === "/api/stop"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/stop")} />
+            <ActionButton icon={Power} label="手动平仓" tone="danger" busy={busyPath === "/api/manual-close"} disabled={readOnlyMode} title={readOnlyReason} onClick={manualClose} />
+            <ActionButton icon={Trash2} label="清空模拟仓位" tone="danger" busy={busyPath === "/api/reset-dry-run-state"} disabled={readOnlyMode} title={readOnlyReason} onClick={resetState} />
           </div>
         </section>
 
@@ -640,6 +645,8 @@ function App() {
               snapshots={snapshots}
               onClosePosition={closePosition}
               busySymbol={busyPath.startsWith("/api/close-position:") ? busyPath.split(":")[1] : ""}
+              readOnly={readOnlyMode}
+              readOnlyReason={readOnlyReason}
             />
           )}
           {activeTab === "hot" && (
@@ -670,6 +677,8 @@ function App() {
               diagnostics={diagnostics}
               settings={settings}
               busy={busyPath === "/api/square-diagnose" || busyPath === "/api/update-signal-returns"}
+              readOnly={readOnlyMode}
+              readOnlyReason={readOnlyReason}
               updateSetting={updateSetting}
               onDiagnose={() => submit("/api/square-diagnose", "diag")}
               onUpdateReturns={() => submit("/api/update-signal-returns", "diag")}
@@ -777,6 +786,41 @@ function SafetyPanel({
           <small>
             {accountRisk?.reason || `Exposure ${formatPercent(accountRisk?.total_exposure_pct ?? 0)} · suggested ${formatMoney(accountRisk?.risk_based_quote_suggestion ?? 0, textValue(accountRisk?.quote_asset) || "USDT")}`}
           </small>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function DashboardSecurityPanel({ security }: { security: DashboardSecurity | null }) {
+  const readOnly = Boolean(security?.read_only);
+  const localOnly = security?.local_only_host !== false;
+  const tokenEnabled = Boolean(security?.token_enabled);
+  const tone = readOnly ? "warning" : localOnly && tokenEnabled ? "success" : localOnly ? "warning" : "danger";
+  return (
+    <section className={`safety-panel tone-${tone}`}>
+      <div className="safety-head">
+        <KeyRound size={18} />
+        <div>
+          <strong>Dashboard Security</strong>
+          <span>{readOnly ? "Read-only mode blocks POST controls" : "Trading controls are enabled for allowed local requests"}</span>
+        </div>
+      </div>
+      <div className="safety-grid">
+        <div>
+          <span>Read-only</span>
+          <strong>{readOnly ? "Enabled" : "Disabled"}</strong>
+          <small>{readOnly ? "POST control routes are blocked" : "Control routes can run after configured checks"}</small>
+        </div>
+        <div>
+          <span>Dashboard token</span>
+          <strong>{tokenEnabled ? "Enabled" : "Disabled"}</strong>
+          <small>{tokenEnabled ? "Token is required for POST requests" : "Local default, no token set"}</small>
+        </div>
+        <div>
+          <span>Host / Origin</span>
+          <strong>{security?.host_origin_check_enabled ? "Checked" : "Unknown"}</strong>
+          <small>{localOnly ? `Bound to ${security?.bound_host || "localhost"}` : security?.warning || "Non-local bind detected"}</small>
         </div>
       </div>
     </section>
@@ -1032,11 +1076,15 @@ function PositionsPanel({
   snapshots,
   onClosePosition,
   busySymbol,
+  readOnly,
+  readOnlyReason,
 }: {
   positions: PositionView[];
   snapshots: PositionSnapshot[];
   onClosePosition: (symbol: string, quantity: string) => void;
   busySymbol: string;
+  readOnly: boolean;
+  readOnlyReason: string;
 }) {
   if (!positions.length) {
     return <EmptyState title="暂无当前仓位" text="开仓后这里会显示完整仓位、浮动盈亏和价格线。" />;
@@ -1058,6 +1106,8 @@ function PositionsPanel({
               key={`${item.symbol}-${formatOrderQuantity(item.quantity, 1)}`}
               onClosePosition={onClosePosition}
               busy={busySymbol === item.symbol}
+              readOnly={readOnly}
+              readOnlyReason={readOnlyReason}
             />
           ))}
         </div>
@@ -1071,10 +1121,14 @@ function PositionDetailCard({
   item,
   onClosePosition,
   busy,
+  readOnly,
+  readOnlyReason,
 }: {
   item: PositionView;
   onClosePosition: (symbol: string, quantity: string) => void;
   busy: boolean;
+  readOnly: boolean;
+  readOnlyReason: string;
 }) {
   const pnl = asNumber(item.snapshot?.unrealized_pnl);
   const side = positionSide(item);
@@ -1118,7 +1172,8 @@ function PositionDetailCard({
             <button
               type="button"
               key={percent}
-              disabled={busy}
+              disabled={busy || readOnly}
+              title={readOnlyReason}
               onClick={() => onClosePosition(item.symbol, formatOrderQuantity(item.quantity, percent / 100))}
             >
               {percent}%
@@ -1132,7 +1187,7 @@ function PositionDetailCard({
             onChange={(event) => setCloseQuantity(event.target.value)}
             aria-label={`${item.symbol} 平仓数量`}
           />
-          <button type="button" disabled={busy || !isPositiveNumber(closeQuantity)} onClick={() => onClosePosition(item.symbol, closeQuantity)}>
+          <button type="button" disabled={busy || readOnly || !isPositiveNumber(closeQuantity)} title={readOnlyReason} onClick={() => onClosePosition(item.symbol, closeQuantity)}>
             {busy ? "处理中" : "平仓"}
           </button>
         </div>
@@ -1235,16 +1290,20 @@ function ActionButton({
   label,
   onClick,
   busy,
+  disabled = false,
+  title = "",
   tone = "secondary",
 }: {
   icon: LucideIcon;
   label: string;
   onClick: () => void;
   busy?: boolean;
+  disabled?: boolean;
+  title?: string;
   tone?: "primary" | "secondary" | "danger";
 }) {
   return (
-    <button className={`action-button tone-${tone}`} type="button" disabled={busy} onClick={onClick}>
+    <button className={`action-button tone-${tone}`} type="button" disabled={busy || disabled} title={title} onClick={onClick}>
       <Icon size={16} />
       <span>{busy ? "处理中" : label}</span>
     </button>
@@ -1540,6 +1599,8 @@ function DiagnosticsPanel({
   diagnostics,
   settings,
   busy,
+  readOnly,
+  readOnlyReason,
   updateSetting,
   onDiagnose,
   onUpdateReturns,
@@ -1547,6 +1608,8 @@ function DiagnosticsPanel({
   diagnostics: Diagnostics | null;
   settings: SettingsState;
   busy: boolean;
+  readOnly: boolean;
+  readOnlyReason: string;
   updateSetting: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
   onDiagnose: () => void;
   onUpdateReturns: () => void;
@@ -1578,11 +1641,11 @@ function DiagnosticsPanel({
             </button>
           ))}
         </div>
-        <button className="action-button" type="button" disabled={busy} onClick={onDiagnose}>
+        <button className="action-button" type="button" disabled={busy || readOnly} title={readOnlyReason} onClick={onDiagnose}>
           <Search size={16} />
           <span>{busy ? "诊断中" : "重新诊断"}</span>
         </button>
-        <button className="action-button" type="button" disabled={busy} onClick={onUpdateReturns}>
+        <button className="action-button" type="button" disabled={busy || readOnly} title={readOnlyReason} onClick={onUpdateReturns}>
           <Database size={16} />
           <span>Update returns</span>
         </button>

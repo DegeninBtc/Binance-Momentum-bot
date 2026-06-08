@@ -33,6 +33,18 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_BASE_URL = "https://api.binance.com"
 LOCAL_DASHBOARD_HOSTS = {"127.0.0.1", "localhost", "::1"}
+READ_ONLY_BLOCKED_POST_ROUTES = {
+    "/api/preview",
+    "/api/square-diagnose",
+    "/api/update-signal-returns",
+    "/api/run-once",
+    "/api/manual-close",
+    "/api/close-position",
+    "/api/start-loop",
+    "/api/stop",
+    "/api/reset-dry-run-state",
+    "/api/test-telegram",
+}
 WEB_DIST_DIR = Path(__file__).resolve().parent / "web" / "dist"
 DEFAULT_SQUARE_URLS = (
     "https://www.binance.com/en/square",
@@ -88,6 +100,7 @@ class BotRunner:
         self.last_signal: dict[str, Any] | None = None
         self.last_diagnostics: dict[str, Any] | None = None
         self.last_config: Any | None = None
+        self.bound_host = DEFAULT_HOST
         self.price_cache: dict[str, dict[str, Any]] = {}
         self.safety_cache: dict[str, dict[str, Any]] = {}
 
@@ -108,6 +121,7 @@ class BotRunner:
             config = config_from_payload({})
         state_file = config.state_file
         payload["config"] = sanitize_config(config)
+        payload["dashboard_security"] = dashboard_security_snapshot(self.bound_host)
         state = safe_load_state(state_file)
         state = enrich_state_for_status(state, config, self)
         payload["state"] = state
@@ -1153,6 +1167,30 @@ def dashboard_auth_error(required_token: str, headers: Any, route: str) -> str |
     return f"dashboard auth token is required for {route}"
 
 
+def dashboard_read_only_enabled() -> bool:
+    return str(os.getenv("DASHBOARD_READ_ONLY", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def dashboard_read_only_error(route: str) -> str | None:
+    if dashboard_read_only_enabled() and route in READ_ONLY_BLOCKED_POST_ROUTES:
+        return f"dashboard is read-only; {route} is disabled"
+    return None
+
+
+def dashboard_security_snapshot(bound_host: str) -> dict[str, Any]:
+    normalized_bound = normalize_dashboard_host(bound_host)
+    local_only = normalized_bound in LOCAL_DASHBOARD_HOSTS
+    return {
+        "read_only": dashboard_read_only_enabled(),
+        "token_enabled": bool(os.getenv("DASHBOARD_AUTH_TOKEN", "")),
+        "host_origin_check_enabled": True,
+        "bound_host": normalized_bound or bound_host,
+        "local_only_host": local_only,
+        "allowed_hosts": sorted(LOCAL_DASHBOARD_HOSTS | ({normalized_bound} if normalized_bound else set())),
+        "warning": "" if local_only else "Dashboard is not bound to a localhost address; use HTTPS, firewall, and IP allowlist.",
+    }
+
+
 def dashboard_request_host_error(bound_host: str, headers: Any) -> str | None:
     allowed_hosts = set(LOCAL_DASHBOARD_HOSTS)
     normalized_bound = normalize_dashboard_host(bound_host)
@@ -1182,6 +1220,8 @@ def normalize_dashboard_host(value: str) -> str:
 
 
 def make_handler(runner: BotRunner, bound_host: str = DEFAULT_HOST) -> type[BaseHTTPRequestHandler]:
+    runner.bound_host = bound_host
+
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "BinanceBotDashboard/1.0"
 
@@ -1223,6 +1263,10 @@ def make_handler(runner: BotRunner, bound_host: str = DEFAULT_HOST) -> type[Base
                 auth_error = dashboard_auth_error(os.getenv("DASHBOARD_AUTH_TOKEN", ""), self.headers, route)
                 if auth_error:
                     self._send_json({"error": auth_error}, HTTPStatus.UNAUTHORIZED)
+                    return
+                read_only_error = dashboard_read_only_error(route)
+                if read_only_error:
+                    self._send_json({"error": read_only_error}, HTTPStatus.FORBIDDEN)
                     return
                 payload = self._read_payload()
                 if route == "/api/stop":

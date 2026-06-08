@@ -376,3 +376,41 @@ If you deploy the dashboard on a VPS or expose it beyond localhost, add external
 - Live-mode confirmation for every trading control request.
 
 Do not treat the dashboard token alone as a complete public-internet authentication system.
+
+## P7 Dashboard Read-Only Safety Mode
+
+Use `DASHBOARD_READ_ONLY=true` when the dashboard should be observable but must not run control actions.
+
+```powershell
+$env:DASHBOARD_READ_ONLY="true"
+python .\web_dashboard.py
+```
+
+Read-only mode blocks POST control routes including preview, Square diagnostics, future-return updates, run-once, start-loop, stop, manual close, position close, dry-run state reset, and Telegram test sends. It keeps read-only GET routes available, including `/api/status`, `/api/market-chart`, and static frontend assets.
+
+`/api/status` exposes a `dashboard_security` snapshot with:
+
+- read-only enabled / disabled.
+- dashboard token enabled / disabled.
+- Host / Origin checking status.
+- bound host and whether it is local-only.
+
+The frontend displays this dashboard security state and disables control buttons when read-only mode is enabled. This is an application-level safeguard only; VPS or public deployments still need HTTPS reverse proxy, firewall, IP allowlist, Binance API IP whitelist, and no-withdrawal API keys.
+
+## P8 Dependabot Dependency Alerts
+
+GitHub Dependabot is configured in `.github/dependabot.yml` to check dependencies weekly:
+
+- `npm` for frontend dependencies in `package.json` / `package-lock.json`.
+- `pip` for Python dependencies in `requirements.txt`.
+
+Dependabot only opens update PRs. It does not auto-merge, does not run the bot, does not read API keys, and does not change live trading behavior. Review each Dependabot PR manually and require the normal validation baseline before merging:
+
+```powershell
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py
+python .\tests\test_safety_and_risk.py
+npm ci
+npm run build
+```
+
+The dependency strategy stays conservative in this phase: frontend installs use `npm ci`, Python stays on `requirements.txt`, and no `uv.lock`, `requirements.lock`, pip-tools, or automatic dependency update merge policy is introduced.

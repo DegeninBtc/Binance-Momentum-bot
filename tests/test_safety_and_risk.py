@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -58,6 +59,21 @@ def test_live_confirm_and_dashboard_auth() -> None:
     assert web.dashboard_request_host_error("127.0.0.1", {"Host": "127.0.0.1:8787"}) is None
     assert web.dashboard_request_host_error("127.0.0.1", {"Host": "evil.example"}) is not None
     assert web.dashboard_request_host_error("127.0.0.1", {"Host": "127.0.0.1:8787", "Origin": "http://evil.example"}) is not None
+
+    previous = os.environ.get("DASHBOARD_READ_ONLY")
+    try:
+        os.environ["DASHBOARD_READ_ONLY"] = "true"
+        assert web.dashboard_read_only_enabled()
+        assert web.dashboard_read_only_error("/api/run-once") is not None
+        assert web.dashboard_read_only_error("/api/status") is None
+        snapshot = web.dashboard_security_snapshot("127.0.0.1")
+        assert snapshot["read_only"] is True
+        assert snapshot["local_only_host"] is True
+    finally:
+        if previous is None:
+            os.environ.pop("DASHBOARD_READ_ONLY", None)
+        else:
+            os.environ["DASHBOARD_READ_ONLY"] = previous
 
 
 def test_signal_reliability_filters() -> None:
