@@ -295,7 +295,7 @@ $env:RISK_PER_TRADE_PCT="0"
 Use the following commands before committing local safety or dashboard changes:
 
 ```powershell
-python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
 python .\tests\test_safety_and_risk.py
 npm ci
 npm run build
@@ -340,13 +340,32 @@ P5 adds lightweight validation on top of P4 signal records. It is not a full bac
 python .\tools\replay_signal_records.py .\signal_records.jsonl --horizon 1h
 ```
 
+## P9 Walk-Forward Validation Draft
+
+P9 adds a lightweight walk-forward summary for existing signal records. It is offline-only: it does not call Binance, does not change bot state, does not tune parameters, and does not alter live trading behavior.
+
+The default split is:
+
+- Train: 60%
+- Validation: 20%
+- Test: 20%
+
+Run it with:
+
+```powershell
+python .\tools\walk_forward_signal_records.py .\signal_records.jsonl
+python .\tools\walk_forward_signal_records.py .\signal_records.jsonl --split 60,20,20
+```
+
+Each phase reports record count, entered/skipped count, decision groups, future-return summary for all records, and future-return summary for entered records only. Use this as an early guard against judging the strategy from one market segment.
+
 ## P6 CI And Dependency Stability
 
 This repository includes a lightweight GitHub Actions baseline in `.github/workflows/ci.yml`.
 It runs the same validation commands recommended for local pre-commit checks:
 
 ```powershell
-python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
 python .\tests\test_safety_and_risk.py
 npm ci
 npm run build
@@ -407,7 +426,7 @@ GitHub Dependabot is configured in `.github/dependabot.yml` to check dependencie
 Dependabot only opens update PRs. It does not auto-merge, does not run the bot, does not read API keys, and does not change live trading behavior. Review each Dependabot PR manually and require the normal validation baseline before merging:
 
 ```powershell
-python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
 python .\tests\test_safety_and_risk.py
 npm ci
 npm run build

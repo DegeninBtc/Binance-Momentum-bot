@@ -14,6 +14,7 @@ import binance_square_momentum_bot as bot
 import web_dashboard as web
 import analyze_signal_records
 import replay_signal_records
+import walk_forward_signal_records
 
 
 def assert_raises(expected: type[Exception], fn) -> None:
@@ -345,6 +346,24 @@ def test_signal_recording_and_analysis() -> None:
         assert replay["trade_count"] == 1
         assert replay["max_consecutive_losses"] == 1
         assert replay["group_opportunity"]["square_low_confidence"]["missed_upside_count"] == 1
+
+        empty_walk = walk_forward_signal_records.walk_forward([])
+        assert empty_walk["record_count"] == 0
+        assert empty_walk["split_count"] == {"train": 0, "validation": 0, "test": 0}
+
+        records = []
+        for index in range(5):
+            item = dict(updated if index % 2 == 0 else entered_record)
+            item["recorded_at"] = f"2026-06-08T00:0{index}:00+00:00"
+            item["api_secret"] = "should-not-appear"
+            records.append(item)
+        before_state = state_path.read_text(encoding="utf-8")
+        walk = walk_forward_signal_records.walk_forward(records)
+        after_state = state_path.read_text(encoding="utf-8")
+        assert before_state == after_state
+        assert walk["split_count"] == {"train": 3, "validation": 1, "test": 1}
+        assert walk["phases"]["train"]["record_count"] == 3
+        assert "should-not-appear" not in json.dumps(walk)
 
 
 if __name__ == "__main__":
