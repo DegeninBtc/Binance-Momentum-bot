@@ -239,6 +239,17 @@ class BotRunner:
             self.last_started_at = now_text()
             self.last_finished_at = ""
             self.last_config = config
+            if mode == "preview":
+                self.last_signal = {
+                    "checked_at": self.last_started_at,
+                    "source": "刷新中",
+                    "note": "正在重新抓取 Binance Square 和 24h 涨幅榜，请稍候。",
+                    "post_count": 0,
+                    "square_confidence": None,
+                    "entry_confirmation": None,
+                    "hot_assets": [],
+                    "candidate": None,
+                }
             return True
 
     def _busy_status(self, action_label: str) -> dict[str, Any]:
