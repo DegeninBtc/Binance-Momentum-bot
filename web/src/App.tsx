@@ -609,8 +609,8 @@ function App() {
             <h2>操作中枢</h2>
           </div>
           <div className="command-grid">
-            <ActionButton icon={RefreshCw} label="刷新信号" busy={previewBusy} disabled={readOnlyMode || taskLocked} title={taskLockReason} onClick={() => submit("/api/preview", "hot")} />
-            <ActionButton icon={Search} label="诊断广场" busy={diagnosticsBusy} disabled={readOnlyMode || taskLocked} title={taskLockReason} onClick={() => submit("/api/square-diagnose", "diag")} />
+            <ActionButton icon={RefreshCw} label="刷新信号" busy={previewBusy} disabled={readOnlyMode} title={taskLockReason} onClick={() => submit("/api/preview", "hot")} />
+            <ActionButton icon={Search} label="诊断广场" busy={diagnosticsBusy} disabled={readOnlyMode} title={taskLockReason} onClick={() => submit("/api/square-diagnose", "diag")} />
             <ActionButton icon={Play} label="执行一次" tone="primary" busy={busyPath === "/api/run-once"} disabled={readOnlyMode || running} title={running ? taskLockReason : readOnlyReason} onClick={() => submit("/api/run-once", "hot")} />
             <ActionButton icon={Activity} label="启动循环" busy={busyPath === "/api/start-loop"} disabled={readOnlyMode || running} title={running ? taskLockReason : readOnlyReason} onClick={() => submit("/api/start-loop")} />
             <ActionButton icon={Square} label="停止" tone="danger" busy={busyPath === "/api/stop"} disabled={readOnlyMode} title={readOnlyReason} onClick={() => submit("/api/stop")} />
@@ -690,7 +690,7 @@ function App() {
               diagnostics={diagnostics}
               settings={settings}
               busy={diagnosticsBusy}
-              readOnly={readOnlyMode || taskLocked}
+              readOnly={readOnlyMode}
               readOnlyReason={taskLockReason}
               updateSetting={updateSetting}
               onDiagnose={() => submit("/api/square-diagnose", "diag")}

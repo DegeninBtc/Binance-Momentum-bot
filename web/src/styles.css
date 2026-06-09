@@ -832,7 +832,7 @@ input:focus-visible {
 
 .action-button:disabled {
   opacity: 0.55;
-  cursor: wait;
+  cursor: not-allowed;
 }
 
 .action-button.tone-primary {
@@ -1077,7 +1077,7 @@ input:focus-visible {
 .position-close-options button:disabled,
 .position-close-custom button:disabled {
   opacity: 0.55;
-  cursor: wait;
+  cursor: not-allowed;
 }
 
 .position-close-custom {
