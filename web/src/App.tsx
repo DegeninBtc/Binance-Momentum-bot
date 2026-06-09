@@ -78,6 +78,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   order_quote_amount: "50",
   max_open_positions: "1",
   leverage_multiplier: "10",
+  contract_max_margin_loss_pct: "20",
+  liquidation_stop_buffer_pct: "2",
   contract_simulation_enabled: true,
   state_file: "bot_state.json",
   min_price_change_percent: "3",
@@ -1171,6 +1173,9 @@ function PositionDetailCard({
   const side = positionSide(item);
   const quoteAsset = item.snapshot?.quote_asset || "USDT";
   const isContractSim = Boolean(item.snapshot?.contract_simulation);
+  const stopGuardWarning = textValue(item.snapshot?.stop_guard_warning);
+  const configuredStopValue = `${formatPercent(item.snapshot?.configured_stop_loss_pct ?? item.snapshot?.initial_stop_loss_pct ?? 0)} / ${formatPrice(item.snapshot?.configured_stop_price)}`;
+  const bufferValue = `${formatPercent(item.snapshot?.liquidation_stop_buffer_pct ?? 0)} 缓冲`;
   const [closeQuantity, setCloseQuantity] = useState(() => formatOrderQuantity(item.quantity, 1));
   const closeOptions = [25, 50, 75, 100];
   return (
@@ -1197,11 +1202,14 @@ function PositionDetailCard({
         <PositionFact label="开仓均价" value={formatPrice(item.entryPrice)} />
         <PositionFact label="现价" value={formatPrice(item.snapshot?.current_price)} />
         <PositionFact label={isContractSim ? "名义仓位" : "最高"} value={isContractSim ? formatMoney(item.snapshot?.notional_quote, quoteAsset) : formatPrice(item.highestPrice)} />
-        <PositionFact label="动态止损" value={formatPrice(item.snapshot?.dynamic_stop_price)} tone={item.snapshot?.stop_triggered ? "danger" : undefined} />
+        <PositionFact label="有效止损" value={formatPrice(item.snapshot?.dynamic_stop_price)} tone={item.snapshot?.stop_triggered ? "danger" : undefined} />
         <PositionFact label={isContractSim ? "预估强平" : "止盈价"} value={isContractSim ? formatPrice(item.snapshot?.liquidation_price) : formatPrice(item.snapshot?.take_profit_price)} tone={item.snapshot?.take_profit_triggered ? "success" : undefined} />
         <PositionFact label={isContractSim ? "保证金" : "投入金额"} value={formatMoney(isContractSim ? item.snapshot?.margin_quote : item.quoteSpent, quoteAsset)} />
         <PositionFact label="开仓时间" value={item.openedAt ? formatTime(item.openedAt) : "--"} />
+        {isContractSim ? <PositionFact label="配置止损" value={configuredStopValue} tone={item.snapshot?.stop_guard_tightened ? "danger" : undefined} /> : null}
+        {isContractSim ? <PositionFact label="强平保护" value={bufferValue} tone={item.snapshot?.stop_guard_tightened ? "danger" : undefined} /> : null}
       </div>
+      {isContractSim && stopGuardWarning ? <p className="position-risk-warning">{stopGuardWarning}</p> : null}
       <div className="position-close-panel">
         <span>平仓</span>
         <div className="position-close-options">
@@ -1252,7 +1260,7 @@ function PositionPriceCharts({ snapshots }: { snapshots: PositionSnapshot[] }) {
       <div className="section-heading compact">
         <p className="eyebrow">Position Map</p>
         <h2>持仓价格线</h2>
-        <span>入场价、现价、止盈价和动态止损价</span>
+        <span>入场价、现价、止盈价和有效止损价</span>
       </div>
       <div className="position-chart-list">
         {active.map((snapshot, index) => (
@@ -1265,7 +1273,7 @@ function PositionPriceCharts({ snapshots }: { snapshots: PositionSnapshot[] }) {
 
 function PositionPriceChart({ snapshot }: { snapshot: PositionSnapshot }) {
   const points = [
-    { key: "stop", label: "止损", value: asNumber(snapshot.dynamic_stop_price), text: formatPrice(snapshot.dynamic_stop_price) },
+    { key: "stop", label: "有效止损", value: asNumber(snapshot.dynamic_stop_price), text: formatPrice(snapshot.dynamic_stop_price) },
     { key: "entry", label: "入场", value: asNumber(snapshot.entry_price), text: formatPrice(snapshot.entry_price) },
     { key: "current", label: "现价", value: asNumber(snapshot.current_price), text: formatPrice(snapshot.current_price) },
     { key: "take", label: "止盈", value: asNumber(snapshot.take_profit_price), text: formatPrice(snapshot.take_profit_price) },
@@ -1972,6 +1980,8 @@ function SettingsPanel({
         {activeTab === "risk" && (
           <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="风控退出" description="控制初始止损、保本、移动止盈和开仓节流；止盈为 0 时让移动止损负责退出。">
             <SettingsField {...fieldProps} name="initial_stop_loss_pct" label="初始止损 %" type="number" min="0.1" step="0.1" />
+            <SettingsField {...fieldProps} name="contract_max_margin_loss_pct" label="合约最大保证金亏损 %" type="number" min="0" step="0.1" help="仅用于 dry-run 合约模拟；按保证金亏损反推有效价格止损，例如 10x + 20% = 2% 价格止损。" />
+            <SettingsField {...fieldProps} name="liquidation_stop_buffer_pct" label="强平止损缓冲 %" type="number" min="0" step="0.1" help="有效止损会保持在预估强平价上方，避免止损价低于或贴近强平价。" />
             <SettingsField {...fieldProps} name="take_profit_pct" label="止盈 %" type="number" min="0" step="0.1" />
             <SettingsField {...fieldProps} name="breakeven_trigger_pct" label="保本触发 %" type="number" min="0" step="0.1" help="最高价达到该涨幅后，把动态止损抬到成本附近；填 0 关闭。" />
             <SettingsField {...fieldProps} name="breakeven_offset_pct" label="保本偏移 %" type="number" step="0.1" help="保本止损相对开仓价的偏移，0 表示刚好成本价。" />
@@ -2139,6 +2149,8 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
     order_quote_amount: textValue(config.order_quote_amount) || DEFAULT_SETTINGS.order_quote_amount,
     max_open_positions: textValue(config.max_open_positions) || DEFAULT_SETTINGS.max_open_positions,
     leverage_multiplier: textValue(config.leverage_multiplier) || DEFAULT_SETTINGS.leverage_multiplier,
+    contract_max_margin_loss_pct: textValue(config.contract_max_margin_loss_pct) || DEFAULT_SETTINGS.contract_max_margin_loss_pct,
+    liquidation_stop_buffer_pct: textValue(config.liquidation_stop_buffer_pct) || DEFAULT_SETTINGS.liquidation_stop_buffer_pct,
     contract_simulation_enabled: config.contract_simulation_enabled !== false,
     state_file: textValue(config.state_file) || DEFAULT_SETTINGS.state_file,
     min_price_change_percent: textValue(config.min_price_change_percent) || DEFAULT_SETTINGS.min_price_change_percent,

@@ -162,6 +162,8 @@ class BotConfig:
     max_open_positions: int = 1
     leverage_multiplier: Decimal = Decimal("10")
     contract_simulation_enabled: bool = True
+    contract_max_margin_loss_pct: Decimal = Decimal("20")
+    liquidation_stop_buffer_pct: Decimal = Decimal("2")
     min_quote_volume: Decimal = Decimal("5000000")
     min_price_change_percent: Decimal = Decimal("3")
     min_volatility_percent: Decimal = Decimal("5")
@@ -1111,21 +1113,23 @@ class LongOnlyMomentumBot:
             highest_price = last_price
             position.highest_price = format_decimal(highest_price)
             highest_updated = True
+        leverage_multiplier = self._position_leverage(position)
+        contract_simulation = self._position_is_contract_sim(position)
         margin_quote = self._position_margin(position)
         unrealized_pnl = (last_price - entry_price) * qty
         unrealized_loss = max(Decimal("0"), -unrealized_pnl)
         unrealized_pnl_pct = (
             unrealized_pnl / margin_quote * Decimal("100")
-            if self._position_is_contract_sim(position) and margin_quote > 0
+            if contract_simulation and margin_quote > 0
             else (last_price - entry_price) / entry_price * Decimal("100")
         )
-        pct_stop = entry_price * (Decimal("1") - self.config.initial_stop_loss_pct / Decimal("100"))
+        pct_stop, stop_guard = effective_initial_stop_price(self.config, entry_price, leverage_multiplier, contract_simulation)
         dynamic_stop, dynamic_stop_mode = self._dynamic_stop_price(entry_price, highest_price, pct_stop)
         take_profit_price = entry_price * (Decimal("1") + self.config.take_profit_pct / Decimal("100"))
         fixed_mode = self._fixed_stop_enabled()
 
         LOGGER.info(
-            "position %s qty=%s entry=%s last=%s high=%s pnl=%s roi=%s loss=%s stop_mode=%s dynamic_stop=%s take_profit=%s",
+            "position %s qty=%s entry=%s last=%s high=%s pnl=%s roi=%s loss=%s stop_mode=%s stop_pct=%s effective_stop_pct=%s dynamic_stop=%s take_profit=%s",
             symbol,
             qty,
             entry_price,
@@ -1135,6 +1139,8 @@ class LongOnlyMomentumBot:
             unrealized_pnl_pct,
             unrealized_loss,
             "fixed-usdt+" + dynamic_stop_mode if fixed_mode else dynamic_stop_mode,
+            self.config.initial_stop_loss_pct,
+            stop_guard["effective_stop_loss_pct"],
             dynamic_stop,
             take_profit_price,
         )
@@ -1733,8 +1739,11 @@ class LongOnlyMomentumBot:
         rules = symbol_order_rules(self.client.exchange_info(), position.symbol)
         entry = Decimal(position.entry_price)
         quantity = round_down_to_step(Decimal(position.quantity), rules.step_size)
+        leverage_multiplier = self._position_leverage(position)
+        contract_simulation = self._position_is_contract_sim(position)
+        effective_stop_price, _ = effective_initial_stop_price(self.config, entry, leverage_multiplier, contract_simulation)
         stop_price = round_down_to_step(
-            entry * (Decimal("1") - self.config.initial_stop_loss_pct / Decimal("100")),
+            effective_stop_price,
             rules.tick_size,
         )
         stop_limit_price = round_down_to_step(
@@ -3244,6 +3253,50 @@ def default_fixed_stop_loss_usdt(order_quote_amount: Decimal) -> Decimal:
     return max(MIN_FIXED_STOP_LOSS_USDT, order_quote_amount * DEFAULT_FIXED_STOP_LOSS_RATIO)
 
 
+def effective_stop_loss_snapshot(config: BotConfig, leverage_multiplier: Decimal, contract_simulation: bool) -> dict[str, Any]:
+    configured_pct = max(Decimal("0"), config.initial_stop_loss_pct)
+    effective_pct = configured_pct
+    margin_loss_stop_pct: Decimal | None = None
+    liquidation_distance_pct: Decimal | None = None
+    max_safe_stop_loss_pct: Decimal | None = None
+
+    if contract_simulation and leverage_multiplier > 0:
+        if config.contract_max_margin_loss_pct > 0:
+            margin_loss_stop_pct = config.contract_max_margin_loss_pct / leverage_multiplier
+            effective_pct = min(effective_pct, margin_loss_stop_pct)
+        liquidation_distance_pct = Decimal("100") / leverage_multiplier
+        max_safe_stop_loss_pct = max(
+            Decimal("0"),
+            liquidation_distance_pct - max(Decimal("0"), config.liquidation_stop_buffer_pct),
+        )
+        effective_pct = min(effective_pct, max_safe_stop_loss_pct)
+
+    tightened = effective_pct < configured_pct
+    warning = ""
+    if tightened and contract_simulation:
+        if max_safe_stop_loss_pct is not None and configured_pct > max_safe_stop_loss_pct:
+            warning = "配置止损低于/接近强平价，已按强平保护规则收紧。"
+        else:
+            warning = "配置止损超过合约模拟保证金风险上限，已按有效止损规则收紧。"
+    return {
+        "configured_stop_loss_pct": configured_pct,
+        "effective_stop_loss_pct": effective_pct,
+        "margin_loss_stop_pct": margin_loss_stop_pct,
+        "liquidation_distance_pct": liquidation_distance_pct,
+        "max_safe_stop_loss_pct": max_safe_stop_loss_pct,
+        "contract_max_margin_loss_pct": config.contract_max_margin_loss_pct,
+        "liquidation_stop_buffer_pct": config.liquidation_stop_buffer_pct,
+        "stop_guard_tightened": tightened,
+        "stop_guard_warning": warning,
+    }
+
+
+def effective_initial_stop_price(config: BotConfig, entry_price: Decimal, leverage_multiplier: Decimal, contract_simulation: bool) -> tuple[Decimal, dict[str, Any]]:
+    snapshot = effective_stop_loss_snapshot(config, leverage_multiplier, contract_simulation)
+    effective_pct = Decimal(str(snapshot["effective_stop_loss_pct"]))
+    return entry_price * (Decimal("1") - effective_pct / Decimal("100")), snapshot
+
+
 def dynamic_stop_price(config: BotConfig, entry_price: Decimal, highest_price: Decimal, pct_stop: Decimal) -> tuple[Decimal, str]:
     stop_price = pct_stop
     stop_mode = "percent"
@@ -3291,6 +3344,8 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
         leverage_multiplier=leverage_multiplier,
         contract_simulation_enabled=bool_env("CONTRACT_SIMULATION_ENABLED", True),
+        contract_max_margin_loss_pct=decimal_env("CONTRACT_MAX_MARGIN_LOSS_PCT", "20") or Decimal("20"),
+        liquidation_stop_buffer_pct=decimal_env("LIQUIDATION_STOP_BUFFER_PCT", "2") or Decimal("2"),
         min_quote_volume=decimal_env("MIN_QUOTE_VOLUME_USDT", "5000000") or Decimal("5000000"),
         min_price_change_percent=decimal_env("MIN_PRICE_CHANGE_PERCENT", "3") or Decimal("3"),
         min_volatility_percent=decimal_env("MIN_VOLATILITY_PERCENT", "5") or Decimal("5"),

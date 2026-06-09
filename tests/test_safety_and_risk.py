@@ -200,6 +200,55 @@ def test_symbol_scoring_rounding_and_dry_run_fill() -> None:
         assert quantity > Decimal("9")
 
 
+def test_contract_sim_effective_stop_loss_guard() -> None:
+    entry = Decimal("0.51401088")
+
+    cfg = bot.BotConfig(api_key="", api_secret="", initial_stop_loss_pct=Decimal("20"), leverage_multiplier=Decimal("10"))
+    stop_price, snapshot = bot.effective_initial_stop_price(cfg, entry, Decimal("10"), True)
+    assert snapshot["effective_stop_loss_pct"] == Decimal("2")
+    assert snapshot["margin_loss_stop_pct"] == Decimal("2")
+    assert snapshot["liquidation_distance_pct"] == Decimal("10")
+    assert snapshot["max_safe_stop_loss_pct"] == Decimal("8")
+    assert snapshot["stop_guard_tightened"] is True
+    assert stop_price == Decimal("0.5037306624")
+    assert stop_price > entry * Decimal("0.9")
+
+    cfg = bot.BotConfig(api_key="", api_secret="", initial_stop_loss_pct=Decimal("4"), leverage_multiplier=Decimal("10"))
+    stop_price, snapshot = bot.effective_initial_stop_price(cfg, Decimal("100"), Decimal("10"), True)
+    assert snapshot["effective_stop_loss_pct"] == Decimal("2")
+    assert stop_price == Decimal("98")
+
+    cfg = bot.BotConfig(api_key="", api_secret="", initial_stop_loss_pct=Decimal("4"), leverage_multiplier=Decimal("5"))
+    stop_price, snapshot = bot.effective_initial_stop_price(cfg, Decimal("100"), Decimal("5"), True)
+    assert snapshot["effective_stop_loss_pct"] == Decimal("4")
+    assert snapshot["stop_guard_tightened"] is False
+    assert stop_price == Decimal("96")
+
+    cfg = bot.BotConfig(api_key="", api_secret="", initial_stop_loss_pct=Decimal("20"), leverage_multiplier=Decimal("10"))
+    stop_price, snapshot = bot.effective_initial_stop_price(cfg, Decimal("100"), Decimal("10"), False)
+    assert snapshot["effective_stop_loss_pct"] == Decimal("20")
+    assert snapshot["stop_guard_tightened"] is False
+    assert stop_price == Decimal("80")
+
+    cfg = bot.BotConfig(
+        api_key="",
+        api_secret="",
+        initial_stop_loss_pct=Decimal("20"),
+        leverage_multiplier=Decimal("10"),
+        breakeven_trigger_pct=Decimal("3"),
+        breakeven_offset_pct=Decimal("0.2"),
+        trailing_start_pct=Decimal("6"),
+        trailing_stop_pct=Decimal("3"),
+    )
+    guarded_stop, _ = bot.effective_initial_stop_price(cfg, Decimal("100"), Decimal("10"), True)
+    breakeven_stop, breakeven_mode = bot.dynamic_stop_price(cfg, Decimal("100"), Decimal("104"), guarded_stop)
+    assert breakeven_mode == "breakeven"
+    assert breakeven_stop > guarded_stop
+    trailing_stop, trailing_mode = bot.dynamic_stop_price(cfg, Decimal("100"), Decimal("110"), guarded_stop)
+    assert trailing_mode == "trailing"
+    assert trailing_stop > guarded_stop
+
+
 def test_account_risk_guards() -> None:
     candidate = bot.TradeCandidate(
         symbol="BTCUSDT",

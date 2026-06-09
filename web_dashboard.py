@@ -888,7 +888,13 @@ def build_position_snapshot(
         bool(config.fixed_stop_after_first_round_trip)
         and int(state.get("completed_round_trips") or 0) > 0
     )
-    stop_price = entry_price * (Decimal("1") - config.initial_stop_loss_pct / Decimal("100"))
+    configured_stop_price = entry_price * (Decimal("1") - config.initial_stop_loss_pct / Decimal("100"))
+    stop_price, stop_guard = bot_module().effective_initial_stop_price(
+        config,
+        entry_price,
+        leverage_multiplier,
+        is_contract_sim,
+    )
     dynamic_stop_price, dynamic_stop_mode = bot_module().dynamic_stop_price(
         config,
         entry_price,
@@ -916,9 +922,11 @@ def build_position_snapshot(
         "current_price": current_price,
         "price_error": price_error,
         "active_stop_mode": "fixed-usdt+" + dynamic_stop_mode if fixed_stop_enabled else dynamic_stop_mode,
+        "configured_stop_price": configured_stop_price,
         "stop_price": stop_price,
         "dynamic_stop_price": dynamic_stop_price,
         "dynamic_stop_mode": dynamic_stop_mode,
+        **stop_guard,
         "take_profit_price": take_profit_price,
         "fixed_stop_loss_usdt": config.fixed_stop_loss_usdt,
         "initial_stop_loss_pct": config.initial_stop_loss_pct,
@@ -1038,6 +1046,8 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 1),
         leverage_multiplier=leverage_multiplier,
         contract_simulation_enabled=bool_value(payload, "contract_simulation_enabled", True),
+        contract_max_margin_loss_pct=decimal_value(payload, "contract_max_margin_loss_pct", "CONTRACT_MAX_MARGIN_LOSS_PCT", "20"),
+        liquidation_stop_buffer_pct=decimal_value(payload, "liquidation_stop_buffer_pct", "LIQUIDATION_STOP_BUFFER_PCT", "2"),
         min_quote_volume=decimal_value(payload, "min_quote_volume", "MIN_QUOTE_VOLUME_USDT", "5000000"),
         min_price_change_percent=decimal_value(payload, "min_price_change_percent", "MIN_PRICE_CHANGE_PERCENT", "3"),
         min_volatility_percent=decimal_value(payload, "min_volatility_percent", "MIN_VOLATILITY_PERCENT", "5"),

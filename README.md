@@ -71,6 +71,8 @@ $env:BINANCE_API_SECRET="你的 API Secret"
 $env:ORDER_QUOTE_USDT="50"
 $env:MAX_OPEN_POSITIONS="1"
 $env:LEVERAGE_MULTIPLIER="10"
+$env:CONTRACT_MAX_MARGIN_LOSS_PCT="20"
+$env:LIQUIDATION_STOP_BUFFER_PCT="2"
 $env:MIN_PRICE_CHANGE_PERCENT="3"
 $env:MIN_VOLATILITY_PERCENT="5"
 $env:MIN_QUOTE_VOLUME_USDT="5000000"
@@ -124,9 +126,10 @@ http://127.0.0.1:8787/
 - `标准`：沿用当前默认参数，适合先做模拟观察。
 - `激进`：降低入场门槛、放宽持仓和日内限制，默认最多 3 个仓位。
 
-首页持仓区域会展示当前持仓的入场价、动态止损价、止盈价和现价价格线；多仓位时，状态卡会显示主仓位并标记额外仓位数量。
+首页持仓区域会展示当前持仓的入场价、有效止损价、止盈价和现价价格线；多仓位时，状态卡会显示主仓位并标记额外仓位数量。
 
 杠杆倍数默认 `10` 倍，可在网页“基础”设置里自由调整，或通过 `LEVERAGE_MULTIPLIER` 设置。dry-run 默认开启 `CONTRACT_SIMULATION_ENABLED=true`，按 `单笔保证金 × 杠杆倍数` 计算名义仓位、ROI 和预估强平价；实盘仍不会自动切换为合约下单。
+合约模拟会优先按保证金风险收紧止损，默认 `CONTRACT_MAX_MARGIN_LOSS_PCT=20`、`LIQUIDATION_STOP_BUFFER_PCT=2`；例如 `10x` 下即使配置 `20%` 初始止损，也会收紧为约 `2%` 价格止损，避免止损价低于预估强平价。
 
 通知页支持 Telegram 推送：
 
@@ -168,7 +171,7 @@ http://127.0.0.1:8787/
 
 - 入场只使用 `BUY MARKET`。
 - 平仓只卖出现有现货余额。
-- 初始止损：默认开仓价下跌 `4%` 后触发。
+- 初始止损：默认开仓价下跌 `4%` 后触发；dry-run 合约模拟会再按 `CONTRACT_MAX_MARGIN_LOSS_PCT / LEVERAGE_MULTIPLIER` 和 `100 / LEVERAGE_MULTIPLIER - LIQUIDATION_STOP_BUFFER_PCT` 取更安全的有效止损。
 - 止盈：默认 `0`，表示关闭固定止盈，让保本和移动止损负责退出；可通过 `TAKE_PROFIT_PCT` 或网页设置调整。
 - 保本止损：默认最高价达到开仓价上方 `3%` 后，将动态止损抬到开仓价上方 `0.2%`，可通过 `BREAKEVEN_TRIGGER_PCT` / `BREAKEVEN_OFFSET_PCT` 或网页设置调整。
 - 移动止盈：默认最高价达到开仓价上方 `6%` 后启用，价格从最高价回撤 `3%` 时平仓，可通过 `TRAILING_START_PCT` / `TRAILING_STOP_PCT` 或网页设置调整；回撤设为 `0` 可关闭。

@@ -7,6 +7,8 @@ export type SettingsState = {
   order_quote_amount: string;
   max_open_positions: string;
   leverage_multiplier: string;
+  contract_max_margin_loss_pct: string;
+  liquidation_stop_buffer_pct: string;
   contract_simulation_enabled: boolean;
   state_file: string;
   min_price_change_percent: string;
@@ -149,6 +151,17 @@ export type PositionSnapshot = {
   leverage_multiplier?: Primitive;
   liquidation_price?: Primitive;
   active_stop_mode?: string;
+  configured_stop_price?: Primitive;
+  initial_stop_loss_pct?: Primitive;
+  configured_stop_loss_pct?: Primitive;
+  effective_stop_loss_pct?: Primitive;
+  margin_loss_stop_pct?: Primitive;
+  liquidation_distance_pct?: Primitive;
+  max_safe_stop_loss_pct?: Primitive;
+  contract_max_margin_loss_pct?: Primitive;
+  liquidation_stop_buffer_pct?: Primitive;
+  stop_guard_tightened?: boolean;
+  stop_guard_warning?: string;
   dynamic_stop_price?: Primitive;
   take_profit_price?: Primitive;
   stop_distance_pct?: Primitive;
