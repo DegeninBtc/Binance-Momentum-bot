@@ -25,12 +25,12 @@ services:
       - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      # Set to 1 to skip Playwright Chromium download
+      # Set to 1 to skip Playwright setup entirely
       # - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
     volumes:
       - bot_data:/app/data
-      # Persist Playwright browser cache across restarts
-      - pw_cache:/root/.cache/ms-playwright
+      # Persist Playwright browser + system deps across restarts
+      - pw_cache:/root/.cache
 
 volumes:
   bot_data:

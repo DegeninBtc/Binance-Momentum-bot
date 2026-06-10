@@ -14,21 +14,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Playwright runtime dependencies
+# Only install curl for entrypoint; Playwright system deps installed at runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-       libdrm2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-       libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1 \
-       fonts-noto-color-emoji curl \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps only, Chromium downloaded at runtime on demand
+# Python deps only, no browser binaries
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-# Playwright lazy-load: first startup downloads Chromium, cached in volume
-# Set PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 to skip if not needed
+# All Playwright setup deferred to first container start
 ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 
 COPY entrypoint.sh ./
