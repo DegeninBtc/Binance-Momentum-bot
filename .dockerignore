@@ -1,0 +1,13 @@
+.git
+.github
+node_modules
+web/dist
+docker-ide
+tests
+tools
+__pycache__
+*.pyc
+*.pyo
+*.bat
+AGENTS.md
+AGENTS(1).md

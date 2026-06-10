@@ -52,20 +52,20 @@
 
 ### Python 依赖
 
-```powershell
+````powershell
 python -m pip install -r requirements.txt
 ```
 
 ### 前端构建
 
-```powershell
+````powershell
 npm ci
 npm run build
 ```
 
 ### 配置环境变量
 
-```powershell
+````powershell
 $env:BINANCE_API_KEY="你的 API Key"
 $env:BINANCE_API_SECRET="你的 API Secret"
 $env:ORDER_QUOTE_USDT="50"
@@ -84,13 +84,13 @@ $env:TELEGRAM_CHAT_ID=""
 
 ### 运行一次模拟
 
-```powershell
+````powershell
 python .\binance_square_momentum_bot.py --once
 ```
 
 ### 确认策略和风控后再使用实盘
 
-```powershell
+````powershell
 python .\binance_square_momentum_bot.py --live
 ```
 
@@ -102,13 +102,13 @@ python .\binance_square_momentum_bot.py --live
 
 启动本地控制台：
 
-```powershell
+````powershell
 .\start_dashboard.bat
 ```
 
 浏览器打开：
 
-```text
+```t`	ext
 http://127.0.0.1:8787/
 ```
 
@@ -140,7 +140,7 @@ http://127.0.0.1:8787/
 
 浏览器抓取模式需要 Playwright Chromium：
 
-```powershell
+````powershell
 .\fix_playwright_browser.bat
 ```
 
@@ -157,7 +157,7 @@ http://127.0.0.1:8787/
 
 综合评分：
 
-```text
+```t`	ext
 市场分 = 涨幅 * 10 + 波动 * 4 + 成交额加分
 广场分 = 当前币提及数 / 最高提及数 * 180
 综合分 = 市场分 + 广场分
@@ -217,15 +217,15 @@ http://127.0.0.1:8787/
 
 如果 Windows 终端里 README 中文显示乱码，通常是当前控制台编码不是 UTF-8，而不是文件损坏。可用下面方式确认：
 
-```powershell
+````powershell
 Get-Content .\README.md -Encoding UTF8
 ```
 
 如需让当前 PowerShell 会话按 UTF-8 输出，可执行：
 
-```powershell
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
+````powershell
+[Console]::OutputEncoding = [System.T`	ext.Encoding]::UTF8
+$OutputEncoding = [System.T`	ext.Encoding]::UTF8
 ```
 
 ---
@@ -247,7 +247,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 新增配置：
 
-```powershell
+````powershell
 $env:EXCHANGE_PROTECTION_ENABLED="true"
 $env:OCO_STOP_LIMIT_SLIPPAGE_PCT="0.5"
 ```
@@ -262,7 +262,7 @@ $env:OCO_STOP_LIMIT_SLIPPAGE_PCT="0.5"
 
 新增配置：
 
-```powershell
+````powershell
 $env:KLINE_CONFIRMATION_ENABLED="true"
 $env:MIN_SQUARE_CONFIDENCE_SCORE="35"
 $env:MAX_SPREAD_BPS="50"
@@ -283,7 +283,7 @@ $env:MIN_ORDERBOOK_DEPTH_USDT="1000"
 
 新增配置：
 
-```powershell
+````powershell
 $env:MAX_TOTAL_EXPOSURE_PCT="0"
 $env:MAX_SYMBOL_EXPOSURE_PCT="0"
 $env:MAX_CONSECUTIVE_LOSSES="0"
@@ -293,20 +293,44 @@ $env:RISK_PER_TRADE_PCT="0"
 
 页面首页会显示 `Account risk` 状态；设置页“风控退出”可以调整这些参数。
 
+## Docker ??
+
+????????
+
+```powershell
+docker compose up -d --build
+```
+
+??????
+
+```text
+http://127.0.0.1:8787/
+```
+
+??? Docker Hub?? `yourname/binance-momentum-dashboard:latest` ????
+
+```powershell
+docker build -t yourname/binance-momentum-dashboard:latest .
+docker login
+docker push yourname/binance-momentum-dashboard:latest
+```
+
+????? API Key ????????????????? `.env` ???
+
 ## P3 Engineering Validation Baseline
 
 Use the following commands before committing local safety or dashboard changes:
 
-```powershell
+````powershell
 python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
 python .\tests\test_safety_and_risk.py
 npm ci
 npm run build
 ```
 
-`package-lock.json` is intentionally committed so `npm ci` can reproduce frontend installs. The dashboard still defaults to `127.0.0.1`; if `DASHBOARD_AUTH_TOKEN` is set, trading-control POST requests must include the same token from the browser settings page. Public deployment still requires external HTTPS, firewall rules, and IP allowlisting.
+`package-lock.json` is intentionally committed so `npm ci` can reproduce frontend installs. The dashboard still defaults to `127.0.0.1`; if `DASHBOARD_AUTH_TOKEN` is set, trading-control POST requests must include the same token from the browser settings page. Public deployment still requires `	external HTTPS, firewall rules, and IP allowlisting.
 
-```powershell
+````powershell
 $env:DASHBOARD_AUTH_TOKEN="your-local-token"
 ```
 
@@ -319,13 +343,13 @@ $env:DASHBOARD_AUTH_TOKEN="your-local-token"
 - `signal_records.jsonl` is ignored by Git.
 - Future-return updates only read market data and do not modify `bot_state.json`:
 
-```powershell
+````powershell
 python .\binance_square_momentum_bot.py --update-signal-returns
 ```
 
 Analyze the local signal dataset:
 
-```powershell
+````powershell
 python .\tools\analyze_signal_records.py .\signal_records.jsonl
 python .\tools\analyze_signal_records.py .\signal_records.jsonl --csv --output .\signal_records.csv
 ```
@@ -339,7 +363,7 @@ P5 adds lightweight validation on top of P4 signal records. It is not a full bac
 - `tools/replay_signal_records.py` replays recorded decisions from JSONL and reports trade count, win rate, average return, max consecutive losses, and missed-upside / avoided-downside counts by decision group.
 - Replay is read-only: it does not call Binance, does not modify `bot_state.json`, and does not place or simulate new orders outside the recorded dataset.
 
-```powershell
+````powershell
 python .\tools\replay_signal_records.py .\signal_records.jsonl --horizon 1h
 ```
 
@@ -355,7 +379,7 @@ The default split is:
 
 Run it with:
 
-```powershell
+````powershell
 python .\tools\walk_forward_signal_records.py .\signal_records.jsonl
 python .\tools\walk_forward_signal_records.py .\signal_records.jsonl --split 60,20,20
 ```
@@ -367,7 +391,7 @@ Each phase reports record count, entered/skipped count, decision groups, future-
 This repository includes a lightweight GitHub Actions baseline in `.github/workflows/ci.yml`.
 It runs the same validation commands recommended for local pre-commit checks:
 
-```powershell
+````powershell
 python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
 python .\tests\test_safety_and_risk.py
 npm ci
@@ -382,13 +406,13 @@ Dependency defaults:
 - Python dependencies remain in `requirements.txt` for now.
 - No `uv.lock`, `requirements.lock`, or pip-tools migration is included in this phase.
 
-Additional test coverage now includes symbol extraction, Square mention counting, score ordering, Decimal rounding, Binance filter parsing, state migration, signal JSONL analysis, replay summaries, and dry-run fill behavior.
+Additional test coverage now includes symbol `	extraction, Square mention counting, score ordering, Decimal rounding, Binance filter parsing, state migration, signal JSONL analysis, replay summaries, and dry-run fill behavior.
 
 ## Remote Dashboard Safety
 
 The web dashboard is designed for local use first. It binds to `127.0.0.1` by default, and `DASHBOARD_AUTH_TOKEN` is only a local control-layer token.
 
-If you deploy the dashboard on a VPS or expose it beyond localhost, add external protection before enabling trading controls:
+If you deploy the dashboard on a VPS or expose it beyond localhost, add `	external protection before enabling trading controls:
 
 - HTTPS reverse proxy.
 - Firewall and IP allowlist.
@@ -403,7 +427,7 @@ Do not treat the dashboard token alone as a complete public-internet authenticat
 
 Use `DASHBOARD_READ_ONLY=true` when the dashboard should be observable but must not run control actions.
 
-```powershell
+````powershell
 $env:DASHBOARD_READ_ONLY="true"
 python .\web_dashboard.py
 ```
@@ -428,7 +452,7 @@ GitHub Dependabot is configured in `.github/dependabot.yml` to check dependencie
 
 Dependabot only opens update PRs. It does not auto-merge, does not run the bot, does not read API keys, and does not change live trading behavior. Review each Dependabot PR manually and require the normal validation baseline before merging:
 
-```powershell
+````powershell
 python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
 python .\tests\test_safety_and_risk.py
 npm ci
