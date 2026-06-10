@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Long-only Binance Spot momentum bot driven by Binance Square mentions.
+Long-only Binance momentum bot driven by Binance Square mentions.
 
 Default mode is dry-run. Use --live only after you have reviewed the logic,
 tested with small order sizes, and accepted the risk of automated trading.
@@ -41,8 +41,13 @@ LOGGER = logging.getLogger("square-momentum-bot")
 DEFAULT_STATE_FILE = "bot_state.json"
 DEFAULT_SIGNAL_RECORD_FILE = "signal_records.jsonl"
 DEFAULT_BASE_URL = "https://api.binance.com"
+DEFAULT_FUTURES_BASE_URL = "https://fapi.binance.com"
+DEFAULT_FUTURES_TESTNET_BASE_URL = "https://demo-fapi.binance.com"
 DEFAULT_FIXED_STOP_LOSS_RATIO = Decimal("0.2")
 MIN_FIXED_STOP_LOSS_USDT = Decimal("1")
+MARKET_FUTURES = "futures"
+MARKET_SPOT = "spot"
+TRADE_MARKET_MODES = {"futures_preferred", "futures_only", "spot_only"}
 DEFAULT_SQUARE_URLS = (
     "https://www.binance.com/en/square",
     "https://www.binance.com/en/square/top",
@@ -157,7 +162,10 @@ class BotConfig:
     api_key: str
     api_secret: str
     base_url: str = DEFAULT_BASE_URL
+    futures_base_url: str = DEFAULT_FUTURES_BASE_URL
     quote_asset: str = "USDT"
+    trade_market_mode: str = "futures_preferred"
+    futures_margin_type: str = "ISOLATED"
     order_quote_amount: Decimal = Decimal("50")
     max_open_positions: int = 1
     leverage_multiplier: Decimal = Decimal("10")
@@ -248,6 +256,7 @@ class TradeCandidate:
     market_score: Decimal = Decimal("0")
     square_score: Decimal = Decimal("0")
     combined_score: Decimal = Decimal("0")
+    market_type: str = MARKET_SPOT
 
 
 @dataclass
@@ -273,6 +282,8 @@ class PositionState:
     margin_quote: str = "0"
     notional_quote: str = "0"
     leverage_multiplier: str = "1"
+    market_type: str = MARKET_SPOT
+    margin_type: str = ""
 
 
 @dataclass
@@ -286,6 +297,7 @@ class PendingOrderState:
     action: str = ""
     status: str = "pending"
     error: str = ""
+    market_type: str = MARKET_SPOT
 
 
 @dataclass
@@ -393,6 +405,8 @@ class BinanceSpotClient:
                 and item.get("isSpotTradingAllowed")
                 and item.get("quoteAsset") == quote_asset
             ):
+                item = dict(item)
+                item["market_type"] = MARKET_SPOT
                 result[item["symbol"]] = item
         return result
 
@@ -516,6 +530,121 @@ class BinanceSpotClient:
         if response.status_code >= 400:
             raise BinanceAPIError(f"HTTP {response.status_code}: {data}")
         return data
+
+
+class BinanceFuturesClient:
+    def __init__(self, config: BotConfig) -> None:
+        self.config = config
+        self.session = build_retry_session()
+        self._time_offset_ms = 0
+        self._exchange_info: dict[str, Any] | None = None
+
+    def sync_time(self) -> None:
+        data = self.public_get("/fapi/v1/time")
+        server_time = int(data["serverTime"])
+        local_time = int(time.time() * 1000)
+        self._time_offset_ms = server_time - local_time
+        LOGGER.info("Binance futures time offset: %sms", self._time_offset_ms)
+
+    def public_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        url = self.config.futures_base_url + path
+        try:
+            response = self.session.get(url, params=params, timeout=15)
+            return BinanceSpotClient._handle_response(response)
+        except requests.RequestException as exc:
+            raise BinanceAPIError(f"futures public GET failed: {path}: {exc}") from exc
+
+    def signed_request(self, method: str, path: str, params: dict[str, Any] | None = None) -> Any:
+        if not self.config.api_key or not self.config.api_secret:
+            raise BinanceAPIError("BINANCE_API_KEY and BINANCE_API_SECRET are required for signed futures endpoints")
+        payload = dict(params or {})
+        payload["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
+        payload["recvWindow"] = self.config.recv_window_ms
+        query = urlencode(payload, doseq=True)
+        signature = hmac.new(
+            self.config.api_secret.encode("utf-8"),
+            query.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        payload["signature"] = signature
+        headers = {"X-MBX-APIKEY": self.config.api_key}
+        url = self.config.futures_base_url + path
+        try:
+            response = self.session.request(method, url, params=payload, headers=headers, timeout=15)
+            return BinanceSpotClient._handle_response(response)
+        except requests.RequestException as exc:
+            raise BinanceAPIError(f"futures signed {method} failed: {path}: {exc}") from exc
+
+    def account(self) -> dict[str, Any]:
+        return self.signed_request("GET", "/fapi/v2/account")
+
+    def exchange_info(self) -> dict[str, Any]:
+        if self._exchange_info is None:
+            self._exchange_info = self.public_get("/fapi/v1/exchangeInfo")
+        return self._exchange_info
+
+    def tradable_quote_symbols(self, quote_asset: str) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for item in self.exchange_info().get("symbols", []):
+            if (
+                item.get("status") == "TRADING"
+                and item.get("quoteAsset") == quote_asset
+                and str(item.get("contractType", "")).upper() == "PERPETUAL"
+            ):
+                item = dict(item)
+                item["market_type"] = MARKET_FUTURES
+                result[item["symbol"]] = item
+        return result
+
+    def ticker_24hr(self) -> list[dict[str, Any]]:
+        return self.public_get("/fapi/v1/ticker/24hr")
+
+    def ticker_price(self, symbol: str) -> Decimal:
+        data = self.public_get("/fapi/v1/ticker/price", {"symbol": symbol})
+        return Decimal(str(data["price"]))
+
+    def klines(self, symbol: str, interval: str, limit: int, start_time: int | None = None) -> list[Any]:
+        params: dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+        if start_time is not None:
+            params["startTime"] = start_time
+        return self.public_get("/fapi/v1/klines", params)
+
+    def depth(self, symbol: str, limit: int = 50) -> dict[str, Any]:
+        return self.public_get("/fapi/v1/depth", {"symbol": symbol, "limit": limit})
+
+    def change_margin_type(self, symbol: str, margin_type: str) -> dict[str, Any]:
+        return self.signed_request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type.upper()})
+
+    def change_leverage(self, symbol: str, leverage: Decimal) -> dict[str, Any]:
+        return self.signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(leverage)})
+
+    def market_buy_quantity(self, symbol: str, quantity: Decimal, client_order_id: str | None = None) -> dict[str, Any]:
+        params = {
+            "symbol": symbol,
+            "side": "BUY",
+            "type": "MARKET",
+            "quantity": format_decimal(quantity),
+            "newOrderRespType": "RESULT",
+        }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        return self.signed_request("POST", "/fapi/v1/order", params)
+
+    def market_sell_quantity(self, symbol: str, quantity: Decimal, client_order_id: str | None = None) -> dict[str, Any]:
+        params = {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": format_decimal(quantity),
+            "reduceOnly": "true",
+            "newOrderRespType": "RESULT",
+        }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        return self.signed_request("POST", "/fapi/v1/order", params)
+
+    def get_order_by_client_id(self, symbol: str, client_order_id: str) -> dict[str, Any]:
+        return self.signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "origClientOrderId": client_order_id})
 
 
 class TelegramNotifier:
@@ -882,7 +1011,9 @@ class BinanceSquareScraper:
 class LongOnlyMomentumBot:
     def __init__(self, config: BotConfig) -> None:
         self.config = config
-        self.client = BinanceSpotClient(config)
+        self.spot_client = BinanceSpotClient(config)
+        self.futures_client = BinanceFuturesClient(config)
+        self.client = self.spot_client
         self.square = BinanceSquareScraper(build_retry_session(), config.square_urls)
         self.state = load_state(config.state_file)
         self._load_square_feed_state()
@@ -906,6 +1037,22 @@ class LongOnlyMomentumBot:
         except Exception as exc:
             LOGGER.warning("telegram send failed: %s", exc)
 
+    def _market_client(self, market_type: str) -> BinanceSpotClient | BinanceFuturesClient:
+        return self.futures_client if market_type == MARKET_FUTURES else self.spot_client
+
+    def _candidate_market_type(self, candidate: TradeCandidate) -> str:
+        return MARKET_FUTURES if candidate.market_type == MARKET_FUTURES else MARKET_SPOT
+
+    def _position_market_type(self, position: PositionState) -> str:
+        if position.market_type in {MARKET_FUTURES, MARKET_SPOT}:
+            return position.market_type
+        if position.position_mode in {"futures-live", "contract-sim"}:
+            return MARKET_FUTURES
+        return MARKET_SPOT
+
+    def _position_is_futures_live(self, position: PositionState) -> bool:
+        return (not self.config.dry_run) and self._position_market_type(position) == MARKET_FUTURES
+
     def run_forever(self) -> None:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
@@ -919,7 +1066,9 @@ class LongOnlyMomentumBot:
     def run_once(self) -> None:
         try:
             self.last_signal_record = None
-            self.client.sync_time()
+            self.spot_client.sync_time()
+            if self.config.trade_market_mode != "spot_only":
+                self.futures_client.sync_time()
             self._ensure_live_account_safety()
             self._recover_pending_order()
             self._sync_open_position_with_account()
@@ -986,6 +1135,7 @@ class LongOnlyMomentumBot:
         action: str,
         quote_amount: Decimal | None = None,
         quantity: Decimal | None = None,
+        market_type: str = MARKET_SPOT,
     ) -> None:
         self.state.pending_order = PendingOrderState(
             symbol=symbol,
@@ -995,6 +1145,7 @@ class LongOnlyMomentumBot:
             quantity=format_decimal(quantity) if quantity is not None else "",
             created_at=utc_now(),
             action=action,
+            market_type=market_type,
         )
         self._touch_state()
 
@@ -1008,8 +1159,9 @@ class LongOnlyMomentumBot:
         pending = self.state.pending_order
         if self.config.dry_run or not pending or not pending.client_order_id or not pending.symbol:
             return
+        market_type = pending.market_type if pending.market_type in {MARKET_FUTURES, MARKET_SPOT} else MARKET_SPOT
         try:
-            order = self.client.get_order_by_client_id(pending.symbol, pending.client_order_id)
+            order = self._market_client(market_type).get_order_by_client_id(pending.symbol, pending.client_order_id)
         except Exception as exc:
             LOGGER.warning("pending order lookup failed for %s %s: %s", pending.symbol, pending.client_order_id, exc)
             return
@@ -1029,7 +1181,7 @@ class LongOnlyMomentumBot:
             if pending.symbol in self._held_symbols():
                 self._clear_pending_order(pending.client_order_id)
                 return
-            qty = Decimal(str(order.get("executedQty", "0")))
+            qty = Decimal(str(order.get("executedQty") or order.get("origQty") or "0"))
             avg_price = average_fill_price(order)
             if qty <= 0 or avg_price is None:
                 LOGGER.warning("filled pending BUY lacks executable quantity/price: %s", order)
@@ -1042,6 +1194,7 @@ class LongOnlyMomentumBot:
                 volatility_percent=Decimal("0"),
                 quote_volume=Decimal("0"),
                 last_price=avg_price,
+                market_type=market_type,
             )
             self._clear_pending_order(pending.client_order_id)
             self._open_position(candidate, qty, avg_price, order)
@@ -1051,11 +1204,16 @@ class LongOnlyMomentumBot:
         if pending.side.upper() == "SELL":
             LOGGER.warning("recovered filled SELL from pending order %s; syncing account state", pending.client_order_id)
             self._clear_pending_order(pending.client_order_id)
-            self._sync_open_position_with_account()
+            if market_type == MARKET_FUTURES:
+                self.state.completed_round_trips += 1
+                self._remove_position(pending.symbol)
+                self._touch_state()
+            else:
+                self._sync_open_position_with_account()
 
-    def _order_after_submit_failure(self, symbol: str, client_order_id: str) -> dict[str, Any] | None:
+    def _order_after_submit_failure(self, symbol: str, client_order_id: str, market_type: str = MARKET_SPOT) -> dict[str, Any] | None:
         try:
-            return self.client.get_order_by_client_id(symbol, client_order_id)
+            return self._market_client(market_type).get_order_by_client_id(symbol, client_order_id)
         except Exception as exc:
             LOGGER.warning("order lookup after submit failure failed for %s %s: %s", symbol, client_order_id, exc)
             return None
@@ -1063,17 +1221,22 @@ class LongOnlyMomentumBot:
     def _ensure_live_account_safety(self) -> None:
         if self.config.dry_run:
             return
-        check = account_safety_snapshot(self.client, self.config)
+        check = account_safety_snapshot(self.spot_client, self.config)
         self.state.last_safety_check = check
         self._touch_state()
         if not check.get("api_key_loaded") or not check.get("api_secret_loaded"):
             raise BinanceAPIError("live mode requires BINANCE_API_KEY and BINANCE_API_SECRET")
-        if check.get("error"):
+        if self.config.trade_market_mode == "spot_only" and check.get("error"):
             raise BinanceAPIError(f"live account safety check failed: {check['error']}")
-        if check.get("can_trade") is False:
+        if self.config.trade_market_mode == "spot_only" and check.get("can_trade") is False:
             raise BinanceAPIError("live account safety check failed: account canTrade is false")
-        if check.get("spot_trading_allowed") is False:
+        if self.config.trade_market_mode == "spot_only" and check.get("spot_trading_allowed") is False:
             raise BinanceAPIError("live account safety check failed: API key/account does not report SPOT permission")
+        if self.config.trade_market_mode != "spot_only":
+            try:
+                self.futures_client.account()
+            except Exception as exc:
+                raise BinanceAPIError(f"live futures account safety check failed: {exc}") from exc
 
     def _remove_position(self, symbol: str) -> None:
         self._set_positions([item for item in self._active_positions() if item.symbol != symbol])
@@ -1106,7 +1269,7 @@ class LongOnlyMomentumBot:
         symbol = position.symbol
         qty = Decimal(position.quantity)
         entry_price = Decimal(position.entry_price)
-        last_price = self.client.ticker_price(symbol)
+        last_price = self._market_client(self._position_market_type(position)).ticker_price(symbol)
         highest_price = decimal_from_any(position.highest_price) or entry_price
         highest_updated = False
         if last_price > highest_price:
@@ -1170,7 +1333,9 @@ class LongOnlyMomentumBot:
 
     def manual_close_position(self, symbol: str | None = None, quantity: Decimal | None = None) -> None:
         if not self.config.dry_run:
-            self.client.sync_time()
+            self.spot_client.sync_time()
+            if self.config.trade_market_mode != "spot_only":
+                self.futures_client.sync_time()
             self._ensure_live_account_safety()
             self._recover_pending_order()
             self._sync_open_position_with_account()
@@ -1183,7 +1348,7 @@ class LongOnlyMomentumBot:
             if not positions:
                 raise BinanceAPIError(f"no open position for {wanted_symbol}")
         for position in positions:
-            last_price = self.client.ticker_price(position.symbol)
+            last_price = self._market_client(self._position_market_type(position)).ticker_price(position.symbol)
             self._close_position(position, last_price, "DRY_RUN_MANUAL_SELL", "MANUAL_SELL", "manual close", quantity)
 
     def _close_position(
@@ -1201,10 +1366,11 @@ class LongOnlyMomentumBot:
         full_close_requested = close_quantity is None or wanted_qty >= qty
         if wanted_qty <= 0:
             raise BinanceAPIError(f"close quantity for {symbol} must be positive")
+        market_type = self._position_market_type(position)
         LOGGER.warning("%s triggered for %s", exit_label, symbol)
         if not self.config.dry_run:
             self._release_exchange_protection_for_close(position)
-        sell_qty = self._safe_sell_quantity(symbol, position.base_asset, wanted_qty)
+        sell_qty = self._safe_sell_quantity(symbol, position.base_asset, wanted_qty, market_type)
         if sell_qty <= 0:
             if self.config.dry_run and full_close_requested:
                 LOGGER.info("[dry-run] cleared %s residual quantity below sell step after full close request: %s", symbol, qty)
@@ -1220,7 +1386,7 @@ class LongOnlyMomentumBot:
             if self.config.dry_run
             else last_price
         )
-        sell_error = self._sell_order_error(symbol, sell_qty, order_check_price)
+        sell_error = self._sell_order_error(symbol, sell_qty, order_check_price, market_type)
         if sell_error:
             if self.config.dry_run and full_close_requested:
                 LOGGER.info("[dry-run] ignoring close validation for full close %s: %s", symbol, sell_error)
@@ -1270,11 +1436,11 @@ class LongOnlyMomentumBot:
             return
 
         client_order_id = build_client_order_id(live_action.lower(), symbol)
-        self._set_pending_order(symbol, "SELL", client_order_id, live_action, quantity=sell_qty)
+        self._set_pending_order(symbol, "SELL", client_order_id, live_action, quantity=sell_qty, market_type=market_type)
         try:
-            order = self.client.market_sell_quantity(symbol, sell_qty, client_order_id=client_order_id)
+            order = self._market_client(market_type).market_sell_quantity(symbol, sell_qty, client_order_id=client_order_id)
         except Exception:
-            recovered = self._order_after_submit_failure(symbol, client_order_id)
+            recovered = self._order_after_submit_failure(symbol, client_order_id, market_type)
             if not recovered or str(recovered.get("status", "")).upper() != "FILLED":
                 raise
             order = recovered
@@ -1283,10 +1449,11 @@ class LongOnlyMomentumBot:
         self._append_trade(live_action, symbol, sell_qty, avg_price, order)
         remaining_qty = max(Decimal("0"), qty - sell_qty)
         if self.config.account_sync_enabled:
-            remaining_qty = round_down_to_step(
-                self._account_asset_balance(position.base_asset),
-                symbol_step_size(self.client.exchange_info(), symbol),
-            )
+            if market_type == MARKET_SPOT:
+                remaining_qty = round_down_to_step(
+                    self._account_asset_balance(position.base_asset),
+                    symbol_step_size(self.spot_client.exchange_info(), symbol),
+                )
         if Decimal("0") < remaining_qty < qty:
             LOGGER.warning("account sync kept residual %s quantity after sell: %s", symbol, remaining_qty)
             position.quantity = format_decimal(remaining_qty)
@@ -1365,13 +1532,13 @@ class LongOnlyMomentumBot:
             )
             return
 
-        symbols = self.client.tradable_quote_symbols(self.config.quote_asset)
+        symbols = self._tradable_market_symbols()
         base_assets = {data["baseAsset"] for data in symbols.values()}
         posts = self.square.fetch_top_posts(self.config.top_post_limit, browser_mode=self.config.square_browser_mode)
         square_confidence = square_confidence_snapshot(posts, self.square.last_diagnostics, self.square.feed_state)
         self.state.square_confidence = square_confidence
         mentions = count_coin_mentions(posts, base_assets)
-        source = "Binance Square browser" if self.config.square_browser_mode else "Binance Square"
+        source = "Binance Square browser + futures preferred" if self.config.square_browser_mode else "Binance Square + futures preferred"
         if Decimal(str(square_confidence.get("score", "0"))) < self.config.min_square_confidence_score:
             reason = (
                 f"Square confidence {square_confidence.get('score')} below "
@@ -1463,8 +1630,9 @@ class LongOnlyMomentumBot:
             return
 
         LOGGER.info("selected candidate: %s", asdict(candidate))
+        market_type = self._candidate_market_type(candidate)
         if self.config.dry_run:
-            fill_price, qty, fee_amount, quote_spent = self._dry_run_buy_fill(candidate.last_price)
+            fill_price, qty, fee_amount, quote_spent = self._dry_run_buy_fill(candidate.last_price, market_type)
             LOGGER.warning(
                 "[dry-run] would BUY %s with %s %s price=%s fee=%s mode=%s leverage=%sx",
                 candidate.symbol,
@@ -1472,8 +1640,8 @@ class LongOnlyMomentumBot:
                 self.config.quote_asset,
                 fill_price,
                 fee_amount,
-                "contract-sim" if self.config.contract_simulation_enabled else "spot",
-                self.config.leverage_multiplier if self.config.contract_simulation_enabled else Decimal("1"),
+                "contract-sim" if market_type == MARKET_FUTURES else "spot",
+                self.config.leverage_multiplier if market_type == MARKET_FUTURES else Decimal("1"),
             )
             self._open_position(candidate, qty, fill_price, None, quote_spent=quote_spent, fee_amount=fee_amount)
             self.last_signal_record = build_signal_record(
@@ -1497,23 +1665,29 @@ class LongOnlyMomentumBot:
             client_order_id,
             "BUY",
             quote_amount=self.config.order_quote_amount,
+            market_type=market_type,
         )
         try:
-            order = self.client.market_buy_quote(candidate.symbol, self.config.order_quote_amount, client_order_id=client_order_id)
+            if market_type == MARKET_FUTURES:
+                self._prepare_futures_symbol_for_live(candidate.symbol)
+                qty_estimate = self._futures_order_quantity(candidate.symbol, self.config.order_quote_amount, candidate.last_price)
+                order = self.futures_client.market_buy_quantity(candidate.symbol, qty_estimate, client_order_id=client_order_id)
+            else:
+                order = self.spot_client.market_buy_quote(candidate.symbol, self.config.order_quote_amount, client_order_id=client_order_id)
         except Exception:
-            recovered = self._order_after_submit_failure(candidate.symbol, client_order_id)
+            recovered = self._order_after_submit_failure(candidate.symbol, client_order_id, market_type)
             if not recovered or str(recovered.get("status", "")).upper() != "FILLED":
                 raise
             order = recovered
         self._clear_pending_order(client_order_id)
-        qty = Decimal(str(order.get("executedQty", "0")))
+        qty = Decimal(str(order.get("executedQty") or order.get("origQty") or "0"))
         avg_price = average_fill_price(order) or candidate.last_price
         if qty <= 0:
             raise BinanceAPIError(f"market buy returned zero executedQty: {order}")
-        if self.config.account_sync_enabled:
+        if market_type == MARKET_SPOT and self.config.account_sync_enabled:
             synced_qty = round_down_to_step(
                 self._account_asset_balance(candidate.base_asset),
-                symbol_step_size(self.client.exchange_info(), candidate.symbol),
+                symbol_step_size(self.spot_client.exchange_info(), candidate.symbol),
             )
             if Decimal("0") < synced_qty < qty:
                 LOGGER.warning("account sync reduced buy quantity for %s from %s to %s", candidate.symbol, qty, synced_qty)
@@ -1529,7 +1703,7 @@ class LongOnlyMomentumBot:
             square_confidence=square_confidence,
             account_risk_snapshot=self.state.account_risk_snapshot,
             final_action="entered",
-            note="live spot position opened",
+            note="live futures position opened" if market_type == MARKET_FUTURES else "live spot position opened",
         )
 
     def _position_leverage(self, position: PositionState) -> Decimal:
@@ -1543,7 +1717,43 @@ class LongOnlyMomentumBot:
         return decimal_from_any(position.quote_spent) or Decimal("0")
 
     def _position_is_contract_sim(self, position: PositionState) -> bool:
-        return self.config.dry_run and position.position_mode == "contract-sim"
+        return self.config.dry_run and self._position_market_type(position) == MARKET_FUTURES
+
+    def _tradable_market_symbols(self) -> dict[str, dict[str, Any]]:
+        mode = self.config.trade_market_mode
+        result: dict[str, dict[str, Any]] = {}
+        if mode != "futures_only":
+            result.update(self.spot_client.tradable_quote_symbols(self.config.quote_asset))
+        if mode != "spot_only":
+            futures_symbols = self.futures_client.tradable_quote_symbols(self.config.quote_asset)
+            result.update(futures_symbols)
+        return result
+
+    def _ticker_24hr_for_symbols(self, symbols: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        spot_symbols = {
+            symbol
+            for symbol, info in symbols.items()
+            if info.get("market_type") == MARKET_SPOT
+        }
+        futures_symbols = {
+            symbol
+            for symbol, info in symbols.items()
+            if info.get("market_type") == MARKET_FUTURES
+        }
+        rows: list[dict[str, Any]] = []
+        if spot_symbols:
+            for ticker in self.spot_client.ticker_24hr():
+                if ticker.get("symbol") in spot_symbols:
+                    item = dict(ticker)
+                    item["market_type"] = MARKET_SPOT
+                    rows.append(item)
+        if futures_symbols:
+            for ticker in self.futures_client.ticker_24hr():
+                if ticker.get("symbol") in futures_symbols:
+                    item = dict(ticker)
+                    item["market_type"] = MARKET_FUTURES
+                    rows.append(item)
+        return rows
 
     def _select_trade_candidate(
         self,
@@ -1560,7 +1770,7 @@ class LongOnlyMomentumBot:
         symbols: dict[str, dict[str, Any]],
         mentions: Counter[str],
     ) -> list[TradeCandidate]:
-        tickers = self.client.ticker_24hr()
+        tickers = self._ticker_24hr_for_symbols(symbols)
         candidates: list[TradeCandidate] = []
         max_mentions = max(mentions.values(), default=0)
 
@@ -1572,6 +1782,7 @@ class LongOnlyMomentumBot:
             if symbol_info is None:
                 continue
             base_asset = symbol_info["baseAsset"]
+            market_type = str(symbol_info.get("market_type") or ticker.get("market_type") or MARKET_SPOT)
             if not is_momentum_asset(base_asset, self.config.quote_asset):
                 continue
             if not self._asset_allowed(symbol, base_asset):
@@ -1609,6 +1820,7 @@ class LongOnlyMomentumBot:
                     market_score=market_score,
                     square_score=square_score,
                     combined_score=combined_score,
+                    market_type=market_type,
                 )
             )
 
@@ -1625,7 +1837,7 @@ class LongOnlyMomentumBot:
         return candidates
 
     def _market_momentum_mentions(self, symbols: dict[str, dict[str, Any]]) -> Counter[str]:
-        tickers = self.client.ticker_24hr()
+        tickers = self._ticker_24hr_for_symbols(symbols)
         ranked: list[tuple[str, Decimal, Decimal, Decimal]] = []
         for ticker in tickers:
             symbol = ticker.get("symbol", "")
@@ -1663,9 +1875,13 @@ class LongOnlyMomentumBot:
         fee_amount: Decimal | None = None,
     ) -> None:
         spent = quote_spent if quote_spent is not None else quantity * entry_price
-        leverage = self.config.leverage_multiplier if self.config.dry_run and self.config.contract_simulation_enabled else Decimal("1")
-        position_mode = "contract-sim" if self.config.dry_run and self.config.contract_simulation_enabled else "spot"
-        margin_quote = spent if position_mode == "contract-sim" else Decimal("0")
+        market_type = self._candidate_market_type(candidate)
+        leverage = self.config.leverage_multiplier if market_type == MARKET_FUTURES else Decimal("1")
+        if market_type == MARKET_FUTURES:
+            position_mode = "contract-sim" if self.config.dry_run else "futures-live"
+        else:
+            position_mode = "spot"
+        margin_quote = spent if market_type == MARKET_FUTURES else Decimal("0")
         notional_quote = quantity * entry_price
         new_position = PositionState(
             symbol=candidate.symbol,
@@ -1680,6 +1896,8 @@ class LongOnlyMomentumBot:
             margin_quote=format_decimal(margin_quote),
             notional_quote=format_decimal(notional_quote),
             leverage_multiplier=format_decimal(leverage),
+            market_type=market_type,
+            margin_type=self.config.futures_margin_type.upper() if market_type == MARKET_FUTURES else "",
         )
         positions = [item for item in self._active_positions() if item.symbol != candidate.symbol]
         positions.append(new_position)
@@ -1693,6 +1911,10 @@ class LongOnlyMomentumBot:
 
     def _ensure_exchange_protection(self, position: PositionState) -> None:
         if not self.config.exchange_protection_enabled:
+            return
+        if self._position_market_type(position) == MARKET_FUTURES and not self.config.dry_run:
+            LOGGER.warning("exchange-side futures protection is not enabled; local polling will manage reduce-only exits for %s", position.symbol)
+            self._notify(f"Futures exchange protection is not enabled for {position.symbol}; local polling will manage exits.")
             return
         protection = self._build_protection_order_state(position)
         if self.config.dry_run:
@@ -1736,7 +1958,8 @@ class LongOnlyMomentumBot:
             self._notify(f"Exchange protection missing for {position.symbol}: {exc}")
 
     def _build_protection_order_state(self, position: PositionState) -> ProtectionOrderState:
-        rules = symbol_order_rules(self.client.exchange_info(), position.symbol)
+        market_type = self._position_market_type(position)
+        rules = symbol_order_rules(self._market_client(market_type).exchange_info(), position.symbol)
         entry = Decimal(position.entry_price)
         quantity = round_down_to_step(Decimal(position.quantity), rules.step_size)
         leverage_multiplier = self._position_leverage(position)
@@ -1760,7 +1983,7 @@ class LongOnlyMomentumBot:
             kind = "oco"
         if quantity <= 0:
             raise BinanceAPIError(f"cannot create protection for {position.symbol}: quantity is zero after step rounding")
-        sell_error = self._sell_order_error(position.symbol, quantity, stop_limit_price)
+        sell_error = self._sell_order_error(position.symbol, quantity, stop_limit_price, market_type)
         if sell_error:
             raise BinanceAPIError(f"cannot create protection for {position.symbol}: {sell_error}")
         return ProtectionOrderState(
@@ -1828,7 +2051,7 @@ class LongOnlyMomentumBot:
                     LOGGER.info("candidate %s skipped by account risk: %s", candidate.symbol, account_risk_guard)
                     self.state.entry_confirmation = self._entry_confirmation_payload(candidate, False, account_risk_guard)
                     continue
-                buy_error = self._buy_order_error(candidate.symbol, self.config.order_quote_amount, candidate.last_price)
+                buy_error = self._buy_order_error(candidate.symbol, self.config.order_quote_amount, candidate.last_price, self._candidate_market_type(candidate))
                 if buy_error:
                     LOGGER.info("candidate %s skipped by order rules: %s", candidate.symbol, buy_error)
                     self.state.entry_confirmation = self._entry_confirmation_payload(candidate, False, buy_error)
@@ -1874,10 +2097,11 @@ class LongOnlyMomentumBot:
         }
 
     def _kline_confirmation(self, candidate: TradeCandidate) -> dict[str, Any]:
+        client = self._market_client(self._candidate_market_type(candidate))
         snapshots = {
-            "5m": kline_confirmation_snapshot(self.client.klines(candidate.symbol, "5m", 24)),
-            "15m": kline_confirmation_snapshot(self.client.klines(candidate.symbol, "15m", 24)),
-            "1h": kline_confirmation_snapshot(self.client.klines(candidate.symbol, "1h", 24)),
+            "5m": kline_confirmation_snapshot(client.klines(candidate.symbol, "5m", 24)),
+            "15m": kline_confirmation_snapshot(client.klines(candidate.symbol, "15m", 24)),
+            "1h": kline_confirmation_snapshot(client.klines(candidate.symbol, "1h", 24)),
         }
         failures = []
         if snapshots["15m"]["roc_pct"] <= Decimal("0"):
@@ -1903,7 +2127,7 @@ class LongOnlyMomentumBot:
     def _orderbook_liquidity_confirmation(self, candidate: TradeCandidate) -> dict[str, Any]:
         if self.config.max_spread_bps <= 0 and self.config.min_orderbook_depth_usdt <= 0:
             return {"passed": True, "reason": "liquidity filter disabled"}
-        snapshot = orderbook_liquidity_snapshot(self.client.depth(candidate.symbol, 50))
+        snapshot = orderbook_liquidity_snapshot(self._market_client(self._candidate_market_type(candidate)).depth(candidate.symbol, 50))
         failures = []
         spread_bps = snapshot.get("spread_bps")
         ask_depth = snapshot.get("ask_depth_usdt")
@@ -1937,7 +2161,8 @@ class LongOnlyMomentumBot:
         if not assets:
             return None
         changes: dict[str, Decimal] = {}
-        for ticker in self.client.ticker_24hr():
+        symbols = self._tradable_market_symbols()
+        for ticker in self._ticker_24hr_for_symbols(symbols):
             symbol = str(ticker.get("symbol", "")).upper()
             for asset in assets:
                 if symbol == f"{asset}{self.config.quote_asset}".upper():
@@ -1974,7 +2199,7 @@ class LongOnlyMomentumBot:
             qty = Decimal(position.quantity)
             entry_price = Decimal(position.entry_price)
             try:
-                price = self.client.ticker_price(position.symbol)
+                price = self._market_client(self._position_market_type(position)).ticker_price(position.symbol)
             except Exception:
                 price = entry_price
             value = qty * price
@@ -1996,6 +2221,8 @@ class LongOnlyMomentumBot:
             )
 
         proposed_quote = self.config.order_quote_amount if candidate else Decimal("0")
+        if candidate and candidate.market_type == MARKET_FUTURES:
+            proposed_quote *= self.config.leverage_multiplier
         proposed_total_exposure = total_exposure + proposed_quote
         proposed_symbol_exposure = proposed_quote
         if candidate:
@@ -2064,9 +2291,12 @@ class LongOnlyMomentumBot:
         changed = False
         try:
             for position in positions:
+                if self._position_market_type(position) == MARKET_FUTURES:
+                    updated_positions.append(position)
+                    continue
                 account_qty = self._account_asset_balance(position.base_asset)
                 wanted_qty = Decimal(position.quantity)
-                step_size = symbol_step_size(self.client.exchange_info(), position.symbol)
+                step_size = symbol_step_size(self.spot_client.exchange_info(), position.symbol)
                 synced_qty = round_down_to_step(account_qty, step_size)
                 if synced_qty <= 0:
                     LOGGER.warning("account sync cleared local position %s; no %s balance found", position.symbol, position.base_asset)
@@ -2086,7 +2316,7 @@ class LongOnlyMomentumBot:
             LOGGER.exception("account sync failed; keeping local position state")
 
     def _account_asset_balance(self, asset: str) -> Decimal:
-        account = self.client.account()
+        account = self.spot_client.account()
         for item in account.get("balances", []):
             if item.get("asset") == asset:
                 return Decimal(str(item.get("free", "0"))) + Decimal(str(item.get("locked", "0")))
@@ -2156,20 +2386,22 @@ class LongOnlyMomentumBot:
         if self.config.fixed_stop_equity_usdt is None:
             return False
         try:
-            account = self.client.account()
+            account = self.spot_client.account()
             balances = {item["asset"]: Decimal(item["free"]) + Decimal(item["locked"]) for item in account["balances"]}
             quote_balance = balances.get(self.config.quote_asset, Decimal("0"))
             position_value = Decimal("0")
             for position in self._active_positions():
-                last = self.client.ticker_price(position.symbol)
+                last = self._market_client(self._position_market_type(position)).ticker_price(position.symbol)
                 position_value += Decimal(position.quantity) * last
             return quote_balance + position_value >= self.config.fixed_stop_equity_usdt
         except Exception:
             LOGGER.exception("failed to evaluate equity threshold; keeping percent stop")
             return False
 
-    def _safe_sell_quantity(self, symbol: str, base_asset: str, wanted_qty: Decimal) -> Decimal:
-        account = self.client.account() if not self.config.dry_run else {"balances": []}
+    def _safe_sell_quantity(self, symbol: str, base_asset: str, wanted_qty: Decimal, market_type: str = MARKET_SPOT) -> Decimal:
+        if market_type == MARKET_FUTURES:
+            return round_down_to_step(wanted_qty, symbol_step_size(self.futures_client.exchange_info(), symbol))
+        account = self.spot_client.account() if not self.config.dry_run else {"balances": []}
         free_balance = wanted_qty
         if not self.config.dry_run:
             for item in account.get("balances", []):
@@ -2177,12 +2409,12 @@ class LongOnlyMomentumBot:
                     free_balance = Decimal(str(item.get("free", "0")))
                     break
         qty = min(wanted_qty, free_balance)
-        step_size = symbol_step_size(self.client.exchange_info(), symbol)
+        step_size = symbol_step_size(self.spot_client.exchange_info(), symbol)
         return round_down_to_step(qty, step_size)
 
-    def _buy_order_error(self, symbol: str, quote_amount: Decimal, price: Decimal) -> str | None:
-        rules = symbol_order_rules(self.client.exchange_info(), symbol)
-        gross_quote = quote_amount * self.config.leverage_multiplier if self.config.dry_run and self.config.contract_simulation_enabled else quote_amount
+    def _buy_order_error(self, symbol: str, quote_amount: Decimal, price: Decimal, market_type: str = MARKET_SPOT) -> str | None:
+        rules = symbol_order_rules(self._market_client(market_type).exchange_info(), symbol)
+        gross_quote = quote_amount * self.config.leverage_multiplier if market_type == MARKET_FUTURES else quote_amount
         if rules.min_notional > 0 and gross_quote < rules.min_notional:
             return f"quote amount {gross_quote} is below min notional {rules.min_notional}"
         estimate_price = price * (Decimal("1") + self.config.slippage_pct / Decimal("100")) if self.config.dry_run else price
@@ -2192,8 +2424,25 @@ class LongOnlyMomentumBot:
             return f"estimated quantity {estimated_qty} is below min quantity {rules.min_qty}"
         return None
 
-    def _sell_order_error(self, symbol: str, quantity: Decimal, price: Decimal) -> str | None:
-        rules = symbol_order_rules(self.client.exchange_info(), symbol)
+    def _futures_order_quantity(self, symbol: str, margin_quote: Decimal, price: Decimal) -> Decimal:
+        rules = symbol_order_rules(self.futures_client.exchange_info(), symbol)
+        notional = margin_quote * self.config.leverage_multiplier
+        quantity = notional / price if price > 0 else Decimal("0")
+        return round_down_to_step(quantity, rules.step_size)
+
+    def _prepare_futures_symbol_for_live(self, symbol: str) -> None:
+        margin_type = self.config.futures_margin_type.upper()
+        try:
+            self.futures_client.change_margin_type(symbol, margin_type)
+        except BinanceAPIError as exc:
+            text = str(exc).lower()
+            if "-4046" not in text and "no need to change margin type" not in text:
+                raise
+            LOGGER.info("futures margin type already set for %s: %s", symbol, margin_type)
+        self.futures_client.change_leverage(symbol, self.config.leverage_multiplier)
+
+    def _sell_order_error(self, symbol: str, quantity: Decimal, price: Decimal, market_type: str = MARKET_SPOT) -> str | None:
+        rules = symbol_order_rules(self._market_client(market_type).exchange_info(), symbol)
         if rules.min_qty > 0 and quantity < rules.min_qty:
             return f"quantity {quantity} is below min quantity {rules.min_qty}"
         notional = quantity * price
@@ -2201,10 +2450,10 @@ class LongOnlyMomentumBot:
             return f"notional {notional} is below min notional {rules.min_notional}"
         return None
 
-    def _dry_run_buy_fill(self, market_price: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    def _dry_run_buy_fill(self, market_price: Decimal, market_type: str = MARKET_FUTURES) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         fill_price = market_price * (Decimal("1") + self.config.slippage_pct / Decimal("100"))
         margin_quote = self.config.order_quote_amount
-        gross_quote = margin_quote * self.config.leverage_multiplier if self.config.contract_simulation_enabled else margin_quote
+        gross_quote = margin_quote * self.config.leverage_multiplier if market_type == MARKET_FUTURES else margin_quote
         fee_amount = gross_quote * self.config.fee_rate_pct / Decimal("100")
         net_quote = max(Decimal("0"), gross_quote - fee_amount)
         quantity = net_quote / fill_price if fill_price > 0 else Decimal("0")
@@ -2683,6 +2932,9 @@ def average_fill_price(order: dict[str, Any]) -> Decimal | None:
     cummulative_quote = Decimal(str(order.get("cummulativeQuoteQty", "0")))
     if executed > 0 and cummulative_quote > 0:
         return cummulative_quote / executed
+    avg_price = Decimal(str(order.get("avgPrice", "0")))
+    if avg_price > 0:
+        return avg_price
     return None
 
 
@@ -2856,7 +3108,7 @@ def symbol_order_rules(exchange_info: dict[str, Any], symbol: str) -> OrderRules
                 if min_qty > 0:
                     rules.min_qty = max(rules.min_qty, min_qty)
             elif filter_type in {"MIN_NOTIONAL", "NOTIONAL"}:
-                min_notional = Decimal(str(filt.get("minNotional", "0")))
+                min_notional = Decimal(str(filt.get("minNotional", filt.get("notional", "0"))))
                 if min_notional > 0:
                     rules.min_notional = max(rules.min_notional, min_notional)
             elif filter_type == "PRICE_FILTER":
@@ -2948,6 +3200,7 @@ def signal_candidate_row(candidate: TradeCandidate) -> dict[str, Any]:
             "price_change_percent": candidate.price_change_percent,
             "volatility_percent": candidate.volatility_percent,
             "quote_volume": candidate.quote_volume,
+            "market_type": candidate.market_type,
         }
     )
 
@@ -3317,6 +3570,13 @@ def dynamic_stop_price(config: BotConfig, entry_price: Decimal, highest_price: D
     return stop_price, stop_mode
 
 
+def normalize_trade_market_mode(value: str) -> str:
+    mode = str(value or "futures_preferred").strip().lower().replace("-", "_")
+    if mode not in TRADE_MARKET_MODES:
+        raise ValueError(f"TRADE_MARKET_MODE must be one of {', '.join(sorted(TRADE_MARKET_MODES))}")
+    return mode
+
+
 def load_config(args: argparse.Namespace) -> BotConfig:
     square_urls = tuple(
         item.strip()
@@ -3324,8 +3584,10 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         if item.strip()
     )
     base_url = os.getenv("BINANCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    futures_base_url = os.getenv("FUTURES_BASE_URL", DEFAULT_FUTURES_BASE_URL).rstrip("/")
     if args.testnet:
         base_url = "https://testnet.binance.vision"
+        futures_base_url = DEFAULT_FUTURES_TESTNET_BASE_URL
 
     order_quote_amount = decimal_env("ORDER_QUOTE_USDT", "50") or Decimal("50")
     fixed_stop_loss_usdt = decimal_env("FIXED_STOP_LOSS_USDT")
@@ -3339,7 +3601,10 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         api_key=os.getenv("BINANCE_API_KEY", ""),
         api_secret=os.getenv("BINANCE_API_SECRET", ""),
         base_url=base_url,
+        futures_base_url=futures_base_url,
         quote_asset=os.getenv("QUOTE_ASSET", "USDT"),
+        trade_market_mode=normalize_trade_market_mode(os.getenv("TRADE_MARKET_MODE", "futures_preferred")),
+        futures_margin_type=os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED").strip().upper() or "ISOLATED",
         order_quote_amount=order_quote_amount,
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
         leverage_multiplier=leverage_multiplier,
@@ -3399,11 +3664,11 @@ def load_config(args: argparse.Namespace) -> BotConfig:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Binance Square long-only spot momentum bot")
-    parser.add_argument("--live", action="store_true", help="place real Binance Spot orders")
+    parser = argparse.ArgumentParser(description="Binance Square long-only futures-preferred momentum bot")
+    parser.add_argument("--live", action="store_true", help="place real Binance futures or Spot orders based on TRADE_MARKET_MODE")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
     parser.add_argument("--update-signal-returns", action="store_true", help="update future-return fields in the signal JSONL file and exit")
-    parser.add_argument("--testnet", action="store_true", help="use Binance Spot testnet base URL")
+    parser.add_argument("--testnet", action="store_true", help="use Binance Spot and USD-M Futures testnet base URLs")
     parser.add_argument("--square-browser", action="store_true", help="scrape Binance Square with Playwright browser rendering")
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     return parser.parse_args()
@@ -3419,7 +3684,7 @@ def main() -> int:
     if config.dry_run:
         LOGGER.warning("dry-run mode is enabled; no real orders will be sent")
     else:
-        LOGGER.warning("LIVE mode is enabled; real Spot BUY/SELL orders may be sent")
+        LOGGER.warning("LIVE mode is enabled; real Futures or Spot orders may be sent (mode=%s)", config.trade_market_mode)
 
     if args.update_signal_returns:
         result = update_signal_record_future_returns(config)

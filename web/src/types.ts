@@ -4,6 +4,8 @@ export type ConfigPayload = Record<string, Primitive | string[]>;
 
 export type SettingsState = {
   quote_asset: string;
+  trade_market_mode: string;
+  futures_margin_type: string;
   order_quote_amount: string;
   max_open_positions: string;
   leverage_multiplier: string;
@@ -68,6 +70,7 @@ export type Candidate = {
   price_change_percent?: Primitive;
   combined_score?: Primitive;
   volatility_percent?: Primitive;
+  market_type?: string;
   last_price?: Primitive;
 };
 
@@ -81,6 +84,7 @@ export type HotAsset = {
   last_price?: Primitive;
   price_change_percent?: Primitive;
   volatility_percent?: Primitive;
+  market_type?: string;
 };
 
 export type ChartRangeKey = "1H" | "6H" | "24H" | "7D" | "30D";
@@ -133,6 +137,8 @@ export type PositionSnapshot = {
   dry_run?: boolean;
   mode_label?: string;
   position_mode?: string;
+  market_type?: string;
+  margin_type?: string;
   contract_simulation?: boolean;
   quantity?: Primitive;
   entry_price?: Primitive;
@@ -246,6 +252,9 @@ export type ApiKeyCheck = {
   can_trade?: boolean | null;
   can_withdraw?: boolean | null;
   spot_trading_allowed?: boolean | null;
+  futures_account_accessible?: boolean | null;
+  futures_error?: string;
+  spot_error?: string;
   error?: string;
   warning?: string;
 };
@@ -410,11 +419,21 @@ export type DashboardStatus = {
   last_finished_at?: string;
   last_signal?: LastSignal | null;
   last_diagnostics?: Diagnostics | null;
+  loop_snapshot?: LoopSnapshot | null;
   logs?: string[];
   config?: ConfigPayload;
   state?: BotState;
   dashboard_security?: DashboardSecurity | null;
   error?: string;
+};
+
+export type LoopSnapshot = {
+  cycle_count?: Primitive;
+  last_cycle_started_at?: string;
+  last_cycle_finished_at?: string;
+  next_cycle_eta?: string;
+  last_cycle_action?: string;
+  last_cycle_note?: string;
 };
 
 export type DashboardSecurity = {

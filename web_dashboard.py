@@ -32,6 +32,8 @@ BOT_LOGGER = logging.getLogger("square-momentum-bot")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_BASE_URL = "https://api.binance.com"
+DEFAULT_FUTURES_BASE_URL = "https://fapi.binance.com"
+DEFAULT_FUTURES_TESTNET_BASE_URL = "https://demo-fapi.binance.com"
 LOCAL_DASHBOARD_HOSTS = {"127.0.0.1", "localhost", "::1"}
 READ_ONLY_BLOCKED_POST_ROUTES = {
     "/api/preview",
@@ -100,6 +102,14 @@ class BotRunner:
         self.last_signal: dict[str, Any] | None = None
         self.last_diagnostics: dict[str, Any] | None = None
         self.last_config: Any | None = None
+        self.loop_snapshot: dict[str, Any] = {
+            "cycle_count": 0,
+            "last_cycle_started_at": "",
+            "last_cycle_finished_at": "",
+            "next_cycle_eta": "",
+            "last_cycle_action": "",
+            "last_cycle_note": "",
+        }
         self.bound_host = DEFAULT_HOST
         self.price_cache: dict[str, dict[str, Any]] = {}
         self.safety_cache: dict[str, dict[str, Any]] = {}
@@ -115,6 +125,7 @@ class BotRunner:
                 "last_finished_at": self.last_finished_at,
                 "last_signal": self.last_signal,
                 "last_diagnostics": self.last_diagnostics,
+                "loop_snapshot": self.loop_snapshot,
                 "logs": self.log_handler.tail(),
             }
         if config is None:
@@ -127,15 +138,17 @@ class BotRunner:
         payload["state"] = state
         return payload
 
-    def ticker_price_for_status(self, config: Any, symbol: str) -> tuple[Decimal | None, str]:
-        cache_key = f"{config.base_url}|{symbol}"
+    def ticker_price_for_status(self, config: Any, symbol: str, market_type: str = "spot") -> tuple[Decimal | None, str]:
+        cache_key = f"{config.base_url}|{config.futures_base_url}|{market_type}|{symbol}"
         now = time.monotonic()
         with self.lock:
             cached = self.price_cache.get(cache_key)
             if cached and now - float(cached.get("cached_at", 0)) < 10:
                 return cached.get("price"), str(cached.get("error", ""))
         try:
-            price = bot_module().BinanceSpotClient(config).ticker_price(symbol)
+            module = bot_module()
+            client = module.BinanceFuturesClient(config) if market_type == "futures" else module.BinanceSpotClient(config)
+            price = client.ticker_price(symbol)
             error = ""
         except Exception as exc:
             price = None
@@ -152,12 +165,13 @@ class BotRunner:
                 "api_secret_loaded": bool(config.api_secret),
                 "api_key_suffix": config.api_key[-4:] if config.api_key else "",
                 "spot_trading_allowed": None,
+                "futures_account_accessible": None,
                 "can_trade": None,
                 "manual_withdraw_permission_check_required": True,
                 "manual_ip_whitelist_check_required": True,
                 "warning": "Live 前请人工确认 API key 禁用提现权限，并开启 IP 白名单。",
             }
-        cache_key = f"{config.base_url}|{config.api_key[-4:] if config.api_key else ''}"
+        cache_key = f"{config.base_url}|{config.futures_base_url}|{config.trade_market_mode}|{config.api_key[-4:] if config.api_key else ''}"
         now = time.monotonic()
         with self.lock:
             cached = self.safety_cache.get(cache_key)
@@ -169,6 +183,19 @@ class BotRunner:
         except Exception:
             pass
         payload = module.account_safety_snapshot(client, config)
+        spot_error = payload.get("error")
+        if config.trade_market_mode != "spot_only":
+            futures_client = module.BinanceFuturesClient(config)
+            try:
+                futures_client.sync_time()
+                futures_client.account()
+                payload["futures_account_accessible"] = True
+                if spot_error:
+                    payload["spot_error"] = spot_error
+                    payload["error"] = ""
+            except Exception as exc:
+                payload["futures_account_accessible"] = False
+                payload["futures_error"] = str(exc)
         with self.lock:
             self.safety_cache[cache_key] = {"payload": payload, "cached_at": now}
         return payload
@@ -227,6 +254,12 @@ class BotRunner:
         with self.lock:
             if self.running:
                 self.mode = "stopping"
+                self.loop_snapshot = {
+                    **self.loop_snapshot,
+                    "next_cycle_eta": "",
+                    "last_cycle_action": "stopping",
+                    "last_cycle_note": "停止请求已发送，当前轮次会尽快结束。",
+                }
         return self.status()
 
     def _claim(self, mode: str, config: Any) -> bool:
@@ -239,6 +272,15 @@ class BotRunner:
             self.last_started_at = now_text()
             self.last_finished_at = ""
             self.last_config = config
+            if mode.startswith("loop-"):
+                self.loop_snapshot = {
+                    "cycle_count": 0,
+                    "last_cycle_started_at": "",
+                    "last_cycle_finished_at": "",
+                    "next_cycle_eta": "",
+                    "last_cycle_action": "starting",
+                    "last_cycle_note": "循环已启动，准备执行首轮扫描。",
+                }
             if mode == "preview":
                 self.last_signal = {
                     "checked_at": self.last_started_at,
@@ -289,7 +331,9 @@ class BotRunner:
 
     def _once_worker(self, config: Any) -> None:
         try:
-            bot_module().LongOnlyMomentumBot(config).run_once()
+            bot = bot_module().LongOnlyMomentumBot(config)
+            bot.run_once()
+            self._sync_signal_from_record(bot.last_signal_record, checked_at=now_text())
         except Exception as exc:
             LOGGER.exception("single cycle failed")
             self._finish(str(exc))
@@ -318,7 +362,29 @@ class BotRunner:
         try:
             bot = bot_module().LongOnlyMomentumBot(config)
             while not self.stop_event.is_set():
+                cycle_started_at = now_text()
+                with self.lock:
+                    cycle_count = int(self.loop_snapshot.get("cycle_count") or 0) + 1
+                    self.loop_snapshot = {
+                        **self.loop_snapshot,
+                        "cycle_count": cycle_count,
+                        "last_cycle_started_at": cycle_started_at,
+                        "last_cycle_action": "running",
+                        "last_cycle_note": "正在执行本轮扫描、风控复核和持仓管理。",
+                        "next_cycle_eta": "",
+                    }
                 bot.run_once()
+                cycle_finished_at = now_text()
+                self._sync_signal_from_record(bot.last_signal_record, checked_at=cycle_finished_at)
+                action, note = loop_action_from_signal_record(bot.last_signal_record)
+                with self.lock:
+                    self.loop_snapshot = {
+                        **self.loop_snapshot,
+                        "last_cycle_finished_at": cycle_finished_at,
+                        "next_cycle_eta": next_cycle_eta_text(config.poll_seconds) if not self.stop_event.is_set() else "",
+                        "last_cycle_action": action,
+                        "last_cycle_note": note,
+                    }
                 for _ in range(max(1, config.poll_seconds)):
                     if self.stop_event.is_set():
                         break
@@ -329,12 +395,21 @@ class BotRunner:
             return
         self._finish()
 
+    def _sync_signal_from_record(self, record: dict[str, Any] | None, checked_at: str) -> None:
+        if not record:
+            return
+        signal = signal_payload_from_record(record, checked_at=checked_at)
+        with self.lock:
+            self.last_signal = signal
+
 
 def build_signal_preview(config: Any) -> dict[str, Any]:
     module = bot_module()
     bot = module.LongOnlyMomentumBot(config)
-    bot.client.sync_time()
-    symbols = bot.client.tradable_quote_symbols(config.quote_asset)
+    bot.spot_client.sync_time()
+    if config.trade_market_mode != "spot_only":
+        bot.futures_client.sync_time()
+    symbols = bot._tradable_market_symbols()
     base_assets = {data["baseAsset"] for data in symbols.values()}
     posts = bot.square.fetch_top_posts(config.top_post_limit, browser_mode=config.square_browser_mode)
     bot._sync_square_feed_state()
@@ -405,6 +480,49 @@ def build_signal_preview(config: Any) -> dict[str, Any]:
     return payload
 
 
+def signal_payload_from_record(record: dict[str, Any], checked_at: str | None = None) -> dict[str, Any]:
+    final_action = str(record.get("final_action") or "").strip()
+    entered = bool(record.get("entered"))
+    note = str(record.get("note") or "").strip()
+    entry_confirmation = record.get("entry_confirmation") if isinstance(record.get("entry_confirmation"), dict) else {}
+    if not note and entry_confirmation:
+        note = str(entry_confirmation.get("reason") or "").strip()
+    if not note:
+        note = "本轮已完成扫描和策略复核。"
+    source = str(record.get("source") or "run_once")
+    if source == "run_once":
+        source = "自动循环：Binance Square + 24h 涨幅榜"
+    action_text = "已开仓" if entered or final_action == "entered" else "已跳过" if final_action == "skipped" else final_action or "已完成"
+    return {
+        "checked_at": checked_at or now_text(),
+        "source": source,
+        "note": f"{action_text}：{note}",
+        "post_count": len(record.get("hot_posts") or []),
+        "square_confidence": record.get("square_confidence") or None,
+        "entry_confirmation": entry_confirmation or None,
+        "hot_assets": record.get("candidates") or [],
+        "candidate": record.get("candidate"),
+        "final_action": final_action,
+        "entered": entered,
+    }
+
+
+def loop_action_from_signal_record(record: dict[str, Any] | None) -> tuple[str, str]:
+    if not record:
+        return "completed", "本轮已完成，但没有产生信号记录。"
+    final_action = str(record.get("final_action") or "").strip()
+    entered = bool(record.get("entered"))
+    entry_confirmation = record.get("entry_confirmation") if isinstance(record.get("entry_confirmation"), dict) else {}
+    note = str(record.get("note") or entry_confirmation.get("reason") or "").strip()
+    if entered or final_action == "entered":
+        candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+        symbol = str(candidate.get("symbol") or "").strip()
+        return "entered", f"本轮已按策略开仓{f'：{symbol}' if symbol else ''}。"
+    if final_action == "skipped":
+        return "skipped", note or "本轮未满足开仓条件，已跳过。"
+    return final_action or "completed", note or "本轮已完成扫描和策略复核。"
+
+
 def candidate_score_row(candidate: Any) -> dict[str, Any]:
     return stringify_decimals(
         {
@@ -418,6 +536,7 @@ def candidate_score_row(candidate: Any) -> dict[str, Any]:
             "price_change_percent": candidate.price_change_percent,
             "volatility_percent": candidate.volatility_percent,
             "quote_volume": candidate.quote_volume,
+            "market_type": getattr(candidate, "market_type", "spot"),
         }
     )
 
@@ -451,7 +570,7 @@ def update_signal_returns(config: Any) -> dict[str, Any]:
 def build_market_chart(symbol: str, range_key: str, testnet: bool = False) -> dict[str, Any]:
     normalized_symbol = symbol.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{3,20}", normalized_symbol):
-        raise ValueError("symbol must be a Binance spot symbol")
+        raise ValueError("symbol must be a Binance market symbol")
     normalized_range = range_key.strip().upper()
     if normalized_range not in CHART_RANGES:
         raise ValueError("range must be one of 1H, 6H, 24H, 7D, 30D")
@@ -459,9 +578,14 @@ def build_market_chart(symbol: str, range_key: str, testnet: bool = False) -> di
     interval, limit = CHART_RANGES[normalized_range]
     module = bot_module()
     base_url = "https://testnet.binance.vision" if testnet else DEFAULT_BASE_URL
-    config = module.BotConfig(api_key="", api_secret="", base_url=base_url)
-    client = module.BinanceSpotClient(config)
-    rows = client.klines(normalized_symbol, interval, limit)
+    futures_base_url = DEFAULT_FUTURES_TESTNET_BASE_URL if testnet else DEFAULT_FUTURES_BASE_URL
+    config = module.BotConfig(api_key="", api_secret="", base_url=base_url, futures_base_url=futures_base_url)
+    market_type = "spot"
+    try:
+        rows = module.BinanceSpotClient(config).klines(normalized_symbol, interval, limit)
+    except Exception:
+        rows = module.BinanceFuturesClient(config).klines(normalized_symbol, interval, limit)
+        market_type = "futures"
 
     points: list[dict[str, Any]] = []
     for row in rows:
@@ -489,6 +613,7 @@ def build_market_chart(symbol: str, range_key: str, testnet: bool = False) -> di
             "symbol": normalized_symbol,
             "range": normalized_range,
             "interval": interval,
+            "market_type": market_type,
             "points": points,
             "first_close": first_close,
             "last_close": last_close,
@@ -623,7 +748,7 @@ def build_safety_snapshot(state: dict[str, Any], config: Any, runner: BotRunner)
         "manual_checks": [
             "确认 Binance API key 没有提现权限",
             "确认 Binance API key 已开启 IP 白名单",
-            "确认当前 live 模式仍是现货交易，不会自动切换合约",
+            "确认当前 live 市场模式；合约优先会发送 USDT-M Futures 订单",
         ],
     }
 
@@ -872,14 +997,15 @@ def build_position_snapshot(
 
     quote_spent = decimal_from_state(position.get("quote_spent")) or quantity * entry_price
     position_mode = str(position.get("position_mode") or "spot")
-    is_contract_sim = position_mode == "contract-sim"
+    market_type = str(position.get("market_type") or ("futures" if position_mode in {"contract-sim", "futures-live"} else "spot"))
+    is_contract_sim = position_mode in {"contract-sim", "futures-live"} or market_type == "futures"
     leverage_multiplier = decimal_from_state(position.get("leverage_multiplier")) or config.leverage_multiplier
     if leverage_multiplier <= 0:
         leverage_multiplier = Decimal("1")
     margin_quote = decimal_from_state(position.get("margin_quote")) or (quote_spent if is_contract_sim else Decimal("0"))
     notional_quote = decimal_from_state(position.get("notional_quote")) or quantity * entry_price
     symbol = str(position.get("symbol") or "")
-    current_price, price_error = runner.ticker_price_for_status(config, symbol)
+    current_price, price_error = runner.ticker_price_for_status(config, symbol, market_type)
     highest_price = decimal_from_state(position.get("highest_price")) or entry_price
     if current_price is not None and current_price > highest_price:
         highest_price = current_price
@@ -909,11 +1035,13 @@ def build_position_snapshot(
         "quote_asset": config.quote_asset,
         "leverage_multiplier": leverage_multiplier,
         "position_mode": position_mode,
+        "market_type": market_type,
+        "margin_type": position.get("margin_type", ""),
         "contract_simulation": is_contract_sim,
         "margin_quote": margin_quote,
         "notional_quote": notional_quote,
         "dry_run": is_dry_run,
-        "mode_label": "合约模拟" if is_contract_sim else "模拟" if is_dry_run else "实盘",
+        "mode_label": "合约模拟" if is_contract_sim and is_dry_run else "合约实盘" if is_contract_sim else "模拟" if is_dry_run else "现货实盘",
         "quantity": quantity,
         "entry_price": entry_price,
         "highest_price": highest_price,
@@ -1029,6 +1157,7 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
     )
     testnet = bool(payload.get("testnet"))
     base_url = "https://testnet.binance.vision" if testnet else os.getenv("BINANCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    futures_base_url = DEFAULT_FUTURES_TESTNET_BASE_URL if testnet else os.getenv("FUTURES_BASE_URL", DEFAULT_FUTURES_BASE_URL).rstrip("/")
     order_quote_amount = decimal_value(payload, "order_quote_amount", "ORDER_QUOTE_USDT", "50")
     fixed_stop_loss_usdt = optional_decimal(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
@@ -1041,7 +1170,10 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         api_key=os.getenv("BINANCE_API_KEY", ""),
         api_secret=os.getenv("BINANCE_API_SECRET", ""),
         base_url=base_url,
+        futures_base_url=futures_base_url,
         quote_asset=str(payload.get("quote_asset") or os.getenv("QUOTE_ASSET", "USDT")).upper(),
+        trade_market_mode=module.normalize_trade_market_mode(str(payload.get("trade_market_mode") or os.getenv("TRADE_MARKET_MODE", "futures_preferred"))),
+        futures_margin_type=str(payload.get("futures_margin_type") or os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED")).strip().upper() or "ISOLATED",
         order_quote_amount=order_quote_amount,
         max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 1),
         leverage_multiplier=leverage_multiplier,
@@ -1179,6 +1311,10 @@ def format_decimal(value: Decimal) -> str:
 
 def now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def next_cycle_eta_text(delay_seconds: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + max(1, int(delay_seconds))))
 
 
 def dashboard_auth_error(required_token: str, headers: Any, route: str) -> str | None:

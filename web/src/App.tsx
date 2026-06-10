@@ -75,6 +75,8 @@ import type {
 
 const DEFAULT_SETTINGS: SettingsState = {
   quote_asset: "USDT",
+  trade_market_mode: "futures_preferred",
+  futures_margin_type: "ISOLATED",
   order_quote_amount: "50",
   max_open_positions: "1",
   leverage_multiplier: "10",
@@ -272,6 +274,7 @@ function App() {
   const squareConfidence = state.square_confidence || signal.square_confidence || null;
   const accountRisk = state.account_risk_snapshot || null;
   const diagnostics = status?.last_diagnostics || null;
+  const loopSnapshot = status?.loop_snapshot || null;
   const dashboardSecurity = status?.dashboard_security || null;
   const readOnlyMode = Boolean(dashboardSecurity?.read_only);
   const readOnlyReason = readOnlyMode ? "Dashboard read-only mode is enabled" : "";
@@ -286,7 +289,10 @@ function App() {
   const liveMode = settings.live || config.dry_run === false;
   const quoteAsset = snapshot?.quote_asset || textValue(config.quote_asset) || settings.quote_asset || "USDT";
   const heroSymbol = candidate?.symbol || position?.symbol || "OPNUSDT";
-  const updatedAt = status?.last_finished_at || status?.last_started_at || "--";
+  const updatedAt = loopSnapshot?.last_cycle_finished_at || status?.last_finished_at || status?.last_started_at || "--";
+  const loopDetail = loopSnapshot?.last_cycle_note
+    ? `${loopSnapshot.last_cycle_note}${loopSnapshot.next_cycle_eta ? ` · 下轮 ${loopSnapshot.next_cycle_eta}` : ""}`
+    : `轮询 ${settings.poll_seconds || "300"} 秒 · 页面 2.5 秒刷新`;
   const totals = useMemo(() => positionTotals(positionViews), [positionViews]);
   const hotAssets = signal.hot_assets || [];
   const favoriteSet = useMemo(() => new Set(favoriteSymbols), [favoriteSymbols]);
@@ -386,12 +392,12 @@ function App() {
       return "";
     }
     if (path === "/api/manual-close") {
-      return "Confirm LIVE market sell for the current position? This will place a real order.";
+      return "Confirm LIVE market close for the current position? This may place a real futures reduce-only or spot sell order.";
     }
     if (path === "/api/start-loop") {
-      return "Confirm LIVE loop start? Future cycles may place real spot orders.";
+      return "Confirm LIVE loop start? Future cycles may place real futures or spot orders.";
     }
-    return "Confirm LIVE run once? This cycle may place real spot orders.";
+    return "Confirm LIVE run once? This cycle may place a real futures or spot order.";
   }
 
   async function submit(path: string, nextTab?: TabKey) {
@@ -575,7 +581,7 @@ function App() {
               <Clock3 className="source-watermark" size={38} />
               <span>最后更新</span>
               <strong>{updatedAt}</strong>
-              <small>{requestError || status?.last_error || `轮询 ${settings.poll_seconds || "300"} 秒 · 页面 2.5 秒刷新`}</small>
+              <small>{requestError || status?.last_error || loopDetail}</small>
             </div>
           </div>
         </section>
@@ -783,7 +789,7 @@ function SafetyPanel({
   const protectionOk = Boolean(safety?.protection_ok);
   const entryBlocked = entryConfirmation && entryConfirmation.passed === false;
   const accountBlocked = Boolean(accountRisk?.entry_blocked);
-  const tone = pending || missing.length || failed.length || api.error || entryBlocked || accountBlocked || (liveMode && api.spot_trading_allowed === false) ? "danger" : liveMode ? "warning" : "success";
+  const tone = pending || missing.length || failed.length || api.error || api.futures_error || entryBlocked || accountBlocked || (liveMode && api.spot_trading_allowed === false) || (liveMode && api.futures_account_accessible === false) ? "danger" : liveMode ? "warning" : "success";
   return (
     <section className={`safety-panel tone-${tone}`}>
       <div className="safety-head">
@@ -809,7 +815,7 @@ function SafetyPanel({
         <div>
           <span>API Key</span>
           <strong>{api.api_key_loaded ? `已加载 ****${api.api_key_suffix || ""}` : "未加载"}</strong>
-          <small>{api.error || (api.spot_trading_allowed === false ? "未检测到 SPOT 权限" : "请人工确认关闭提现并开启 IP 白名单")}</small>
+          <small>{api.error || api.futures_error || (api.futures_account_accessible === false ? "未检测到 Futures 权限" : api.spot_trading_allowed === false ? "未检测到 SPOT 权限" : "请人工确认关闭提现并开启 IP 白名单")}</small>
         </div>
         <div>
           <span>入场确认</span>
@@ -932,6 +938,10 @@ function normalizeSymbol(symbol?: Primitive): string {
     return "";
   }
   return clean.endsWith("USDT") ? clean : `${clean}USDT`;
+}
+
+function marketTypeLabel(value?: string): string {
+  return value === "futures" ? "合约" : "现货";
 }
 
 function tradingViewChartUrl(symbol: string): string {
@@ -1375,6 +1385,7 @@ function HotAssetsTable({
               <th>#</th>
               <th></th>
               <th>币种</th>
+              <th>市场</th>
               <th>综合分</th>
               <th>市场分</th>
               <th>广场分</th>
@@ -1400,6 +1411,7 @@ function HotAssetsTable({
                   {item.symbol || item.asset || "--"}
                 </a>
               </td>
+              <td>{marketTypeLabel(item.market_type)}</td>
               <td className="mono accent">{formatScore(item.score)}</td>
               <td className="mono">{formatScore(item.market_score)}</td>
               <td className="mono">
@@ -1940,9 +1952,11 @@ function SettingsPanel({
         {activeTab === "basic" && (
           <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="基础交易" description="控制交易计价、单笔投入和本地状态文件。">
             <SettingsField {...fieldProps} name="quote_asset" label="计价币种" />
+            <SettingsField {...fieldProps} name="trade_market_mode" label="交易市场模式" help="futures_preferred=合约优先；futures_only=仅合约；spot_only=仅现货。" />
+            <SettingsField {...fieldProps} name="futures_margin_type" label="合约保证金模式" help="默认 ISOLATED 逐仓；也可填 CROSSED 全仓。" />
             <SettingsField {...fieldProps} name="order_quote_amount" label="单笔金额" type="number" min="1" step="1" />
             <SettingsField {...fieldProps} name="max_open_positions" label="最大持仓数" type="number" min="1" step="1" help="允许同时持有的仓位数量；保守默认为 1，标准预设为 5，激进预设为 10。" />
-            <SettingsField {...fieldProps} name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="合约模拟中用于计算名义仓位、保证金收益和强平风险；实盘仍不会自动切换为合约下单。" />
+            <SettingsField {...fieldProps} name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="合约优先模式下用于 USDT-M 合约实盘和 dry-run 合约模拟；现货兜底时不使用杠杆。" />
             <SettingsField {...fieldProps} name="state_file" label="状态文件" full />
             <div className="toggle-grid is-full">
               <SettingsToggle {...toggleProps} name="contract_simulation_enabled" label="Dry-run 使用合约模拟" />
@@ -1980,7 +1994,7 @@ function SettingsPanel({
         {activeTab === "risk" && (
           <SettingsSection onSave={saveCurrentSettings} saveMessage={saveMessage} title="风控退出" description="控制初始止损、保本、移动止盈和开仓节流；止盈为 0 时让移动止损负责退出。">
             <SettingsField {...fieldProps} name="initial_stop_loss_pct" label="初始止损 %" type="number" min="0.1" step="0.1" />
-            <SettingsField {...fieldProps} name="contract_max_margin_loss_pct" label="合约最大保证金亏损 %" type="number" min="0" step="0.1" help="仅用于 dry-run 合约模拟；按保证金亏损反推有效价格止损，例如 10x + 20% = 2% 价格止损。" />
+            <SettingsField {...fieldProps} name="contract_max_margin_loss_pct" label="合约最大保证金亏损 %" type="number" min="0" step="0.1" help="用于合约实盘和 dry-run 合约模拟；按保证金亏损反推有效价格止损，例如 10x + 20% = 2% 价格止损。" />
             <SettingsField {...fieldProps} name="liquidation_stop_buffer_pct" label="强平止损缓冲 %" type="number" min="0" step="0.1" help="有效止损会保持在预估强平价上方，避免止损价低于或贴近强平价。" />
             <SettingsField {...fieldProps} name="take_profit_pct" label="止盈 %" type="number" min="0" step="0.1" />
             <SettingsField {...fieldProps} name="breakeven_trigger_pct" label="保本触发 %" type="number" min="0" step="0.1" help="最高价达到该涨幅后，把动态止损抬到成本附近；填 0 关闭。" />
@@ -2146,6 +2160,8 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
   return {
     ...DEFAULT_SETTINGS,
     quote_asset: textValue(config.quote_asset) || DEFAULT_SETTINGS.quote_asset,
+    trade_market_mode: textValue(config.trade_market_mode) || DEFAULT_SETTINGS.trade_market_mode,
+    futures_margin_type: textValue(config.futures_margin_type) || DEFAULT_SETTINGS.futures_margin_type,
     order_quote_amount: textValue(config.order_quote_amount) || DEFAULT_SETTINGS.order_quote_amount,
     max_open_positions: textValue(config.max_open_positions) || DEFAULT_SETTINGS.max_open_positions,
     leverage_multiplier: textValue(config.leverage_multiplier) || DEFAULT_SETTINGS.leverage_multiplier,

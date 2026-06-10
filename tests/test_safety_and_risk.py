@@ -77,6 +77,39 @@ def test_live_confirm_and_dashboard_auth() -> None:
             os.environ["DASHBOARD_READ_ONLY"] = previous
 
 
+def test_dashboard_signal_payload_from_run_once_record() -> None:
+    record = {
+        "recorded_at": "2026-06-10T01:00:00+00:00",
+        "source": "run_once",
+        "square_confidence": {"score": "42", "post_count": 5},
+        "candidates": [
+            {"asset": "BTC", "symbol": "BTCUSDT", "score": "100", "price_change_percent": "8"},
+            {"asset": "ETH", "symbol": "ETHUSDT", "score": "80", "price_change_percent": "5"},
+        ],
+        "candidate": {"asset": "BTC", "symbol": "BTCUSDT", "score": "100", "price_change_percent": "8"},
+        "entry_confirmation": {"passed": True, "symbol": "BTCUSDT", "reason": "entry confirmed"},
+        "final_action": "entered",
+        "entered": True,
+        "note": "dry-run position opened",
+    }
+    signal = web.signal_payload_from_record(record, checked_at="2026-06-10 09:00:00")
+    assert signal["checked_at"] == "2026-06-10 09:00:00"
+    assert signal["source"].startswith("自动循环")
+    assert signal["candidate"]["symbol"] == "BTCUSDT"
+    assert len(signal["hot_assets"]) == 2
+    assert signal["entered"] is True
+    assert "已开仓" in signal["note"]
+
+    skipped = dict(record, final_action="skipped", entered=False, candidate=None, note="")
+    skipped["entry_confirmation"] = {"passed": False, "reason": "Square confidence low"}
+    signal = web.signal_payload_from_record(skipped, checked_at="2026-06-10 09:05:00")
+    assert signal["candidate"] is None
+    assert "Square confidence low" in signal["note"]
+    action, note = web.loop_action_from_signal_record(skipped)
+    assert action == "skipped"
+    assert note == "Square confidence low"
+
+
 def test_signal_reliability_filters() -> None:
     low_conf = bot.square_confidence_snapshot([], {"extractor_mode": "none"}, bot.SquareFeedState(consecutive_failures=2))
     assert Decimal(str(low_conf["score"])) < Decimal("35")
@@ -198,6 +231,69 @@ def test_symbol_scoring_rounding_and_dry_run_fill() -> None:
         assert fee_amount == Decimal("1.0")
         assert quote_spent == Decimal("100")
         assert quantity > Decimal("9")
+
+
+def test_futures_preferred_candidate_pool_and_reduce_only_order() -> None:
+    class FakeSpot:
+        def tradable_quote_symbols(self, quote_asset: str):
+            assert quote_asset == "USDT"
+            return {
+                "BOTHUSDT": {"symbol": "BOTHUSDT", "baseAsset": "BOTH", "quoteAsset": "USDT", "market_type": bot.MARKET_SPOT},
+                "SPOTUSDT": {"symbol": "SPOTUSDT", "baseAsset": "SPOT", "quoteAsset": "USDT", "market_type": bot.MARKET_SPOT},
+            }
+
+        def ticker_24hr(self):
+            return [
+                {"symbol": "BOTHUSDT", "priceChangePercent": "5", "quoteVolume": "10000000", "highPrice": "12", "lowPrice": "10", "lastPrice": "11"},
+                {"symbol": "SPOTUSDT", "priceChangePercent": "6", "quoteVolume": "10000000", "highPrice": "12", "lowPrice": "10", "lastPrice": "11"},
+            ]
+
+    class FakeFutures:
+        def tradable_quote_symbols(self, quote_asset: str):
+            assert quote_asset == "USDT"
+            return {
+                "BOTHUSDT": {"symbol": "BOTHUSDT", "baseAsset": "BOTH", "quoteAsset": "USDT", "market_type": bot.MARKET_FUTURES},
+                "FUTUSDT": {"symbol": "FUTUSDT", "baseAsset": "FUT", "quoteAsset": "USDT", "market_type": bot.MARKET_FUTURES},
+            }
+
+        def ticker_24hr(self):
+            return [
+                {"symbol": "BOTHUSDT", "priceChangePercent": "7", "quoteVolume": "10000000", "highPrice": "12", "lowPrice": "10", "lastPrice": "11"},
+                {"symbol": "FUTUSDT", "priceChangePercent": "8", "quoteVolume": "10000000", "highPrice": "12", "lowPrice": "10", "lastPrice": "11"},
+            ]
+
+    cfg = bot.BotConfig(api_key="", api_secret="", trade_market_mode="futures_preferred", min_price_change_percent=Decimal("1"), min_volatility_percent=Decimal("1"))
+    instance = bot.LongOnlyMomentumBot(cfg)
+    instance.spot_client = FakeSpot()
+    instance.futures_client = FakeFutures()
+    symbols = instance._tradable_market_symbols()
+    assert symbols["BOTHUSDT"]["market_type"] == bot.MARKET_FUTURES
+    assert symbols["FUTUSDT"]["market_type"] == bot.MARKET_FUTURES
+    assert symbols["SPOTUSDT"]["market_type"] == bot.MARKET_SPOT
+    candidates = instance._rank_trade_candidates(symbols, bot.Counter())
+    assert any(item.symbol == "FUTUSDT" and item.market_type == bot.MARKET_FUTURES for item in candidates)
+
+    cfg = bot.BotConfig(api_key="", api_secret="", trade_market_mode="futures_only", min_price_change_percent=Decimal("1"), min_volatility_percent=Decimal("1"))
+    instance = bot.LongOnlyMomentumBot(cfg)
+    instance.spot_client = FakeSpot()
+    instance.futures_client = FakeFutures()
+    symbols = instance._tradable_market_symbols()
+    assert "SPOTUSDT" not in symbols
+
+    class CaptureFutures(bot.BinanceFuturesClient):
+        def __init__(self):
+            super().__init__(bot.BotConfig(api_key="key", api_secret="secret"))
+            self.last = {}
+
+        def signed_request(self, method, path, params=None):
+            self.last = {"method": method, "path": path, "params": params or {}}
+            return {"status": "FILLED", "executedQty": params.get("quantity", "0"), "avgPrice": "10"}
+
+    futures = CaptureFutures()
+    futures.market_sell_quantity("BTCUSDT", Decimal("0.01"), client_order_id="cid")
+    assert futures.last["path"] == "/fapi/v1/order"
+    assert futures.last["params"]["reduceOnly"] == "true"
+    assert futures.last["params"]["side"] == "SELL"
 
 
 def test_contract_sim_effective_stop_loss_guard() -> None:

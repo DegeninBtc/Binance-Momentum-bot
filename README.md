@@ -1,8 +1,8 @@
 # Binance Square Momentum Bot
 
-基于 Binance Square 热门内容和 Binance Spot 24h 行情的单向追涨交易机器人，附带 React Web 控制台。
+基于 Binance Square 热门内容和 Binance USDT-M 合约 / Spot 24h 行情的单向追涨交易机器人，附带 React Web 控制台。
 
-**核心原则：** 做多头动能策略。市场动能先过硬筛，广场热度只做加分。默认 dry-run，不会真实下单；dry-run 默认按合约模拟展示杠杆、保证金、名义仓位和收益率。
+**核心原则：** 做多头动能策略。市场动能先过硬筛，广场热度只做加分。默认 dry-run，不会真实下单；默认市场模式为 USDT-M 合约优先，现货仅作为 fallback。
 
 **权衡：** 这个项目偏向谨慎筛选和可解释性，而不是高频触发。Binance Square 不是稳定公开接口，网页结构变化可能影响帖子解析；实盘前应长期模拟观察。
 
@@ -37,7 +37,7 @@
 脚本完成三件事：
 
 - 抓取 Binance Square 热门帖子，统计真实币种提及量。
-- 读取 Binance Spot 24h 涨幅、波动、成交额，生成市场动能评分。
+- 读取 Binance USDT-M 合约优先、Spot 兜底的 24h 涨幅、波动、成交额，生成市场动能评分。
 - 综合市场分和广场分，选择只做多的候选标的。
 
 为了降低误判，规则会剔除：
@@ -70,6 +70,9 @@ $env:BINANCE_API_KEY="你的 API Key"
 $env:BINANCE_API_SECRET="你的 API Secret"
 $env:ORDER_QUOTE_USDT="50"
 $env:MAX_OPEN_POSITIONS="1"
+$env:TRADE_MARKET_MODE="futures_preferred"
+$env:FUTURES_BASE_URL="https://fapi.binance.com"
+$env:FUTURES_MARGIN_TYPE="ISOLATED"
 $env:LEVERAGE_MULTIPLIER="10"
 $env:CONTRACT_MAX_MARGIN_LOSS_PCT="20"
 $env:LIQUIDATION_STOP_BUFFER_PCT="2"
@@ -114,10 +117,10 @@ http://127.0.0.1:8787/
 
 常用按钮：
 
-- `刷新信号`：只计算候选，不下单。
+- `刷新信号`：只计算候选，不下单，适合手动预览当前信号。
 - `诊断广场`：检查 Binance Square 是否能抓到可解析帖子。
 - `执行一次`：执行一个完整周期；dry-run 模式只记录模拟交易。
-- `启动循环`：按轮询间隔持续执行。
+- `启动循环`：按轮询间隔自动扫描信号并执行策略；每轮结果会同步到首页热门币表和状态卡。
 - `清空模拟仓位`：只在 dry-run 模式下清空本地 `bot_state.json`。
 
 设置页支持策略参数预设：
@@ -128,8 +131,10 @@ http://127.0.0.1:8787/
 
 首页持仓区域会展示当前持仓的入场价、有效止损价、止盈价和现价价格线；多仓位时，状态卡会显示主仓位并标记额外仓位数量。
 
-杠杆倍数默认 `10` 倍，可在网页“基础”设置里自由调整，或通过 `LEVERAGE_MULTIPLIER` 设置。dry-run 默认开启 `CONTRACT_SIMULATION_ENABLED=true`，按 `单笔保证金 × 杠杆倍数` 计算名义仓位、ROI 和预估强平价；实盘仍不会自动切换为合约下单。
-合约模拟会优先按保证金风险收紧止损，默认 `CONTRACT_MAX_MARGIN_LOSS_PCT=20`、`LIQUIDATION_STOP_BUFFER_PCT=2`；例如 `10x` 下即使配置 `20%` 初始止损，也会收紧为约 `2%` 价格止损，避免止损价低于预估强平价。
+交易市场模式默认 `TRADE_MARKET_MODE=futures_preferred`：同一标的同时有 USDT-M 合约和现货时优先使用合约；只有现货时才回退现货。也可以设置为 `futures_only` 或 `spot_only`。
+
+杠杆倍数默认 `10` 倍，可在网页“基础”设置里自由调整，或通过 `LEVERAGE_MULTIPLIER` 设置。合约实盘和 dry-run 合约模拟都会按 `单笔保证金 × 杠杆倍数` 计算名义仓位、ROI 和预估强平价；现货 fallback 不使用杠杆。
+合约仓位会优先按保证金风险收紧止损，默认 `CONTRACT_MAX_MARGIN_LOSS_PCT=20`、`LIQUIDATION_STOP_BUFFER_PCT=2`；例如 `10x` 下即使配置 `20%` 初始止损，也会收紧为约 `2%` 价格止损，避免止损价低于预估强平价。
 
 通知页支持 Telegram 推送：
 
@@ -153,7 +158,7 @@ http://127.0.0.1:8787/
 - `涨幅 >= MIN_PRICE_CHANGE_PERCENT`
 - `波动 >= MIN_VOLATILITY_PERCENT`
 - `成交额 >= MIN_QUOTE_VOLUME_USDT`
-- 现货可交易，且不是稳定币/法币类资产
+- USDT-M 合约可交易，或在 fallback 情况下 Spot 可交易，且不是稳定币/法币类资产
 
 综合评分：
 
@@ -170,8 +175,8 @@ http://127.0.0.1:8787/
 **严格单向操作，不做空。**
 
 - 入场只使用 `BUY MARKET`。
-- 平仓只卖出现有现货余额。
-- 初始止损：默认开仓价下跌 `4%` 后触发；dry-run 合约模拟会再按 `CONTRACT_MAX_MARGIN_LOSS_PCT / LEVERAGE_MULTIPLIER` 和 `100 / LEVERAGE_MULTIPLIER - LIQUIDATION_STOP_BUFFER_PCT` 取更安全的有效止损。
+- 平仓只减掉已有多头仓位；合约实盘使用 reduce-only 市价平仓，现货 fallback 卖出现有现货余额。
+- 初始止损：默认开仓价下跌 `4%` 后触发；合约实盘和 dry-run 合约模拟会再按 `CONTRACT_MAX_MARGIN_LOSS_PCT / LEVERAGE_MULTIPLIER` 和 `100 / LEVERAGE_MULTIPLIER - LIQUIDATION_STOP_BUFFER_PCT` 取更安全的有效止损。
 - 止盈：默认 `0`，表示关闭固定止盈，让保本和移动止损负责退出；可通过 `TAKE_PROFIT_PCT` 或网页设置调整。
 - 保本止损：默认最高价达到开仓价上方 `3%` 后，将动态止损抬到开仓价上方 `0.2%`，可通过 `BREAKEVEN_TRIGGER_PCT` / `BREAKEVEN_OFFSET_PCT` 或网页设置调整。
 - 移动止盈：默认最高价达到开仓价上方 `6%` 后启用，价格从最高价回撤 `3%` 时平仓，可通过 `TRAILING_START_PCT` / `TRAILING_STOP_PCT` 或网页设置调整；回撤设为 `0` 可关闭。
@@ -236,14 +241,14 @@ $OutputEncoding = [System.T`	ext.Encoding]::UTF8
 
 在切换 `Live 实盘` 或使用 `python .\binance_square_momentum_bot.py --live` 前，请逐项确认：
 
-- API key 只开启现货交易权限，不开启提现权限。
+- API key 只开启当前市场模式需要的交易权限；合约优先需要 Futures 权限，现货兜底需要 Spot 权限，禁止开启提现权限。
 - API key 已在 Binance 后台开启 IP 白名单；Binance API 无法完整可靠读取该项，必须人工检查。
 - 页面状态只显示 API key 是否加载和后 4 位，不会显示完整 key 或 secret。
 - `run-once`、`start-loop`、`manual-close`、单仓位平仓在 live 模式下都需要二次确认；后端会拒绝没有 `live_confirmed=true` 的请求。
 - 下单前会把 `pending_order` 写入 `bot_state.json`，异常后按 `clientOrderId` 查询订单状态，避免直接重复下单。
-- live 买入成交后会尝试创建交易所端保护单：优先 OCO；当固定止盈为 `0` 时使用 stop-loss-limit 保护。保护单失败会写入日志、页面状态，并触发 Telegram 通知。
+- live 现货买入成交后会尝试创建交易所端保护单：优先 OCO；当固定止盈为 `0` 时使用 stop-loss-limit 保护。保护单失败会写入日志、页面状态，并触发 Telegram 通知。
+- live 合约第一版不自动挂交易所端条件保护单；使用本地轮询止损/止盈触发 reduce-only 市价平仓，页面会明确显示“交易所端合约保护单未启用”。
 - dry-run 不会真实挂保护单，只会在状态中记录模拟保护单参数。
-- 当前 futures/contract 显示仅是 dry-run 合约模拟；live 模式仍然只做 Binance Spot 现货交易，不会自动切换合约交易。
 
 新增配置：
 
