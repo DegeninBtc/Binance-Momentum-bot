@@ -25,8 +25,13 @@ services:
       - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      # 设为 1 可跳过 Playwright Chromium 下载（不需要广场抓取时）
+      # - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
     volumes:
       - bot_data:/app/data
+      # 持久化 Playwright 浏览器缓存，避免每次重启都重新下载
+      - pw_cache:/root/.cache/ms-playwright
 
 volumes:
   bot_data:
+  pw_cache:
