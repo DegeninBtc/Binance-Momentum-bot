@@ -4,7 +4,6 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY web ./web
-COPY tsconfig.json ./
 RUN npm run build
 
 FROM python:3.11-slim AS runtime
