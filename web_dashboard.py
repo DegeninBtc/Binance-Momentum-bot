@@ -1204,6 +1204,13 @@ def dashboard_read_only_error(route: str) -> str | None:
     return None
 
 
+def parse_extra_allowed_hosts() -> set[str]:
+    raw = os.getenv("DASHBOARD_ALLOWED_HOSTS", "")
+    if not raw:
+        return set()
+    return {normalize_dashboard_host(h) for h in raw.split(",") if normalize_dashboard_host(h)}
+
+
 def dashboard_security_snapshot(bound_host: str) -> dict[str, Any]:
     normalized_bound = normalize_dashboard_host(bound_host)
     local_only = normalized_bound in LOCAL_DASHBOARD_HOSTS
@@ -1213,7 +1220,7 @@ def dashboard_security_snapshot(bound_host: str) -> dict[str, Any]:
         "host_origin_check_enabled": True,
         "bound_host": normalized_bound or bound_host,
         "local_only_host": local_only,
-        "allowed_hosts": sorted(LOCAL_DASHBOARD_HOSTS | ({normalized_bound} if normalized_bound else set())),
+        "allowed_hosts": sorted(LOCAL_DASHBOARD_HOSTS | ({normalized_bound} if normalized_bound else set()) | parse_extra_allowed_hosts()),
         "warning": "" if local_only else "Dashboard is not bound to a localhost address; use HTTPS, firewall, and IP allowlist.",
     }
 
@@ -1223,6 +1230,7 @@ def dashboard_request_host_error(bound_host: str, headers: Any) -> str | None:
     normalized_bound = normalize_dashboard_host(bound_host)
     if normalized_bound:
         allowed_hosts.add(normalized_bound)
+    allowed_hosts |= parse_extra_allowed_hosts()
     host = normalize_dashboard_host(str(headers.get("Host") or ""))
     if host and host not in allowed_hosts:
         return f"dashboard Host is not allowed: {host}"

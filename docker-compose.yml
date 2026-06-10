@@ -11,6 +11,7 @@ services:
       - DASHBOARD_HOST=0.0.0.0
       - DASHBOARD_PORT=8787
       - DASHBOARD_AUTH_TOKEN=${DASHBOARD_AUTH_TOKEN:-}
+      - DASHBOARD_ALLOWED_HOSTS=${DASHBOARD_ALLOWED_HOSTS:-}
       - BINANCE_API_KEY=${BINANCE_API_KEY:-}
       - BINANCE_API_SECRET=${BINANCE_API_SECRET:-}
       - ORDER_QUOTE_USDT=${ORDER_QUOTE_USDT:-50}
@@ -25,11 +26,8 @@ services:
       - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      # Set to 1 to skip Playwright setup entirely
-      # - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
     volumes:
       - bot_data:/app/data
-      # Persist Playwright browser + system deps across restarts
       - pw_cache:/root/.cache
 
 volumes:
