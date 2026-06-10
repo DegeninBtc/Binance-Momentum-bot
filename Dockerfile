@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Playwright 浏览器运行时依赖
+# Playwright runtime dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
@@ -24,12 +24,12 @@ RUN apt-get update \
        fonts-noto-color-emoji curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 只装 Python 库，不下载 Chromium（运行时按需安装）
+# Python deps only, Chromium downloaded at runtime on demand
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-# Playwright 按需加载：首次启动时才下载 Chromium，缓存到 /root/.cache
-# 如不需要浏览器抓取，设 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 跳过
+# Playwright lazy-load: first startup downloads Chromium, cached in volume
+# Set PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 to skip if not needed
 ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 
 COPY entrypoint.sh ./
