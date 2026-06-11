@@ -1,294 +1,216 @@
 # Binance Square Momentum Bot
 
-基于 Binance Square 热门内容和 Binance USDT-M 合约 / Spot 24h 行情的单向追涨交易机器人，附带 React Web 控制台。
+一个基于 Binance Square 热度、Binance 行情动能和多层风控的多头动能交易机器人，带本地 React Dashboard。
 
-**核心原则：** 做多头动能策略。市场动能先过硬筛，广场热度只做加分。默认 dry-run，不会真实下单；默认市场模式为 USDT-M 合约优先，现货仅作为 fallback。
+默认运行在 **dry-run 模拟模式**，不会真实下单。当前默认市场模式是 **USDT-M 合约优先，Spot 现货兜底**：
 
-**权衡：** 这个项目偏向谨慎筛选和可解释性，而不是高频触发。Binance Square 不是稳定公开接口，网页结构变化可能影响帖子解析；实盘前应长期模拟观察。
+- 有 USDT-M 合约的标的优先按合约行情和合约交易路径处理。
+- 没有合约但有现货的标的可作为 fallback。
+- live 模式需要二次确认；API key 只从环境变量读取，不从网页输入。
+
+> 风险提示：自动交易可能造成真实亏损。本项目不是投资建议。实盘前请长期 dry-run 验证，并从小金额开始。
+
+## 功能概览
+
+- Binance Square 热门帖子抓取与币种提及统计。
+- USDT-M Futures 优先、Spot fallback 的 24h 动能筛选。
+- Square 置信度、5m / 15m / 1h K 线确认、盘口流动性过滤。
+- 多仓位管理、冷却时间、每日开仓限制、每日亏损限制。
+- 账户级风控：总敞口、单币敞口、连亏熔断、日内回撤熔断。
+- 合约模拟强平保护止损：避免止损价低于或贴近预估强平价。
+- live 交易幂等保护：`clientOrderId`、pending order、异常后查单恢复。
+- 本地 Web Dashboard：信号、持仓、交易记录、风控、安全状态、日志、通知、设置。
+- Telegram 通知：买入、平仓、风控跳过、循环异常。
+- 信号 JSONL 记录、SQLite 交易复盘库、离线分析和导出工具。
+- GitHub Actions CI 与 Dependabot 依赖提醒。
 
 ## 项目结构
 
-```
+```text
+.
 ├── binance_square_momentum_bot.py   # 核心交易引擎
-├── web_dashboard.py                 # 本地 Web 后端（HTTP API + 静态文件托管）
-├── web/
-│   ├── src/                         # React + TypeScript 前端源码
-│   │   ├── App.tsx                  # 主界面组件
-│   │   ├── api.ts                   # API 请求层
-│   │   ├── format.ts                # 格式化工具
-│   │   ├── types.ts                 # TypeScript 类型定义
-│   │   ├── styles.css               # 全局样式
-│   │   └── main.tsx                 # 入口
-│   ├── index.html                   # HTML 模板
-│   ├── vite.config.ts               # Vite 构建配置
-│   └── tsconfig.json                # TypeScript 配置
-├── package.json                     # Node.js 依赖和构建脚本
-├── requirements.txt                 # Python 依赖
-├── start_dashboard.bat              # 一键启动控制台
-├── fix_playwright_browser.bat       # 修复 Playwright 浏览器
-├── install_browser_mode.bat         # 安装浏览器抓取模式
-└── .gitignore
+├── web_dashboard.py                 # 本地 HTTP API + Dashboard 静态托管
+├── web/                             # React + TypeScript 前端
+├── tests/                           # 轻量安全/风控/复盘测试
+├── tools/                           # 信号与交易复盘分析工具
+├── .github/                         # CI 和 Dependabot
+├── Dockerfile
+├── docker-compose.yml
+├── package.json
+├── package-lock.json
+└── requirements.txt
 ```
 
-## 项目定位
+## 快速开始
 
-**社媒热度辅助判断，不替代行情强度。**
+### 1. 安装依赖
 
-脚本完成三件事：
-
-- 抓取 Binance Square 热门帖子，统计真实币种提及量。
-- 读取 Binance USDT-M 合约优先、Spot 兜底的 24h 涨幅、波动、成交额，生成市场动能评分。
-- 综合市场分和广场分，选择只做多的候选标的。
-
-为了降低误判，规则会剔除：
-
-- 稳定币和法币类资产，例如 `USDC`、`USDT`、`FDUSD`、`TUSD`、`DAI`。
-- 常见英文词误判，例如 `THE`、`AT`、`PEOPLE`、`NOT`。
-- 明显做空或看空语境，例如 `SHORT POSITION`、`selling pressure`、`drops below`。
-
-## 安装运行
-
-**先安装依赖，再从 dry-run 开始。**
-
-### Python 依赖
-
-````powershell
+```powershell
 python -m pip install -r requirements.txt
-```
-
-### 前端构建
-
-````powershell
 npm ci
 npm run build
 ```
 
-### 配置环境变量
+如需浏览器模式抓取 Binance Square：
 
-````powershell
-$env:BINANCE_API_KEY="你的 API Key"
-$env:BINANCE_API_SECRET="你的 API Secret"
+```powershell
+.\fix_playwright_browser.bat
+```
+
+### 2. 配置环境变量
+
+最小 dry-run 配置：
+
+```powershell
 $env:ORDER_QUOTE_USDT="50"
 $env:MAX_OPEN_POSITIONS="15"
-$env:TRADE_MARKET_MODE="futures_preferred"
-$env:FUTURES_BASE_URL="https://fapi.binance.com"
-$env:FUTURES_MARGIN_TYPE="ISOLATED"
 $env:LEVERAGE_MULTIPLIER="3"
-$env:CONTRACT_MAX_MARGIN_LOSS_PCT="20"
-$env:LIQUIDATION_STOP_BUFFER_PCT="2"
-$env:MIN_PRICE_CHANGE_PERCENT="3"
-$env:MIN_VOLATILITY_PERCENT="5"
-$env:MIN_QUOTE_VOLUME_USDT="5000000"
+$env:TRADE_MARKET_MODE="futures_preferred"
+$env:FUTURES_MARGIN_TYPE="ISOLATED"
 $env:POLL_SECONDS="300"
-$env:TELEGRAM_ENABLED="false"
-$env:TELEGRAM_BOT_TOKEN=""
-$env:TELEGRAM_CHAT_ID=""
 ```
 
-### 运行一次模拟
+live 模式还需要：
 
-````powershell
-python .\binance_square_momentum_bot.py --once
+```powershell
+$env:BINANCE_API_KEY="你的 API Key"
+$env:BINANCE_API_SECRET="你的 API Secret"
 ```
 
-### 确认策略和风控后再使用实盘
+Telegram 可选：
 
-````powershell
-python .\binance_square_momentum_bot.py --live
+```powershell
+$env:TELEGRAM_ENABLED="true"
+$env:TELEGRAM_BOT_TOKEN="你的 Telegram Bot Token"
+$env:TELEGRAM_CHAT_ID="你的 Chat ID"
 ```
 
-## Web 控制台
+### 3. 启动 Dashboard
 
-**页面只负责控制和展示，API Key 只从环境变量读取。**
-
-前端使用 React + Vite + TypeScript，源码在 `web/src/`，构建产物由 `web_dashboard.py` 本地托管。
-
-启动本地控制台：
-
-````powershell
+```powershell
 .\start_dashboard.bat
 ```
 
 浏览器打开：
 
-```t`	ext
+```text
 http://127.0.0.1:8787/
 ```
 
-常用按钮：
+### 4. 命令行运行
 
-- `刷新信号`：只计算候选，不下单，适合手动预览当前信号。
-- `诊断广场`：检查 Binance Square 是否能抓到可解析帖子。
-- `执行一次`：执行一个完整周期；dry-run 模式只记录模拟交易。
-- `启动循环`：按轮询间隔自动扫描信号并执行策略；每轮结果会同步到首页热门币表和状态卡。
-- `清空模拟仓位`：只在 dry-run 模式下清空本地 `bot_state.json`。
+运行一次 dry-run：
 
-设置页支持策略参数预设：
-
-- `保守`：提高入场门槛、收紧日内限制，默认只允许 1 个仓位。
-- `标准`：沿用当前默认筛选参数，预设杠杆 `3x`，最多 `15` 个仓位。
-- `激进`：降低入场门槛、放宽持仓和日内限制，预设杠杆 `5x`，最多 `20` 个仓位。
-
-首页持仓区域会展示当前持仓的入场价、有效止损价、止盈价和现价价格线；多仓位时，状态卡会显示主仓位并标记额外仓位数量。
-
-交易市场模式默认 `TRADE_MARKET_MODE=futures_preferred`：同一标的同时有 USDT-M 合约和现货时优先使用合约；只有现货时才回退现货。也可以设置为 `futures_only` 或 `spot_only`。
-
-标准模式杠杆倍数默认 `3` 倍，可在网页“基础”设置里自由调整，或通过 `LEVERAGE_MULTIPLIER` 设置；激进预设会切换为 `5` 倍。合约实盘和 dry-run 合约模拟都会按 `单笔保证金 × 杠杆倍数` 计算名义仓位、ROI 和预估强平价；现货 fallback 不使用杠杆。
-合约仓位会优先按保证金风险收紧止损，默认 `CONTRACT_MAX_MARGIN_LOSS_PCT=20`、`LIQUIDATION_STOP_BUFFER_PCT=2`；例如 `10x` 下即使配置 `20%` 初始止损，也会收紧为约 `2%` 价格止损，避免止损价低于预估强平价。
-
-通知页支持 Telegram 推送：
-
-- `启用 Telegram 通知`：开启后，买入、平仓、风控跳过和循环异常会推送到 Telegram。
-- `Bot Token`：从 `@BotFather` 获取；后端不会在状态接口回显 Token。
-- `Chat ID`：目标个人或群组 ID。
-- `测试通知`：发送一条测试消息，用于确认 Token 和 Chat ID 是否可用。
-
-浏览器抓取模式需要 Playwright Chromium：
-
-````powershell
-.\fix_playwright_browser.bat
+```powershell
+python .\binance_square_momentum_bot.py --once
 ```
 
-## 评分规则
+循环 dry-run：
 
-**硬条件先过滤，综合分再排序。**
+```powershell
+python .\binance_square_momentum_bot.py
+```
 
-入选候选前必须同时满足：
+live 模式：
 
-- `涨幅 >= MIN_PRICE_CHANGE_PERCENT`
-- `波动 >= MIN_VOLATILITY_PERCENT`
-- `成交额 >= MIN_QUOTE_VOLUME_USDT`
-- USDT-M 合约可交易，或在 fallback 情况下 Spot 可交易，且不是稳定币/法币类资产
+```powershell
+python .\binance_square_momentum_bot.py --live
+```
+
+## Dashboard 使用说明
+
+常用按钮：
+
+- `刷新信号`：只做手动预览，不下单。
+- `诊断广场`：检查 Binance Square 抓取和解析状态。
+- `执行一次`：执行完整策略周期；dry-run 只记录模拟交易。
+- `启动循环`：按 `POLL_SECONDS` 自动扫描、管理持仓、复核策略并执行。
+- `手动平仓`：平掉当前持仓；live 模式需要二次确认。
+- `清空模拟仓位`：只清空本地 dry-run 仓位，不清空复盘数据库。
+
+策略预设：
+
+| 预设 | 用途 | 杠杆 | 最大持仓 |
+| --- | --- | ---: | ---: |
+| 保守 | 更高门槛、更低频 | 当前设置 | 1 |
+| 标准 | 默认观察模式 | 3x | 15 |
+| 激进 | 更宽松、更高风险 | 5x | 20 |
+
+## 核心策略
+
+入场候选必须先通过硬过滤：
+
+- 24h 涨幅达到 `MIN_PRICE_CHANGE_PERCENT`。
+- 波动率达到 `MIN_VOLATILITY_PERCENT`。
+- 成交额达到 `MIN_QUOTE_VOLUME_USDT`。
+- 标的不是稳定币、法币类资产或常见误识别英文词。
+- 市场模式允许该标的：USDT-M 合约优先，Spot fallback。
 
 综合评分：
 
-```t`	ext
+```text
 市场分 = 涨幅 * 10 + 波动 * 4 + 成交额加分
 广场分 = 当前币提及数 / 最高提及数 * 180
 综合分 = 市场分 + 广场分
 ```
 
-如果广场没有有效做多提及，系统仍会按 24h 市场动能排序，不会漏掉涨幅榜强势币。
+入场前还会检查：
 
-## 风控逻辑
+- Square 数据置信度。
+- 5m / 15m / 1h 短周期 K 线确认。
+- order book spread 和深度。
+- 账户级风控和每日限制。
 
-**严格单向操作，不做空。**
+## 市场模式
 
-- 入场只使用 `BUY MARKET`。
-- 平仓只减掉已有多头仓位；合约实盘使用 reduce-only 市价平仓，现货 fallback 卖出现有现货余额。
-- 初始止损：默认开仓价下跌 `4%` 后触发；合约实盘和 dry-run 合约模拟会再按 `CONTRACT_MAX_MARGIN_LOSS_PCT / LEVERAGE_MULTIPLIER` 和 `100 / LEVERAGE_MULTIPLIER - LIQUIDATION_STOP_BUFFER_PCT` 取更安全的有效止损。
-- 止盈：默认 `0`，表示关闭固定止盈，让保本和移动止损负责退出；可通过 `TAKE_PROFIT_PCT` 或网页设置调整。
-- 保本止损：默认最高价达到开仓价上方 `3%` 后，将动态止损抬到开仓价上方 `0.2%`，可通过 `BREAKEVEN_TRIGGER_PCT` / `BREAKEVEN_OFFSET_PCT` 或网页设置调整。
-- 移动止盈：默认最高价达到开仓价上方 `6%` 后启用，价格从最高价回撤 `3%` 时平仓，可通过 `TRAILING_START_PCT` / `TRAILING_STOP_PCT` 或网页设置调整；回撤设为 `0` 可关闭。
-- 固定金额止损：默认值为单笔金额的 `20%`（单笔 `50 USDT` 时为 `10 USDT`），只在固定止损模式启用后触发。
-- 默认不会在首个买入-卖出回合后自动切换固定止损；可在网页勾选或设置 `FIXED_STOP_AFTER_FIRST_ROUND_TRIP=true` 启用。
-- 可设置权益阈值，达到指定账户权益后再启用固定金额止损；不确定时建议留空。
-- 冷却时间：默认同一币种卖出后 `30` 分钟内不重新开仓，可通过 `COOLDOWN_MINUTES` 或网页设置调整；设为 `0` 可关闭。
-- 每日开仓上限：默认每天最多开仓 `5` 次，可通过 `MAX_DAILY_TRADES` 或网页设置调整；设为 `0` 可关闭。
-- 每日亏损上限：默认当天已实现亏损达到 `25 USDT` 后停止新开仓，可通过 `MAX_DAILY_LOSS_USDT` 或网页设置调整；设为 `0` 可关闭。
-- 绩效统计：网页交易记录页会基于已完成的买入-卖出回合统计胜率、总盈亏、平均盈亏、盈亏比、最大回撤和当前连胜/连亏；未平仓浮盈浮亏不计入已实现绩效。
-- 多仓位管理：标准默认 `MAX_OPEN_POSITIONS=15`，激进预设为 `20`；系统会跳过已持有币种，直到持仓数量低于上限才继续扫描新开仓。
-- 订单安全检查：买入/卖出前会检查 Binance 交易规则中的最小数量、步进精度和最小成交额，避免明显不满足规则的实盘订单被拒绝。
-- dry-run 成本估算：默认按 `0.1%` 手续费和 `0.05%` 滑点估算，买入价格上浮、卖出价格下调，绩效统计使用扣费后的净额；可通过 `FEE_RATE_PCT` / `SLIPPAGE_PCT` 或网页设置调整。
-- 手动平仓：网页提供手动平仓按钮，模拟模式记录 `DRY_RUN_MANUAL_SELL`，实盘模式会二次确认后市价卖出现有仓位。
-- 白名单/黑名单：可通过 `ASSET_WHITELIST` / `ASSET_BLACKLIST` 或网页设置控制允许交易的币种，支持 `BTC,ETH,SOL` 或 `SOLUSDT` 格式；白名单为空表示不限制。
-- BTC/ETH 大盘过滤：默认关闭。启用 `MARKET_FILTER_ENABLED=true` 后，会检查 `MARKET_FILTER_ASSETS`（默认 `BTC,ETH`）的 24h 涨幅；若不满足 `MARKET_FILTER_MIN_CHANGE_PCT`（默认 `-1%`）则暂停新开仓。`MARKET_FILTER_REQUIRE_ALL=true` 可要求所有大盘币都满足。
-- 成交后账户同步：默认开启 `ACCOUNT_SYNC_ENABLED=true`。实盘买入后会用账户余额校准本地持仓数量；卖出后如账户仍有剩余余额则保留剩余仓位，否则清空本地仓位；循环开始时也会校准已有实盘仓位。
+`TRADE_MARKET_MODE` 支持：
 
-## 技术栈
+| 值 | 行为 |
+| --- | --- |
+| `futures_preferred` | 默认。USDT-M 合约优先，Spot 兜底 |
+| `futures_only` | 只扫描和交易 USDT-M 合约 |
+| `spot_only` | 只扫描和交易 Spot 现货 |
 
-| 层级 | 技术 |
-|------|------|
-| 交易引擎 | Python 3.10+, requests, beautifulsoup4, playwright |
-| Web 后端 | Python http.server（内置，无额外框架） |
-| Web 前端 | React 19, TypeScript, Vite, lucide-react |
+合约设置：
 
-## GitHub 与安全
-
-**提交代码，不提交账户状态和密钥。**
-
-`.gitignore` 已忽略：
-
-- `bot_state.json` / `bot_state.json.tmp`
-- `dashboard.*.log`
-- `__pycache__/` / `*.pyc`
-- `node_modules/`
-- `signal_records.jsonl`
-- `web/dist/`
-
-## 编码说明
-
-**仓库文件统一按 UTF-8 维护。**
-
-如果 Windows 终端里 README 中文显示乱码，通常是当前控制台编码不是 UTF-8，而不是文件损坏。可用下面方式确认：
-
-````powershell
-Get-Content .\README.md -Encoding UTF8
+```powershell
+$env:FUTURES_BASE_URL="https://fapi.binance.com"
+$env:FUTURES_MARGIN_TYPE="ISOLATED"
+$env:LEVERAGE_MULTIPLIER="3"
 ```
 
-如需让当前 PowerShell 会话按 UTF-8 输出，可执行：
+live 合约开仓前会尝试设置逐仓/全仓模式和杠杆；合约平仓使用 reduce-only 市价单。
 
-````powershell
-[Console]::OutputEncoding = [System.T`	ext.Encoding]::UTF8
-$OutputEncoding = [System.T`	ext.Encoding]::UTF8
+## 风控与安全
+
+### 单笔退出
+
+- 初始止损：`INITIAL_STOP_LOSS_PCT`，默认 `4%`。
+- 固定止盈：`TAKE_PROFIT_PCT`，默认 `0` 表示关闭。
+- 保本止损：`BREAKEVEN_TRIGGER_PCT` / `BREAKEVEN_OFFSET_PCT`。
+- 移动止损：`TRAILING_START_PCT` / `TRAILING_STOP_PCT`。
+- 固定金额止损：`FIXED_STOP_LOSS_USDT`。
+
+合约模拟和合约 live 会额外使用强平保护：
+
+```text
+有效价格止损比例 = min(
+  INITIAL_STOP_LOSS_PCT,
+  CONTRACT_MAX_MARGIN_LOSS_PCT / LEVERAGE_MULTIPLIER,
+  100 / LEVERAGE_MULTIPLIER - LIQUIDATION_STOP_BUFFER_PCT
+)
 ```
 
----
+默认：
 
-**风险提示：** 自动交易可能造成真实亏损。本项目不是投资建议；任何实盘操作都应从小金额开始，并自行承担风险。
-
-## 实盘前检查清单
-
-在切换 `Live 实盘` 或使用 `python .\binance_square_momentum_bot.py --live` 前，请逐项确认：
-
-- API key 只开启当前市场模式需要的交易权限；合约优先需要 Futures 权限，现货兜底需要 Spot 权限，禁止开启提现权限。
-- API key 已在 Binance 后台开启 IP 白名单；Binance API 无法完整可靠读取该项，必须人工检查。
-- 页面状态只显示 API key 是否加载和后 4 位，不会显示完整 key 或 secret。
-- `run-once`、`start-loop`、`manual-close`、单仓位平仓在 live 模式下都需要二次确认；后端会拒绝没有 `live_confirmed=true` 的请求。
-- 下单前会把 `pending_order` 写入 `bot_state.json`，异常后按 `clientOrderId` 查询订单状态，避免直接重复下单。
-- live 现货买入成交后会尝试创建交易所端保护单：优先 OCO；当固定止盈为 `0` 时使用 stop-loss-limit 保护。保护单失败会写入日志、页面状态，并触发 Telegram 通知。
-- live 合约第一版不自动挂交易所端条件保护单；使用本地轮询止损/止盈触发 reduce-only 市价平仓，页面会明确显示“交易所端合约保护单未启用”。
-- dry-run 不会真实挂保护单，只会在状态中记录模拟保护单参数。
-
-新增配置：
-
-````powershell
-$env:EXCHANGE_PROTECTION_ENABLED="true"
-$env:OCO_STOP_LIMIT_SLIPPAGE_PCT="0.5"
+```powershell
+$env:CONTRACT_MAX_MARGIN_LOSS_PCT="20"
+$env:LIQUIDATION_STOP_BUFFER_PCT="2"
 ```
 
-## P1 信号可靠性过滤
+### 账户级风控
 
-自动入场前会额外做三类确认，用于减少 Square 数据失效或短线冲高回落时的误入场：
-
-- `Square 置信度`：基于帖子数量、结构化信息、时间信息、抓取模式和连续失败次数评分；低于阈值时跳过自动交易。
-- `短周期 K 线确认`：检查 5m / 15m / 1h ROC、5m EMA9 和高 24h 涨幅下的短线回落风险。
-- `盘口流动性过滤`：检查 bid-ask spread 和买入侧 order book 深度，流动性不足时跳过候选币。
-
-新增配置：
-
-````powershell
-$env:KLINE_CONFIRMATION_ENABLED="true"
-$env:MIN_SQUARE_CONFIDENCE_SCORE="35"
-$env:MAX_SPREAD_BPS="50"
-$env:MIN_ORDERBOOK_DEPTH_USDT="1000"
-```
-
-当 Binance Square 没有有效做多提及时，自动入场不会再退化成纯 24h 市场动能追涨；页面首页会显示 `Entry confirmation` 的通过/阻塞原因。
-
-## P2 账户级风控
-
-账户级风控用于限制整体风险，而不是替代单笔止损。默认阈值为 `0`，表示关闭对应限制；设置后会在自动入场前检查：
-
-- 总敞口：所有持仓加本次拟开仓金额占权益估算的比例。
-- 单币敞口：当前候选币持仓加本次拟开仓金额占权益估算的比例。
-- 连亏熔断：最近已完成交易连续亏损达到阈值后暂停新开仓。
-- 日内回撤熔断：当日已实现亏损加当前浮亏达到阈值后暂停新开仓。
-- 风险定仓建议：只计算建议下单金额，不改变当前固定 `ORDER_QUOTE_USDT` 下单逻辑。
-
-新增配置：
-
-````powershell
+```powershell
 $env:MAX_TOTAL_EXPOSURE_PCT="0"
 $env:MAX_SYMBOL_EXPOSURE_PCT="0"
 $env:MAX_CONSECUTIVE_LOSSES="0"
@@ -296,191 +218,129 @@ $env:MAX_INTRADAY_DRAWDOWN_PCT="0"
 $env:RISK_PER_TRADE_PCT="0"
 ```
 
-页面首页会显示 `Account risk` 状态；设置页“风控退出”可以调整这些参数。
+默认 `0` 表示关闭对应限制。
 
-## Docker ??
+### live 安全检查
 
-????????
+live 前请确认：
 
-```powershell
-docker compose up -d --build
-```
+- API key 禁止提现权限。
+- API key 开启 IP 白名单。
+- 合约优先模式需要 Futures 权限；Spot fallback 需要 Spot 权限。
+- Dashboard 只显示 API key 是否加载和后 4 位，不显示完整 key/secret。
+- `run-once`、`start-loop`、`manual-close`、单仓位平仓都需要 `live_confirmed=true`。
+- 合约保护单第一版不挂交易所端条件单，使用本地轮询止盈/止损后 reduce-only 平仓。
 
-??????
+## Dashboard 安全
+
+默认只绑定本机：
 
 ```text
-http://127.0.0.1:8787/
+127.0.0.1:8787
 ```
 
-??? Docker Hub?? `yourname/binance-momentum-dashboard:latest` ????
+可设置本地控制 token：
 
 ```powershell
-docker build -t yourname/binance-momentum-dashboard:latest .
-docker login
-docker push yourname/binance-momentum-dashboard:latest
-```
-
-????? API Key ????????????????? `.env` ???
-
-## P3 Engineering Validation Baseline
-
-Use the following commands before committing local safety or dashboard changes:
-
-````powershell
-python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py .\tools\analyze_trade_journal.py .\tools\export_trade_journal.py
-python .\tests\test_safety_and_risk.py
-npm ci
-npm run build
-```
-
-`package-lock.json` is intentionally committed so `npm ci` can reproduce frontend installs. The dashboard still defaults to `127.0.0.1`; if `DASHBOARD_AUTH_TOKEN` is set, trading-control POST requests must include the same token from the browser settings page. Public deployment still requires `	external HTTPS, firewall rules, and IP allowlisting.
-
-````powershell
 $env:DASHBOARD_AUTH_TOKEN="your-local-token"
 ```
 
-## P4 Signal Recording And Offline Dataset
+观察模式：
 
-- `SIGNAL_RECORDING_ENABLED=true` enables JSONL recording by default.
-- `SIGNAL_RECORD_FILE=signal_records.jsonl` controls the local output file.
-- Web `preview` and `run-once` write one record with Square confidence, post summaries, candidate scores, entry confirmation, K-line/orderbook checks, account risk, and final decision.
-- Records are redacted and must not contain API keys, API secrets, Telegram tokens, or full account balance details.
-- `signal_records.jsonl` is ignored by Git.
-- `trade_journal.sqlite3` is ignored by Git.
-- Future-return updates only read market data and do not modify `bot_state.json`:
+```powershell
+$env:DASHBOARD_READ_ONLY="true"
+python .\web_dashboard.py
+```
 
-````powershell
+如果部署到 VPS 或公网，必须额外使用 HTTPS 反代、防火墙、IP 白名单和 Binance API IP 白名单。不要把 `DASHBOARD_AUTH_TOKEN` 当成完整公网鉴权方案。
+
+## 数据记录与复盘
+
+本项目默认不提交本地状态和交易数据。
+
+| 文件 | 用途 | 是否提交 |
+| --- | --- | --- |
+| `bot_state.json` | 当前状态、仓位、pending order | 否 |
+| `signal_records.jsonl` | 信号和决策记录 | 否 |
+| `trade_journal.sqlite3` | 长期交易复盘库 | 否 |
+| `dashboard.*.log` | 本地运行日志 | 否 |
+
+信号记录：
+
+```powershell
+$env:SIGNAL_RECORDING_ENABLED="true"
+$env:SIGNAL_RECORD_FILE="signal_records.jsonl"
+```
+
+更新未来收益观察字段：
+
+```powershell
 python .\binance_square_momentum_bot.py --update-signal-returns
 ```
 
-Analyze the local signal dataset:
+分析信号：
 
-````powershell
+```powershell
 python .\tools\analyze_signal_records.py .\signal_records.jsonl
-python .\tools\analyze_signal_records.py .\signal_records.jsonl --csv --output .\signal_records.csv
+python .\tools\replay_signal_records.py .\signal_records.jsonl --horizon 1h
+python .\tools\walk_forward_signal_records.py .\signal_records.jsonl
 ```
 
-## Trade Journal And Review Database
+分析交易复盘库：
 
-Long-term trade review data is stored in local SQLite by default: `trade_journal.sqlite3`. `bot_state.json` still stores current runtime state and recent actions; the dashboard trade statistics prefer the SQLite journal so completed-trade counts and visible details can stay aligned.
-
-- `trade_events` records each buy, sell, manual close, stop-loss, take-profit, or account-sync action.
-- `trade_round_trips` pairs buys and sells with FIFO matching and stores PnL, return %, market type, position mode, exit reason, and holding duration.
-- Existing `bot_state.json.trade_log` entries are migrated into SQLite on startup or status refresh.
-- Clearing dry-run positions does not clear the review database by default.
-- The journal does not store API keys, API secrets, Telegram tokens, or full account balances.
-
-Export and analyze the local journal:
-
-````powershell
+```powershell
 python .\tools\analyze_trade_journal.py .\trade_journal.sqlite3
 python .\tools\export_trade_journal.py .\trade_journal.sqlite3 --view round_trips --output .\trade_journal_round_trips.csv
 python .\tools\export_trade_journal.py .\trade_journal.sqlite3 --view events --output .\trade_journal_events.csv
 ```
 
-## P5 Offline Validation And Replay Draft
+## Docker
 
-P5 adds lightweight validation on top of P4 signal records. It is not a full backtest engine and does not tune parameters automatically.
+启动：
 
-- `tools/analyze_signal_records.py` groups records by decision reason: entered, low Square confidence, K-line rejection, orderbook rejection, account-risk rejection, and other skips.
-- The analyzer compares future returns for entered versus skipped records at 5m / 15m / 1h / 4h and reports mean, median, and positive-rate values.
-- `tools/replay_signal_records.py` replays recorded decisions from JSONL and reports trade count, win rate, average return, max consecutive losses, and missed-upside / avoided-downside counts by decision group.
-- Replay is read-only: it does not call Binance, does not modify `bot_state.json`, and does not place or simulate new orders outside the recorded dataset.
-
-````powershell
-python .\tools\replay_signal_records.py .\signal_records.jsonl --horizon 1h
+```powershell
+docker compose up -d --build
 ```
 
-## P9 Walk-Forward Validation Draft
+打开：
 
-P9 adds a lightweight walk-forward summary for existing signal records. It is offline-only: it does not call Binance, does not change bot state, does not tune parameters, and does not alter live trading behavior.
-
-The default split is:
-
-- Train: 60%
-- Validation: 20%
-- Test: 20%
-
-Run it with:
-
-````powershell
-python .\tools\walk_forward_signal_records.py .\signal_records.jsonl
-python .\tools\walk_forward_signal_records.py .\signal_records.jsonl --split 60,20,20
+```text
+http://127.0.0.1:8787/
 ```
 
-Each phase reports record count, entered/skipped count, decision groups, future-return summary for all records, and future-return summary for entered records only. Use this as an early guard against judging the strategy from one market segment.
+不要把 API key 写进镜像。使用环境变量或 `.env`，并确保 `.env` 不提交到 GitHub。
 
-## P6 CI And Dependency Stability
+## 验收命令
 
-This repository includes a lightweight GitHub Actions baseline in `.github/workflows/ci.yml`.
-It runs the same validation commands recommended for local pre-commit checks:
+提交前建议运行：
 
-````powershell
+```powershell
 python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py .\tools\analyze_trade_journal.py .\tools\export_trade_journal.py
 python .\tests\test_safety_and_risk.py
 npm ci
 npm run build
 ```
 
-CI does not require Binance or Telegram credentials, does not call live trading endpoints, and does not run the bot in live mode.
+CI 会运行同类检查，不需要 Binance 或 Telegram 密钥，不会启动 live 交易。
 
-Dependency defaults:
+## 依赖更新
 
-- Frontend installs should use `npm ci`; `package-lock.json` is intentionally committed.
-- Python dependencies remain in `requirements.txt` for now.
-- No `uv.lock`, `requirements.lock`, or pip-tools migration is included in this phase.
+Dependabot 已配置：
 
-Additional test coverage now includes symbol `	extraction, Square mention counting, score ordering, Decimal rounding, Binance filter parsing, state migration, signal JSONL analysis, replay summaries, and dry-run fill behavior.
+- `npm`：检查 `package.json` / `package-lock.json`。
+- `pip`：检查 `requirements.txt`。
 
-## Remote Dashboard Safety
+Dependabot 只创建 PR，不自动合并。合并前请先跑验收命令。
 
-The web dashboard is designed for local use first. It binds to `127.0.0.1` by default, and `DASHBOARD_AUTH_TOKEN` is only a local control-layer token.
+## 编码说明
 
-If you deploy the dashboard on a VPS or expose it beyond localhost, add `	external protection before enabling trading controls:
+仓库文本文件按 UTF-8 维护。Windows PowerShell 如显示中文乱码，可执行：
 
-- HTTPS reverse proxy.
-- Firewall and IP allowlist.
-- `DASHBOARD_AUTH_TOKEN`.
-- Binance API key with no withdrawal permission.
-- Binance API IP whitelist.
-- Live-mode confirmation for every trading control request.
-
-Do not treat the dashboard token alone as a complete public-internet authentication system.
-
-## P7 Dashboard Read-Only Safety Mode
-
-Use `DASHBOARD_READ_ONLY=true` when the dashboard should be observable but must not run control actions.
-
-````powershell
-$env:DASHBOARD_READ_ONLY="true"
-python .\web_dashboard.py
+```powershell
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 ```
 
-Read-only mode blocks POST control routes including preview, Square diagnostics, future-return updates, run-once, start-loop, stop, manual close, position close, dry-run state reset, and Telegram test sends. It keeps read-only GET routes available, including `/api/status`, `/api/market-chart`, and static frontend assets.
+## License
 
-`/api/status` exposes a `dashboard_security` snapshot with:
-
-- read-only enabled / disabled.
-- dashboard token enabled / disabled.
-- Host / Origin checking status.
-- bound host and whether it is local-only.
-
-The frontend displays this dashboard security state and disables control buttons when read-only mode is enabled. This is an application-level safeguard only; VPS or public deployments still need HTTPS reverse proxy, firewall, IP allowlist, Binance API IP whitelist, and no-withdrawal API keys.
-
-## P8 Dependabot Dependency Alerts
-
-GitHub Dependabot is configured in `.github/dependabot.yml` to check dependencies weekly:
-
-- `npm` for frontend dependencies in `package.json` / `package-lock.json`.
-- `pip` for Python dependencies in `requirements.txt`.
-
-Dependabot only opens update PRs. It does not auto-merge, does not run the bot, does not read API keys, and does not change live trading behavior. Review each Dependabot PR manually and require the normal validation baseline before merging:
-
-````powershell
-python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py .\tools\analyze_trade_journal.py .\tools\export_trade_journal.py
-python .\tests\test_safety_and_risk.py
-npm ci
-npm run build
-```
-
-The dependency strategy stays conservative in this phase: frontend installs use `npm ci`, Python stays on `requirements.txt`, and no `uv.lock`, `requirements.lock`, pip-tools, or automatic dependency update merge policy is introduced.
+未声明许可证。使用、分发或商用前请先确认仓库所有者授权。
