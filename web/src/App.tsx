@@ -32,7 +32,7 @@ import {
   TrendingUp,
   Wallet,
 } from "lucide-react";
-import { dashboardHeaders, fetchMarketChart, fetchStatus, postAction, postPositionClose } from "./api";
+import { dashboardHeaders, fetchMarketChart, fetchStatus, fetchTrades, postAction, postPositionClose } from "./api";
 import {
   actionLabel,
   asNumber,
@@ -71,6 +71,8 @@ import type {
   SettingsTabKey,
   TabKey,
   TradeItem,
+  TradeJournalPage,
+  TradeRoundTrip,
 } from "./types";
 
 const DEFAULT_SETTINGS: SettingsState = {
@@ -78,8 +80,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   trade_market_mode: "futures_preferred",
   futures_margin_type: "ISOLATED",
   order_quote_amount: "50",
-  max_open_positions: "1",
-  leverage_multiplier: "10",
+  max_open_positions: "15",
+  leverage_multiplier: "3",
   contract_max_margin_loss_pct: "20",
   liquidation_stop_buffer_pct: "2",
   contract_simulation_enabled: true,
@@ -176,7 +178,8 @@ const STRATEGY_PRESETS = {
     cooldown_minutes: "30",
     max_daily_trades: "5",
     max_daily_loss_usdt: "25",
-    max_open_positions: "5",
+    max_open_positions: "15",
+    leverage_multiplier: "3",
     fee_rate_pct: "0.1",
     slippage_pct: "0.05",
   },
@@ -187,7 +190,8 @@ const STRATEGY_PRESETS = {
     cooldown_minutes: "15",
     max_daily_trades: "8",
     max_daily_loss_usdt: "40",
-    max_open_positions: "10",
+    max_open_positions: "20",
+    leverage_multiplier: "5",
     fee_rate_pct: "0.1",
     slippage_pct: "0.08",
   },
@@ -205,6 +209,7 @@ const CHART_RANGES: ChartRangeKey[] = ["1H", "6H", "24H", "7D", "30D"];
 const SETTINGS_STORAGE_KEY = "dashboard-settings";
 const SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY = "dashboard-settings-browser-default-v1";
 const SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY = "dashboard-settings-contract-default-v1";
+const SETTINGS_PRESET_DEFAULT_MIGRATION_KEY = "dashboard-settings-preset-default-v1";
 const FAVORITES_STORAGE_KEY = "dashboard-favorite-symbols";
 
 function App() {
@@ -224,6 +229,11 @@ function App() {
   const [chartError, setChartError] = useState("");
   const [positionsExpanded, setPositionsExpanded] = useState(false);
   const [favoriteSymbols, setFavoriteSymbols] = useState<string[]>(() => loadFavoriteSymbols());
+  const [tradeView, setTradeView] = useState<"round_trips" | "events">("round_trips");
+  const [tradeOffset, setTradeOffset] = useState(0);
+  const [tradePage, setTradePage] = useState<TradeJournalPage | null>(null);
+  const [tradeLoading, setTradeLoading] = useState(false);
+  const [tradeError, setTradeError] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -252,6 +262,25 @@ function App() {
       setSettingsHydrated(true);
     }
   }, [settingsHydrated, status?.config]);
+
+  const loadTrades = useCallback(async () => {
+    setTradeLoading(true);
+    setTradeError("");
+    try {
+      const page = await fetchTrades(tradeView, 25, tradeOffset);
+      setTradePage(page);
+    } catch (error) {
+      setTradeError(error instanceof Error ? error.message : "交易记录加载失败");
+    } finally {
+      setTradeLoading(false);
+    }
+  }, [tradeOffset, tradeView]);
+
+  useEffect(() => {
+    if (activeTab === "trades") {
+      loadTrades();
+    }
+  }, [activeTab, loadTrades, status?.state?.trade_journal?.event_count, status?.state?.trade_journal?.round_trip_count]);
 
   useEffect(() => {
     localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favoriteSymbols));
@@ -682,7 +711,23 @@ function App() {
               settings={settings}
             />
           )}
-          {activeTab === "trades" && <TradesPanel stats={performance} trades={trades} />}
+          {activeTab === "trades" && (
+            <TradesPanel
+              stats={tradePage?.stats || performance}
+              fallbackTrades={trades}
+              page={tradePage}
+              view={tradeView}
+              offset={tradeOffset}
+              loading={tradeLoading}
+              error={tradeError}
+              onViewChange={(view) => {
+                setTradeView(view);
+                setTradeOffset(0);
+              }}
+              onPageChange={setTradeOffset}
+              onRefresh={loadTrades}
+            />
+          )}
           {activeTab === "security" && (
             <SecurityStatusPanel
               safety={safety}
@@ -942,6 +987,26 @@ function normalizeSymbol(symbol?: Primitive): string {
 
 function marketTypeLabel(value?: string): string {
   return value === "futures" ? "合约" : "现货";
+}
+
+function positionModeText(item: { dry_run?: boolean | Primitive; market_type?: string; position_mode?: string }): string {
+  const isDryRun = Boolean(item.dry_run);
+  const market = item.market_type === "futures" || item.position_mode === "contract-sim" || item.position_mode === "futures-live" ? "合约" : "现货";
+  return `${market}${isDryRun ? "模拟" : "实盘"}`;
+}
+
+function durationText(value?: Primitive): string {
+  const seconds = asNumber(value);
+  if (seconds === null || seconds <= 0) {
+    return "--";
+  }
+  if (seconds < 3600) {
+    return `${trimNumber(seconds / 60, 0)} 分钟`;
+  }
+  if (seconds < 86400) {
+    return `${trimNumber(seconds / 3600, 1)} 小时`;
+  }
+  return `${trimNumber(seconds / 86400, 1)} 天`;
 }
 
 function tradingViewChartUrl(symbol: string): string {
@@ -1569,14 +1634,42 @@ function MiniSparkline({ tone, seed }: { tone: "positive" | "warning"; seed: num
   );
 }
 
-function TradesPanel({ stats, trades }: { stats: PerformanceStats | null; trades: TradeItem[] }) {
+function TradesPanel({
+  stats,
+  fallbackTrades,
+  page,
+  view,
+  offset,
+  loading,
+  error,
+  onViewChange,
+  onPageChange,
+  onRefresh,
+}: {
+  stats: PerformanceStats | null | undefined;
+  fallbackTrades: TradeItem[];
+  page: TradeJournalPage | null;
+  view: "round_trips" | "events";
+  offset: number;
+  loading: boolean;
+  error: string;
+  onViewChange: (view: "round_trips" | "events") => void;
+  onPageChange: (offset: number) => void;
+  onRefresh: () => void;
+}) {
   const quote = stats?.quote_asset || "USDT";
-  const recent = trades.slice(-10).reverse();
   const tradeCount = stats?.trade_count ?? stats?.completed_trades ?? 0;
+  const eventCount = stats?.event_count ?? page?.total ?? fallbackTrades.length;
+  const items = page?.items || [];
+  const total = Number(page?.total ?? 0);
+  const limit = Number(page?.limit ?? 25) || 25;
+  const canPrev = offset > 0;
+  const canNext = offset + limit < total;
+  const fallbackRecent = fallbackTrades.slice(-10).reverse();
   return (
     <div className="stack-panel">
       <div className="stats-grid">
-        <StatTile label="交易次数" value={trimNumber(tradeCount, 0)} detail={`胜 ${stats?.wins ?? 0} · 负 ${stats?.losses ?? 0}`} />
+        <StatTile label="完整交易" value={trimNumber(tradeCount, 0)} detail={`动作流水 ${trimNumber(eventCount, 0)}`} />
         <StatTile label="胜率" value={formatPercent(stats?.win_rate ?? 0)} detail={`盈亏比 ${stats?.profit_factor == null ? "--" : trimNumber(stats.profit_factor, 2, 2)}`} />
         <StatTile label="总盈亏" value={signedMoney(stats?.total_pnl ?? 0, quote)} detail={`最大回撤 ${formatMoney(stats?.max_drawdown ?? 0, quote)}`} tone={Number(stats?.total_pnl || 0) < 0 ? "danger" : "success"} />
         <StatTile label="平均盈亏" value={signedMoney(stats?.avg_pnl ?? 0, quote)} detail={`平均收益 ${signedPercent(stats?.avg_return_pct ?? 0)}`} tone={Number(stats?.avg_pnl || 0) < 0 ? "danger" : "success"} />
@@ -1585,49 +1678,128 @@ function TradesPanel({ stats, trades }: { stats: PerformanceStats | null; trades
         <StatTile label="毛利润" value={formatMoney(stats?.gross_profit ?? 0, quote)} detail={`毛亏损 ${formatMoney(stats?.gross_loss ?? 0, quote)}`} tone="success" />
         <StatTile label="当前连续" value={trimNumber(stats?.current_streak ?? 0, 0)} detail={streakLabel(stats?.current_streak_type)} />
       </div>
-      {!recent.length ? (
-        <EmptyState title="暂无交易记录" text="模拟或实盘成交后，这里会显示最近 10 笔动作。" />
-      ) : (
-        <div className="table-shell">
-          <table>
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>模式</th>
-                <th>动作</th>
-                <th>标的</th>
-                <th>数量</th>
-                <th>价格</th>
-                <th>手续费</th>
-                <th>成交额</th>
-              </tr>
-            </thead>
-            <tbody>
-              {recent.map((item, index) => {
-                const action = item.action || "";
-                const isBuy = action.includes("BUY");
-                const isDryRun = Boolean(item.dry_run);
-                return (
-                  <tr key={`${item.ts || "trade"}-${index}`}>
-                    <td>{formatTime(item.ts)}</td>
-                    <td>
-                      <span className={`pill ${isDryRun ? "tone-warning" : "tone-danger"}`}>{isDryRun ? "模拟" : "实盘"}</span>
-                    </td>
-                    <td>
-                      <span className={`pill ${isBuy ? "tone-success" : "tone-danger"}`}>{actionLabel(action)}</span>
-                    </td>
-                    <td className="symbol-cell">{item.symbol || "--"}</td>
-                    <td className="mono">{formatQty(item.quantity)}</td>
-                    <td className="mono">{formatPrice(item.price)}</td>
-                    <td className="mono">{formatMoney(item.fee_amount, item.fee_asset || "")}</td>
-                    <td className="mono">{formatMoney(tradeAmount(item), "")}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+      <div className="trade-toolbar">
+        <div className="segmented-control" aria-label="交易记录视图">
+          <button type="button" className={view === "round_trips" ? "is-active" : ""} onClick={() => onViewChange("round_trips")}>
+            完整交易
+          </button>
+          <button type="button" className={view === "events" ? "is-active" : ""} onClick={() => onViewChange("events")}>
+            动作流水
+          </button>
         </div>
+        <div className="trade-pager">
+          <button className="action-button icon-only" type="button" disabled={loading} onClick={onRefresh} title="刷新交易记录">
+            <RefreshCw size={16} />
+          </button>
+          <button className="action-button" type="button" disabled={!canPrev || loading} onClick={() => onPageChange(Math.max(0, offset - limit))}>
+            上一页
+          </button>
+          <span>
+            {total ? `${offset + 1}-${Math.min(offset + limit, total)} / ${total}` : "0 / 0"}
+          </span>
+          <button className="action-button" type="button" disabled={!canNext || loading} onClick={() => onPageChange(offset + limit)}>
+            下一页
+          </button>
+        </div>
+      </div>
+      {error ? <p className="negative">交易记录加载失败：{error}</p> : null}
+      {loading && !items.length ? (
+        <EmptyState title="正在加载交易记录" text="从本地复盘数据库读取分页数据。" />
+      ) : view === "round_trips" && items.length ? (
+        <TradeRoundTripTable items={items as TradeRoundTrip[]} quote={quote} />
+      ) : view === "events" && items.length ? (
+        <TradeEventTable items={items as TradeItem[]} quote={quote} />
+      ) : fallbackRecent.length ? (
+        <TradeEventTable items={fallbackRecent} quote={quote} />
+      ) : (
+        <EmptyState title="暂无交易记录" text="模拟或实盘成交后，这里会显示完整交易和动作流水。" />
       )}
+    </div>
+  );
+}
+
+function TradeRoundTripTable({ items, quote }: { items: TradeRoundTrip[]; quote: string }) {
+  return (
+    <div className="table-shell">
+      <table>
+        <thead>
+          <tr>
+            <th>平仓时间</th>
+            <th>模式</th>
+            <th>标的</th>
+            <th>数量</th>
+            <th>入场价</th>
+            <th>平仓价</th>
+            <th>盈亏</th>
+            <th>收益率</th>
+            <th>退出原因</th>
+            <th>持仓时长</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item, index) => {
+            const pnl = asNumber(item.pnl) || 0;
+            return (
+              <tr key={`${item.id || item.exit_time || "round"}-${index}`}>
+                <td>{formatTime(item.exit_time)}</td>
+                <td><span className={`pill ${Boolean(item.dry_run) ? "tone-warning" : "tone-danger"}`}>{positionModeText(item)}</span></td>
+                <td className="symbol-cell">{item.symbol || "--"}</td>
+                <td className="mono">{formatQty(item.quantity)}</td>
+                <td className="mono">{formatPrice(item.entry_price)}</td>
+                <td className="mono">{formatPrice(item.exit_price)}</td>
+                <td className={pnl < 0 ? "negative mono" : "positive mono"}>{signedMoney(item.pnl, quote)}</td>
+                <td className={pnl < 0 ? "negative mono" : "positive mono"}>{signedPercent(item.return_pct)}</td>
+                <td><span className="pill tone-danger">{actionLabel(item.exit_reason)}</span></td>
+                <td>{durationText(item.duration_seconds)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TradeEventTable({ items, quote }: { items: TradeItem[]; quote: string }) {
+  return (
+    <div className="table-shell">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>模式</th>
+            <th>动作</th>
+            <th>标的</th>
+            <th>数量</th>
+            <th>价格</th>
+            <th>手续费</th>
+            <th>成交额</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item, index) => {
+            const action = item.action || "";
+            const isBuy = action.includes("BUY");
+            const isDryRun = Boolean(item.dry_run);
+            return (
+              <tr key={`${item.id || item.ts || "trade"}-${index}`}>
+                <td>{formatTime(item.ts)}</td>
+                <td>
+                  <span className={`pill ${isDryRun ? "tone-warning" : "tone-danger"}`}>{positionModeText(item)}</span>
+                </td>
+                <td>
+                  <span className={`pill ${isBuy ? "tone-success" : "tone-danger"}`}>{actionLabel(action)}</span>
+                </td>
+                <td className="symbol-cell">{item.symbol || "--"}</td>
+                <td className="mono">{formatQty(item.quantity)}</td>
+                <td className="mono">{formatPrice(item.price)}</td>
+                <td className="mono">{formatMoney(item.fee_amount, item.fee_asset || quote)}</td>
+                <td className="mono">{formatMoney(tradeAmount(item), quote)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -1955,7 +2127,7 @@ function SettingsPanel({
             <SettingsField {...fieldProps} name="trade_market_mode" label="交易市场模式" help="futures_preferred=合约优先；futures_only=仅合约；spot_only=仅现货。" />
             <SettingsField {...fieldProps} name="futures_margin_type" label="合约保证金模式" help="默认 ISOLATED 逐仓；也可填 CROSSED 全仓。" />
             <SettingsField {...fieldProps} name="order_quote_amount" label="单笔金额" type="number" min="1" step="1" />
-            <SettingsField {...fieldProps} name="max_open_positions" label="最大持仓数" type="number" min="1" step="1" help="允许同时持有的仓位数量；保守默认为 1，标准预设为 5，激进预设为 10。" />
+            <SettingsField {...fieldProps} name="max_open_positions" label="最大持仓数" type="number" min="1" step="1" help="允许同时持有的仓位数量；保守默认为 1，标准预设为 15，激进预设为 20。" />
             <SettingsField {...fieldProps} name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="合约优先模式下用于 USDT-M 合约实盘和 dry-run 合约模拟；现货兜底时不使用杠杆。" />
             <SettingsField {...fieldProps} name="state_file" label="状态文件" full />
             <div className="toggle-grid is-full">
@@ -2242,6 +2414,13 @@ function loadSavedSettings(): Partial<SettingsState> {
       parsed.contract_simulation_enabled = parsed.contract_simulation_enabled !== false;
       localStorage.setItem(SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY, "1");
     }
+    if (!localStorage.getItem(SETTINGS_PRESET_DEFAULT_MIGRATION_KEY)) {
+      if (parsed.leverage_multiplier === "10") parsed.leverage_multiplier = DEFAULT_SETTINGS.leverage_multiplier;
+      if (parsed.max_open_positions === "10" || parsed.max_open_positions === "5" || parsed.max_open_positions === "1") {
+        parsed.max_open_positions = DEFAULT_SETTINGS.max_open_positions;
+      }
+      localStorage.setItem(SETTINGS_PRESET_DEFAULT_MIGRATION_KEY, "1");
+    }
     const allowedKeys = new Set(Object.keys(DEFAULT_SETTINGS));
     return Object.fromEntries(Object.entries(parsed).filter(([key]) => allowedKeys.has(key))) as Partial<SettingsState>;
   } catch {
@@ -2266,6 +2445,7 @@ function saveSettings(settings: SettingsState) {
   localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   localStorage.setItem(SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY, "1");
   localStorage.setItem(SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY, "1");
+  localStorage.setItem(SETTINGS_PRESET_DEFAULT_MIGRATION_KEY, "1");
 }
 
 function formatDefaultFixedStop(value: number): string {

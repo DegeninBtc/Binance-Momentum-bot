@@ -69,11 +69,11 @@ npm run build
 $env:BINANCE_API_KEY="你的 API Key"
 $env:BINANCE_API_SECRET="你的 API Secret"
 $env:ORDER_QUOTE_USDT="50"
-$env:MAX_OPEN_POSITIONS="1"
+$env:MAX_OPEN_POSITIONS="15"
 $env:TRADE_MARKET_MODE="futures_preferred"
 $env:FUTURES_BASE_URL="https://fapi.binance.com"
 $env:FUTURES_MARGIN_TYPE="ISOLATED"
-$env:LEVERAGE_MULTIPLIER="10"
+$env:LEVERAGE_MULTIPLIER="3"
 $env:CONTRACT_MAX_MARGIN_LOSS_PCT="20"
 $env:LIQUIDATION_STOP_BUFFER_PCT="2"
 $env:MIN_PRICE_CHANGE_PERCENT="3"
@@ -126,14 +126,14 @@ http://127.0.0.1:8787/
 设置页支持策略参数预设：
 
 - `保守`：提高入场门槛、收紧日内限制，默认只允许 1 个仓位。
-- `标准`：沿用当前默认参数，适合先做模拟观察。
-- `激进`：降低入场门槛、放宽持仓和日内限制，默认最多 3 个仓位。
+- `标准`：沿用当前默认筛选参数，预设杠杆 `3x`，最多 `15` 个仓位。
+- `激进`：降低入场门槛、放宽持仓和日内限制，预设杠杆 `5x`，最多 `20` 个仓位。
 
 首页持仓区域会展示当前持仓的入场价、有效止损价、止盈价和现价价格线；多仓位时，状态卡会显示主仓位并标记额外仓位数量。
 
 交易市场模式默认 `TRADE_MARKET_MODE=futures_preferred`：同一标的同时有 USDT-M 合约和现货时优先使用合约；只有现货时才回退现货。也可以设置为 `futures_only` 或 `spot_only`。
 
-杠杆倍数默认 `10` 倍，可在网页“基础”设置里自由调整，或通过 `LEVERAGE_MULTIPLIER` 设置。合约实盘和 dry-run 合约模拟都会按 `单笔保证金 × 杠杆倍数` 计算名义仓位、ROI 和预估强平价；现货 fallback 不使用杠杆。
+标准模式杠杆倍数默认 `3` 倍，可在网页“基础”设置里自由调整，或通过 `LEVERAGE_MULTIPLIER` 设置；激进预设会切换为 `5` 倍。合约实盘和 dry-run 合约模拟都会按 `单笔保证金 × 杠杆倍数` 计算名义仓位、ROI 和预估强平价；现货 fallback 不使用杠杆。
 合约仓位会优先按保证金风险收紧止损，默认 `CONTRACT_MAX_MARGIN_LOSS_PCT=20`、`LIQUIDATION_STOP_BUFFER_PCT=2`；例如 `10x` 下即使配置 `20%` 初始止损，也会收紧为约 `2%` 价格止损，避免止损价低于预估强平价。
 
 通知页支持 Telegram 推送：
@@ -187,7 +187,7 @@ http://127.0.0.1:8787/
 - 每日开仓上限：默认每天最多开仓 `5` 次，可通过 `MAX_DAILY_TRADES` 或网页设置调整；设为 `0` 可关闭。
 - 每日亏损上限：默认当天已实现亏损达到 `25 USDT` 后停止新开仓，可通过 `MAX_DAILY_LOSS_USDT` 或网页设置调整；设为 `0` 可关闭。
 - 绩效统计：网页交易记录页会基于已完成的买入-卖出回合统计胜率、总盈亏、平均盈亏、盈亏比、最大回撤和当前连胜/连亏；未平仓浮盈浮亏不计入已实现绩效。
-- 多仓位管理：默认 `MAX_OPEN_POSITIONS=1`，可在网页设置最大持仓数；系统会跳过已持有币种，直到持仓数量低于上限才继续扫描新开仓。
+- 多仓位管理：标准默认 `MAX_OPEN_POSITIONS=15`，激进预设为 `20`；系统会跳过已持有币种，直到持仓数量低于上限才继续扫描新开仓。
 - 订单安全检查：买入/卖出前会检查 Binance 交易规则中的最小数量、步进精度和最小成交额，避免明显不满足规则的实盘订单被拒绝。
 - dry-run 成本估算：默认按 `0.1%` 手续费和 `0.05%` 滑点估算，买入价格上浮、卖出价格下调，绩效统计使用扣费后的净额；可通过 `FEE_RATE_PCT` / `SLIPPAGE_PCT` 或网页设置调整。
 - 手动平仓：网页提供手动平仓按钮，模拟模式记录 `DRY_RUN_MANUAL_SELL`，实盘模式会二次确认后市价卖出现有仓位。
@@ -327,7 +327,7 @@ docker push yourname/binance-momentum-dashboard:latest
 Use the following commands before committing local safety or dashboard changes:
 
 ````powershell
-python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py .\tools\analyze_trade_journal.py .\tools\export_trade_journal.py
 python .\tests\test_safety_and_risk.py
 npm ci
 npm run build
@@ -346,6 +346,7 @@ $env:DASHBOARD_AUTH_TOKEN="your-local-token"
 - Web `preview` and `run-once` write one record with Square confidence, post summaries, candidate scores, entry confirmation, K-line/orderbook checks, account risk, and final decision.
 - Records are redacted and must not contain API keys, API secrets, Telegram tokens, or full account balance details.
 - `signal_records.jsonl` is ignored by Git.
+- `trade_journal.sqlite3` is ignored by Git.
 - Future-return updates only read market data and do not modify `bot_state.json`:
 
 ````powershell
@@ -357,6 +358,24 @@ Analyze the local signal dataset:
 ````powershell
 python .\tools\analyze_signal_records.py .\signal_records.jsonl
 python .\tools\analyze_signal_records.py .\signal_records.jsonl --csv --output .\signal_records.csv
+```
+
+## Trade Journal And Review Database
+
+Long-term trade review data is stored in local SQLite by default: `trade_journal.sqlite3`. `bot_state.json` still stores current runtime state and recent actions; the dashboard trade statistics prefer the SQLite journal so completed-trade counts and visible details can stay aligned.
+
+- `trade_events` records each buy, sell, manual close, stop-loss, take-profit, or account-sync action.
+- `trade_round_trips` pairs buys and sells with FIFO matching and stores PnL, return %, market type, position mode, exit reason, and holding duration.
+- Existing `bot_state.json.trade_log` entries are migrated into SQLite on startup or status refresh.
+- Clearing dry-run positions does not clear the review database by default.
+- The journal does not store API keys, API secrets, Telegram tokens, or full account balances.
+
+Export and analyze the local journal:
+
+````powershell
+python .\tools\analyze_trade_journal.py .\trade_journal.sqlite3
+python .\tools\export_trade_journal.py .\trade_journal.sqlite3 --view round_trips --output .\trade_journal_round_trips.csv
+python .\tools\export_trade_journal.py .\trade_journal.sqlite3 --view events --output .\trade_journal_events.csv
 ```
 
 ## P5 Offline Validation And Replay Draft
@@ -397,7 +416,7 @@ This repository includes a lightweight GitHub Actions baseline in `.github/workf
 It runs the same validation commands recommended for local pre-commit checks:
 
 ````powershell
-python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py .\tools\analyze_trade_journal.py .\tools\export_trade_journal.py
 python .\tests\test_safety_and_risk.py
 npm ci
 npm run build
@@ -458,7 +477,7 @@ GitHub Dependabot is configured in `.github/dependabot.yml` to check dependencie
 Dependabot only opens update PRs. It does not auto-merge, does not run the bot, does not read API keys, and does not change live trading behavior. Review each Dependabot PR manually and require the normal validation baseline before merging:
 
 ````powershell
-python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py
+python -m py_compile .\binance_square_momentum_bot.py .\web_dashboard.py .\tools\analyze_signal_records.py .\tools\replay_signal_records.py .\tools\walk_forward_signal_records.py .\tools\analyze_trade_journal.py .\tools\export_trade_journal.py
 python .\tests\test_safety_and_risk.py
 npm ci
 npm run build

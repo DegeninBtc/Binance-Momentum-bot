@@ -191,6 +191,7 @@ export type PerformanceStats = {
   quote_asset?: string;
   completed_trades?: Primitive;
   trade_count?: Primitive;
+  event_count?: Primitive;
   wins?: Primitive;
   losses?: Primitive;
   win_rate?: Primitive;
@@ -205,18 +206,65 @@ export type PerformanceStats = {
   max_drawdown?: Primitive;
   current_streak?: Primitive;
   current_streak_type?: string;
+  journal_enabled?: boolean;
+  journal_file?: string;
 };
 
 export type TradeItem = {
+  id?: Primitive;
+  event_uid?: string;
   ts?: string;
   dry_run?: boolean;
   action?: string;
   symbol?: string;
+  market_type?: string;
+  position_mode?: string;
   quantity?: Primitive;
   price?: Primitive;
   fee_amount?: Primitive;
   fee_asset?: string;
   quote_amount?: Primitive;
+};
+
+export type TradeRoundTrip = {
+  id?: Primitive;
+  entry_event_id?: Primitive;
+  exit_event_id?: Primitive;
+  symbol?: string;
+  market_type?: string;
+  position_mode?: string;
+  dry_run?: boolean | Primitive;
+  entry_time?: string;
+  exit_time?: string;
+  quantity?: Primitive;
+  entry_price?: Primitive;
+  exit_price?: Primitive;
+  entry_amount?: Primitive;
+  exit_amount?: Primitive;
+  fee_amount?: Primitive;
+  pnl?: Primitive;
+  return_pct?: Primitive;
+  exit_reason?: string;
+  duration_seconds?: Primitive;
+};
+
+export type TradeJournalSummary = {
+  enabled?: boolean;
+  file?: string;
+  event_count?: Primitive;
+  round_trip_count?: Primitive;
+  error?: string;
+};
+
+export type TradeJournalPage = {
+  view?: "round_trips" | "events";
+  items?: Array<TradeItem | TradeRoundTrip>;
+  total?: Primitive;
+  limit?: Primitive;
+  offset?: Primitive;
+  db_path?: string;
+  stats?: PerformanceStats;
+  error?: string;
 };
 
 export type PendingOrder = {
@@ -407,6 +455,7 @@ export type BotState = {
   entry_confirmation?: EntryConfirmation | null;
   square_confidence?: SquareConfidence | null;
   account_risk_snapshot?: AccountRiskSnapshot | null;
+  trade_journal?: TradeJournalSummary | null;
   trade_log?: TradeItem[];
   completed_round_trips?: Primitive;
 };

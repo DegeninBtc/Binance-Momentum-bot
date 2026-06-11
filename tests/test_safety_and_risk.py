@@ -511,6 +511,78 @@ def test_signal_recording_and_analysis() -> None:
         assert "should-not-appear" not in json.dumps(walk)
 
 
+def test_trade_journal_migration_stats_and_pagination() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        journal_path = str(Path(tmp) / "trade_journal.sqlite3")
+        trade_log = [
+            {
+                "ts": "2026-06-10T00:00:00+00:00",
+                "action": "BUY",
+                "symbol": "ABCUSDT",
+                "quantity": "10",
+                "price": "5",
+                "quote_amount": "50",
+                "dry_run": True,
+                "market_type": bot.MARKET_FUTURES,
+                "position_mode": "contract-sim",
+            },
+            {
+                "ts": "2026-06-10T00:10:00+00:00",
+                "action": "DRY_RUN_STOP_SELL",
+                "symbol": "ABCUSDT",
+                "quantity": "10",
+                "price": "4.8",
+                "quote_amount": "48",
+                "dry_run": True,
+                "market_type": bot.MARKET_FUTURES,
+                "position_mode": "contract-sim",
+            },
+        ]
+        bot.migrate_trade_log_to_journal(journal_path, trade_log)
+        stats = bot.trade_journal_stats(journal_path, "USDT")
+        assert stats is not None
+        assert stats["trade_count"] == 1
+        assert stats["event_count"] == 2
+        assert str(stats["total_pnl"]) == "-2"
+
+        rounds = bot.query_trade_journal(journal_path, "round_trips", 10, 0)
+        assert rounds["total"] == 1
+        assert rounds["items"][0]["symbol"] == "ABCUSDT"
+        assert rounds["items"][0]["market_type"] == bot.MARKET_FUTURES
+        assert rounds["items"][0]["exit_reason"] == "DRY_RUN_STOP_SELL"
+
+        events = bot.query_trade_journal(journal_path, "events", 1, 0)
+        assert events["total"] == 2
+        assert len(events["items"]) == 1
+
+        manual_log = [
+            {
+                "ts": "2026-06-10T01:00:00+00:00",
+                "action": "BUY",
+                "symbol": "XYZUSDT",
+                "quantity": "5",
+                "price": "10",
+                "quote_amount": "50",
+                "dry_run": True,
+            },
+            {
+                "ts": "2026-06-10T01:05:00+00:00",
+                "action": "DRY_RUN_MANUAL_SELL",
+                "symbol": "XYZUSDT",
+                "quantity": "5",
+                "price": "11",
+                "quote_amount": "55",
+                "dry_run": True,
+            },
+        ]
+        bot.migrate_trade_log_to_journal(journal_path, manual_log)
+        stats = bot.trade_journal_stats(journal_path, "USDT")
+        assert stats is not None
+        assert stats["trade_count"] == 2
+        rounds = bot.query_trade_journal(journal_path, "round_trips", 10, 0)
+        assert any(item["exit_reason"] == "DRY_RUN_MANUAL_SELL" for item in rounds["items"])
+
+
 if __name__ == "__main__":
     test_state_migration_and_client_order_id()
     test_live_confirm_and_dashboard_auth()
@@ -518,4 +590,5 @@ if __name__ == "__main__":
     test_symbol_scoring_rounding_and_dry_run_fill()
     test_account_risk_guards()
     test_signal_recording_and_analysis()
+    test_trade_journal_migration_stats_and_pagination()
     print("safety and risk tests passed")

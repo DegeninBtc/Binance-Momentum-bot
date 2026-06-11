@@ -17,9 +17,11 @@ import math
 import os
 import re
 import signal
+import sqlite3
 import sys
 import time
 from collections import Counter
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -40,6 +42,7 @@ except ImportError:  # The scraper can still extract from raw HTML without bs4.
 LOGGER = logging.getLogger("square-momentum-bot")
 DEFAULT_STATE_FILE = "bot_state.json"
 DEFAULT_SIGNAL_RECORD_FILE = "signal_records.jsonl"
+DEFAULT_TRADE_JOURNAL_FILE = "trade_journal.sqlite3"
 DEFAULT_BASE_URL = "https://api.binance.com"
 DEFAULT_FUTURES_BASE_URL = "https://fapi.binance.com"
 DEFAULT_FUTURES_TESTNET_BASE_URL = "https://demo-fapi.binance.com"
@@ -167,8 +170,8 @@ class BotConfig:
     trade_market_mode: str = "futures_preferred"
     futures_margin_type: str = "ISOLATED"
     order_quote_amount: Decimal = Decimal("50")
-    max_open_positions: int = 1
-    leverage_multiplier: Decimal = Decimal("10")
+    max_open_positions: int = 15
+    leverage_multiplier: Decimal = Decimal("3")
     contract_simulation_enabled: bool = True
     contract_max_margin_loss_pct: Decimal = Decimal("20")
     liquidation_stop_buffer_pct: Decimal = Decimal("2")
@@ -213,6 +216,7 @@ class BotConfig:
     oco_stop_limit_slippage_pct: Decimal = Decimal("0.5")
     signal_recording_enabled: bool = True
     signal_record_file: str = DEFAULT_SIGNAL_RECORD_FILE
+    trade_journal_file: str = DEFAULT_TRADE_JOURNAL_FILE
     state_file: str = DEFAULT_STATE_FILE
     dry_run: bool = True
     square_urls: tuple[str, ...] = DEFAULT_SQUARE_URLS
@@ -1016,6 +1020,7 @@ class LongOnlyMomentumBot:
         self.client = self.spot_client
         self.square = BinanceSquareScraper(build_retry_session(), config.square_urls)
         self.state = load_state(config.state_file)
+        migrate_trade_log_to_journal(config.trade_journal_file, self.state.trade_log)
         self._load_square_feed_state()
         self._sync_legacy_position()
         self.stop_requested = False
@@ -1044,10 +1049,10 @@ class LongOnlyMomentumBot:
         return MARKET_FUTURES if candidate.market_type == MARKET_FUTURES else MARKET_SPOT
 
     def _position_market_type(self, position: PositionState) -> str:
-        if position.market_type in {MARKET_FUTURES, MARKET_SPOT}:
-            return position.market_type
         if position.position_mode in {"futures-live", "contract-sim"}:
             return MARKET_FUTURES
+        if position.market_type in {MARKET_FUTURES, MARKET_SPOT}:
+            return position.market_type
         return MARKET_SPOT
 
     def _position_is_futures_live(self, position: PositionState) -> bool:
@@ -2476,10 +2481,15 @@ class LongOnlyMomentumBot:
         fee_amount: Decimal | None = None,
         quote_amount: Decimal | None = None,
     ) -> None:
+        position = next((item for item in self._active_positions() if item.symbol == symbol), None)
+        market_type = self._position_market_type(position) if position else MARKET_SPOT
+        position_mode = position.position_mode if position else ""
         record = {
             "ts": utc_now(),
             "action": action,
             "symbol": symbol,
+            "market_type": market_type,
+            "position_mode": position_mode,
             "quantity": format_decimal(quantity),
             "price": format_decimal(price),
             "dry_run": self.config.dry_run,
@@ -2490,6 +2500,11 @@ class LongOnlyMomentumBot:
             record["fee_asset"] = self.config.quote_asset
         if quote_amount is not None:
             record["quote_amount"] = format_decimal(quote_amount)
+        record["event_uid"] = trade_event_uid(record)
+        try:
+            insert_trade_event(self.config.trade_journal_file, record)
+        except Exception as exc:
+            LOGGER.warning("trade journal write failed: %s", exc)
         self.state.trade_log.append(record)
         self.state.trade_log = self.state.trade_log[-100:]
 
@@ -3093,6 +3108,359 @@ def current_loss_streak(trade_log: list[dict[str, Any]]) -> int:
     return streak
 
 
+def trade_journal_enabled(path: str) -> bool:
+    return bool(str(path or "").strip())
+
+
+def trade_journal_path(path: str) -> Path:
+    return Path(str(path or DEFAULT_TRADE_JOURNAL_FILE)).expanduser()
+
+
+def trade_event_uid(record: dict[str, Any]) -> str:
+    raw = "|".join(
+        str(record.get(key, ""))
+        for key in ("ts", "action", "symbol", "quantity", "price", "quote_amount", "dry_run")
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def ensure_trade_journal(path: str) -> None:
+    if not trade_journal_enabled(path):
+        return
+    db_path = trade_journal_path(path)
+    if db_path.parent and str(db_path.parent) not in {"", "."}:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS journal_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_uid TEXT NOT NULL UNIQUE,
+                ts TEXT NOT NULL,
+                action TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                market_type TEXT NOT NULL DEFAULT '',
+                position_mode TEXT NOT NULL DEFAULT '',
+                dry_run INTEGER NOT NULL DEFAULT 1,
+                quantity TEXT NOT NULL DEFAULT '0',
+                price TEXT NOT NULL DEFAULT '0',
+                fee_amount TEXT NOT NULL DEFAULT '',
+                fee_asset TEXT NOT NULL DEFAULT '',
+                quote_amount TEXT NOT NULL DEFAULT '',
+                order_json TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_round_trips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_event_id INTEGER NOT NULL,
+                exit_event_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                market_type TEXT NOT NULL DEFAULT '',
+                position_mode TEXT NOT NULL DEFAULT '',
+                dry_run INTEGER NOT NULL DEFAULT 1,
+                entry_time TEXT NOT NULL,
+                exit_time TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                entry_price TEXT NOT NULL,
+                exit_price TEXT NOT NULL,
+                entry_amount TEXT NOT NULL,
+                exit_amount TEXT NOT NULL,
+                fee_amount TEXT NOT NULL DEFAULT '',
+                pnl TEXT NOT NULL,
+                return_pct TEXT NOT NULL,
+                exit_reason TEXT NOT NULL DEFAULT '',
+                duration_seconds INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_ts ON trade_events(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_symbol ON trade_events(symbol)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_round_trips_exit_time ON trade_round_trips(exit_time)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_round_trips_symbol ON trade_round_trips(symbol)")
+        conn.commit()
+
+
+def insert_trade_event(path: str, record: dict[str, Any], rebuild: bool = True) -> None:
+    if not trade_journal_enabled(path):
+        return
+    ensure_trade_journal(path)
+    db_path = trade_journal_path(path)
+    event_uid = str(record.get("event_uid") or trade_event_uid(record))
+    record["event_uid"] = event_uid
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO trade_events (
+                event_uid, ts, action, symbol, market_type, position_mode, dry_run,
+                quantity, price, fee_amount, fee_asset, quote_amount, order_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_uid,
+                str(record.get("ts") or utc_now()),
+                str(record.get("action") or ""),
+                str(record.get("symbol") or ""),
+                str(record.get("market_type") or ""),
+                str(record.get("position_mode") or ""),
+                1 if bool(record.get("dry_run", True)) else 0,
+                str(record.get("quantity") or "0"),
+                str(record.get("price") or "0"),
+                str(record.get("fee_amount") or ""),
+                str(record.get("fee_asset") or ""),
+                str(record.get("quote_amount") or ""),
+                json.dumps(record.get("order") or {}, ensure_ascii=False, default=str),
+                utc_now(),
+            ),
+        )
+        conn.commit()
+    if rebuild:
+        rebuild_trade_round_trips(path)
+
+
+def migrate_trade_log_to_journal(path: str, trade_log: list[dict[str, Any]]) -> None:
+    if not trade_journal_enabled(path) or not trade_log:
+        return
+    ensure_trade_journal(path)
+    for item in trade_log:
+        if isinstance(item, dict):
+            insert_trade_event(path, dict(item), rebuild=False)
+    rebuild_trade_round_trips(path)
+    db_path = trade_journal_path(path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO journal_meta (key, value) VALUES ('state_trade_log_migrated', '1')"
+        )
+        conn.commit()
+
+
+def rebuild_trade_round_trips(path: str) -> None:
+    if not trade_journal_enabled(path):
+        return
+    ensure_trade_journal(path)
+    db_path = trade_journal_path(path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        events = [dict(row) for row in conn.execute("SELECT * FROM trade_events ORDER BY ts ASC, id ASC")]
+        completed = build_round_trips_from_events(events)
+        conn.execute("DELETE FROM trade_round_trips")
+        conn.executemany(
+            """
+            INSERT INTO trade_round_trips (
+                entry_event_id, exit_event_id, symbol, market_type, position_mode, dry_run,
+                entry_time, exit_time, quantity, entry_price, exit_price, entry_amount,
+                exit_amount, fee_amount, pnl, return_pct, exit_reason, duration_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item["entry_event_id"],
+                    item["exit_event_id"],
+                    item["symbol"],
+                    item["market_type"],
+                    item["position_mode"],
+                    1 if item["dry_run"] else 0,
+                    item["entry_time"],
+                    item["exit_time"],
+                    item["quantity"],
+                    item["entry_price"],
+                    item["exit_price"],
+                    item["entry_amount"],
+                    item["exit_amount"],
+                    item["fee_amount"],
+                    item["pnl"],
+                    item["return_pct"],
+                    item["exit_reason"],
+                    item["duration_seconds"],
+                )
+                for item in completed
+            ],
+        )
+        conn.commit()
+
+
+def build_round_trips_from_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    completed: list[dict[str, Any]] = []
+    open_trades: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        action = str(event.get("action") or "")
+        symbol = str(event.get("symbol") or "")
+        qty = decimal_from_any(event.get("quantity"))
+        price = decimal_from_any(event.get("price"))
+        if not symbol or qty is None or price is None or qty <= 0:
+            continue
+        amount = decimal_from_any(event.get("quote_amount")) or qty * price
+        if "BUY" in action:
+            open_trades.setdefault(symbol, []).append(
+                {
+                    "event_id": int(event.get("id") or 0),
+                    "symbol": symbol,
+                    "qty": qty,
+                    "amount": amount,
+                    "price": price,
+                    "ts": str(event.get("ts") or ""),
+                    "dry_run": bool(event.get("dry_run", 1)),
+                    "market_type": str(event.get("market_type") or ""),
+                    "position_mode": str(event.get("position_mode") or ""),
+                    "fee_amount": decimal_from_any(event.get("fee_amount")) or Decimal("0"),
+                }
+            )
+            continue
+        if "SELL" not in action or not open_trades.get(symbol):
+            continue
+        remaining_sell_qty = qty
+        queue = open_trades[symbol]
+        while remaining_sell_qty > 0 and queue:
+            open_trade = queue[0]
+            open_qty = open_trade["qty"]
+            closed_qty = min(open_qty, remaining_sell_qty)
+            ratio = closed_qty / qty if qty > 0 else Decimal("1")
+            open_ratio = closed_qty / open_qty if open_qty > 0 else Decimal("1")
+            exit_amount = amount * ratio
+            entry_amount = open_trade["amount"] * open_ratio
+            fee_amount = (decimal_from_any(event.get("fee_amount")) or Decimal("0")) * ratio
+            pnl = exit_amount - entry_amount
+            return_pct = pnl / entry_amount * Decimal("100") if entry_amount > 0 else Decimal("0")
+            entry_time = str(open_trade.get("ts") or "")
+            exit_time = str(event.get("ts") or "")
+            opened_at = parse_timestamp(entry_time)
+            closed_at = parse_timestamp(exit_time)
+            duration = int((closed_at - opened_at).total_seconds()) if opened_at and closed_at else 0
+            completed.append(
+                {
+                    "entry_event_id": int(open_trade["event_id"]),
+                    "exit_event_id": int(event.get("id") or 0),
+                    "symbol": symbol,
+                    "market_type": open_trade.get("market_type") or str(event.get("market_type") or ""),
+                    "position_mode": open_trade.get("position_mode") or str(event.get("position_mode") or ""),
+                    "dry_run": bool(open_trade.get("dry_run", True)),
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "quantity": format_decimal(closed_qty),
+                    "entry_price": format_decimal(open_trade["price"]),
+                    "exit_price": format_decimal(price),
+                    "entry_amount": format_decimal(entry_amount),
+                    "exit_amount": format_decimal(exit_amount),
+                    "fee_amount": format_decimal(fee_amount),
+                    "pnl": format_decimal(pnl),
+                    "return_pct": format_decimal(return_pct),
+                    "exit_reason": action,
+                    "duration_seconds": duration,
+                }
+            )
+            open_trade["qty"] = open_qty - closed_qty
+            open_trade["amount"] = open_trade["amount"] - entry_amount
+            remaining_sell_qty -= closed_qty
+            if open_trade["qty"] <= 0:
+                queue.pop(0)
+    return completed
+
+
+def query_trade_journal(path: str, view: str = "round_trips", limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    if not trade_journal_enabled(path):
+        return {"view": view, "items": [], "total": 0, "limit": limit, "offset": offset}
+    ensure_trade_journal(path)
+    db_path = trade_journal_path(path)
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    normalized_view = "events" if view == "events" else "round_trips"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        if normalized_view == "events":
+            total = int(conn.execute("SELECT COUNT(*) FROM trade_events").fetchone()[0])
+            rows = conn.execute(
+                "SELECT * FROM trade_events ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        else:
+            total = int(conn.execute("SELECT COUNT(*) FROM trade_round_trips").fetchone()[0])
+            rows = conn.execute(
+                "SELECT * FROM trade_round_trips ORDER BY exit_time DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+    return {
+        "view": normalized_view,
+        "items": [dict(row) for row in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "db_path": str(db_path),
+    }
+
+
+def trade_journal_stats(path: str, quote_asset: str) -> dict[str, Any] | None:
+    if not trade_journal_enabled(path):
+        return None
+    ensure_trade_journal(path)
+    db_path = trade_journal_path(path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(row) for row in conn.execute("SELECT * FROM trade_round_trips ORDER BY exit_time ASC, id ASC")]
+        event_count = int(conn.execute("SELECT COUNT(*) FROM trade_events").fetchone()[0])
+    if not rows:
+        return None
+    pnls = [decimal_from_any(item.get("pnl")) or Decimal("0") for item in rows]
+    returns = [decimal_from_any(item.get("return_pct")) or Decimal("0") for item in rows]
+    wins = [pnl for pnl in pnls if pnl > 0]
+    losses = [pnl for pnl in pnls if pnl < 0]
+    total = len(rows)
+    total_pnl = sum(pnls, Decimal("0"))
+    gross_profit = sum(wins, Decimal("0"))
+    gross_loss = sum((-pnl for pnl in losses), Decimal("0"))
+    avg_pnl = total_pnl / total if total else Decimal("0")
+    avg_return_pct = sum(returns, Decimal("0")) / total if total else Decimal("0")
+    win_rate = Decimal(len(wins)) / Decimal(total) * Decimal("100") if total else Decimal("0")
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+    equity = Decimal("0")
+    peak = Decimal("0")
+    max_drawdown = Decimal("0")
+    current_streak = 0
+    current_streak_type = ""
+    for pnl in pnls:
+        equity += pnl
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+        if pnl > 0:
+            current_streak = current_streak + 1 if current_streak_type == "win" else 1
+            current_streak_type = "win"
+        elif pnl < 0:
+            current_streak = current_streak + 1 if current_streak_type == "loss" else 1
+            current_streak_type = "loss"
+    return {
+        "quote_asset": quote_asset,
+        "completed_trades": total,
+        "trade_count": total,
+        "event_count": event_count,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "avg_pnl": avg_pnl,
+        "avg_return_pct": avg_return_pct,
+        "profit_factor": profit_factor,
+        "best_trade": max(pnls, default=Decimal("0")),
+        "worst_trade": min(pnls, default=Decimal("0")),
+        "max_drawdown": max_drawdown,
+        "current_streak": current_streak,
+        "current_streak_type": current_streak_type,
+        "journal_enabled": True,
+        "journal_file": str(db_path),
+    }
+
+
 def symbol_order_rules(exchange_info: dict[str, Any], symbol: str) -> OrderRules:
     rules = OrderRules(symbol=symbol)
     for item in exchange_info.get("symbols", []):
@@ -3593,7 +3961,7 @@ def load_config(args: argparse.Namespace) -> BotConfig:
     fixed_stop_loss_usdt = decimal_env("FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
         fixed_stop_loss_usdt = default_fixed_stop_loss_usdt(order_quote_amount)
-    leverage_multiplier = decimal_env("LEVERAGE_MULTIPLIER", "10") or Decimal("10")
+    leverage_multiplier = decimal_env("LEVERAGE_MULTIPLIER", "3") or Decimal("3")
     if leverage_multiplier <= 0:
         raise ValueError("LEVERAGE_MULTIPLIER must be greater than zero")
 
@@ -3606,7 +3974,7 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         trade_market_mode=normalize_trade_market_mode(os.getenv("TRADE_MARKET_MODE", "futures_preferred")),
         futures_margin_type=os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED").strip().upper() or "ISOLATED",
         order_quote_amount=order_quote_amount,
-        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
+        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "15")),
         leverage_multiplier=leverage_multiplier,
         contract_simulation_enabled=bool_env("CONTRACT_SIMULATION_ENABLED", True),
         contract_max_margin_loss_pct=decimal_env("CONTRACT_MAX_MARGIN_LOSS_PCT", "20") or Decimal("20"),
@@ -3652,6 +4020,7 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         oco_stop_limit_slippage_pct=decimal_env("OCO_STOP_LIMIT_SLIPPAGE_PCT", "0.5") or Decimal("0.5"),
         signal_recording_enabled=bool_env("SIGNAL_RECORDING_ENABLED", True),
         signal_record_file=os.getenv("SIGNAL_RECORD_FILE", DEFAULT_SIGNAL_RECORD_FILE),
+        trade_journal_file=os.getenv("TRADE_JOURNAL_FILE", DEFAULT_TRADE_JOURNAL_FILE),
         state_file=os.getenv("STATE_FILE", DEFAULT_STATE_FILE),
         dry_run=not args.live,
         square_urls=square_urls,

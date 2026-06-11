@@ -1306,6 +1306,25 @@ input:focus-visible {
   overflow-x: auto;
 }
 
+.trade-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.trade-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 750;
+}
+
 table {
   width: 100%;
   min-width: 1040px;

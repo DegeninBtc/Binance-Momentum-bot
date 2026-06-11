@@ -6,6 +6,9 @@ npm-debug.log*
 dashboard.*.log
 bot_state.json
 signal_records.jsonl
+trade_journal.sqlite3
+trade_journal.sqlite3-*
+trade_journal_*.csv
 bot_state.json.tmp
 skills/
 install_cautious_coding_skill.bat

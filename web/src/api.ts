@@ -1,4 +1,4 @@
-import type { ChartRangeKey, DashboardStatus, MarketChart, SettingsState } from "./types";
+import type { ChartRangeKey, DashboardStatus, MarketChart, SettingsState, TradeJournalPage } from "./types";
 
 async function readJsonResponse<T extends { error?: string }>(response: Response): Promise<T> {
   const text = await response.text();
@@ -53,4 +53,10 @@ export async function fetchMarketChart(symbol: string, range: ChartRangeKey, tes
   const params = new URLSearchParams({ symbol, range, testnet: String(testnet) });
   const response = await fetch(`/api/market-chart?${params.toString()}`, { cache: "no-store" });
   return readJsonResponse<MarketChart>(response);
+}
+
+export async function fetchTrades(view: "round_trips" | "events", limit: number, offset: number): Promise<TradeJournalPage> {
+  const params = new URLSearchParams({ view, limit: String(limit), offset: String(offset) });
+  const response = await fetch(`/api/trades?${params.toString()}`, { cache: "no-store" });
+  return readJsonResponse<TradeJournalPage>(response);
 }

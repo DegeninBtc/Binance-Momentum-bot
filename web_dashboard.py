@@ -697,8 +697,29 @@ def safe_load_state(path: str) -> dict[str, Any]:
 
 def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunner) -> dict[str, Any]:
     enriched = dict(state)
+    module = bot_module()
+    try:
+        module.migrate_trade_log_to_journal(config.trade_journal_file, state.get("trade_log") or [])
+    except Exception as exc:
+        LOGGER.warning("trade journal migration failed: %s", exc)
     enriched["entry_guard_snapshot"] = stringify_decimals(build_entry_guard_snapshot(state, config))
-    enriched["performance_stats"] = stringify_decimals(build_performance_stats(state, config.quote_asset))
+    journal_stats = None
+    try:
+        journal_stats = module.trade_journal_stats(config.trade_journal_file, config.quote_asset)
+    except Exception as exc:
+        LOGGER.warning("trade journal stats failed: %s", exc)
+    enriched["performance_stats"] = stringify_decimals(journal_stats or build_performance_stats(state, config.quote_asset))
+    try:
+        journal_events = module.query_trade_journal(config.trade_journal_file, "events", 1, 0)
+        journal_rounds = module.query_trade_journal(config.trade_journal_file, "round_trips", 1, 0)
+        enriched["trade_journal"] = {
+            "enabled": True,
+            "file": config.trade_journal_file,
+            "event_count": journal_events.get("total", 0),
+            "round_trip_count": journal_rounds.get("total", 0),
+        }
+    except Exception as exc:
+        enriched["trade_journal"] = {"enabled": False, "file": config.trade_journal_file, "error": str(exc)}
     enriched["safety_snapshot"] = stringify_decimals(build_safety_snapshot(state, config, runner))
     enriched["account_risk_snapshot"] = stringify_decimals(build_account_risk_snapshot(state, config, runner))
 
@@ -720,6 +741,15 @@ def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunne
     enriched["position_snapshot"] = stringify_decimals(snapshots[0])
     enriched["position_snapshots"] = stringify_decimals(snapshots)
     return enriched
+
+
+def build_trade_journal_response(config: Any, view: str, limit: int, offset: int) -> dict[str, Any]:
+    module = bot_module()
+    state = safe_load_state(config.state_file)
+    module.migrate_trade_log_to_journal(config.trade_journal_file, state.get("trade_log") or [])
+    payload = module.query_trade_journal(config.trade_journal_file, view, limit, offset)
+    payload["stats"] = stringify_decimals(module.trade_journal_stats(config.trade_journal_file, config.quote_asset) or {})
+    return stringify_decimals(payload)
 
 
 def build_safety_snapshot(state: dict[str, Any], config: Any, runner: BotRunner) -> dict[str, Any]:
@@ -1162,7 +1192,7 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
     fixed_stop_loss_usdt = optional_decimal(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
         fixed_stop_loss_usdt = module.default_fixed_stop_loss_usdt(order_quote_amount)
-    leverage_multiplier = decimal_value(payload, "leverage_multiplier", "LEVERAGE_MULTIPLIER", "10")
+    leverage_multiplier = decimal_value(payload, "leverage_multiplier", "LEVERAGE_MULTIPLIER", "3")
     if leverage_multiplier <= 0:
         raise ValueError("leverage_multiplier must be greater than zero")
 
@@ -1175,7 +1205,7 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         trade_market_mode=module.normalize_trade_market_mode(str(payload.get("trade_market_mode") or os.getenv("TRADE_MARKET_MODE", "futures_preferred"))),
         futures_margin_type=str(payload.get("futures_margin_type") or os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED")).strip().upper() or "ISOLATED",
         order_quote_amount=order_quote_amount,
-        max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 1),
+        max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 15),
         leverage_multiplier=leverage_multiplier,
         contract_simulation_enabled=bool_value(payload, "contract_simulation_enabled", True),
         contract_max_margin_loss_pct=decimal_value(payload, "contract_max_margin_loss_pct", "CONTRACT_MAX_MARGIN_LOSS_PCT", "20"),
@@ -1221,6 +1251,7 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         oco_stop_limit_slippage_pct=decimal_value(payload, "oco_stop_limit_slippage_pct", "OCO_STOP_LIMIT_SLIPPAGE_PCT", "0.5"),
         signal_recording_enabled=bool_value(payload, "signal_recording_enabled", True),
         signal_record_file=str(payload.get("signal_record_file") or os.getenv("SIGNAL_RECORD_FILE", module.DEFAULT_SIGNAL_RECORD_FILE)),
+        trade_journal_file=str(payload.get("trade_journal_file") or os.getenv("TRADE_JOURNAL_FILE", module.DEFAULT_TRADE_JOURNAL_FILE)),
         state_file=str(payload.get("state_file") or os.getenv("STATE_FILE", "bot_state.json")),
         dry_run=not bool(payload.get("live")),
         square_urls=square_urls,
@@ -1406,6 +1437,17 @@ def make_handler(runner: BotRunner, bound_host: str = DEFAULT_HOST) -> type[Base
                 return
             if route == "/api/defaults":
                 self._send_json(sanitize_config(config_from_payload({})))
+                return
+            if route == "/api/trades":
+                params = parse_qs(parsed.query)
+                try:
+                    config = config_from_payload({})
+                    view = (params.get("view") or ["round_trips"])[-1]
+                    limit = int((params.get("limit") or ["50"])[-1])
+                    offset = int((params.get("offset") or ["0"])[-1])
+                    self._send_json(build_trade_journal_response(config, view, limit, offset))
+                except (ValueError, RuntimeError) as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             if route == "/api/market-chart":
                 params = parse_qs(parsed.query)
