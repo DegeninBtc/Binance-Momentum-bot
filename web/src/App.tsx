@@ -80,6 +80,7 @@ const DEFAULT_SETTINGS: SettingsState = {
   trade_market_mode: "futures_preferred",
   futures_margin_type: "ISOLATED",
   order_quote_amount: "50",
+  dry_run_initial_equity_usdt: "750",
   max_open_positions: "15",
   leverage_multiplier: "3",
   contract_max_margin_loss_pct: "20",
@@ -327,7 +328,7 @@ function App() {
   const favoriteSet = useMemo(() => new Set(favoriteSymbols), [favoriteSymbols]);
 
   const riskTone = useMemo(() => {
-    if (hasError || snapshot?.stop_triggered || guard?.entry_blocked) {
+    if (hasError || snapshot?.liquidation_triggered || snapshot?.stop_triggered || guard?.entry_blocked) {
       return "danger";
     }
     if (snapshot?.take_profit_triggered) {
@@ -337,7 +338,7 @@ function App() {
       return "warning";
     }
     return "success";
-  }, [guard?.entry_blocked, hasError, keysLoaded, liveMode, running, snapshot?.stop_triggered, snapshot?.take_profit_triggered]);
+  }, [guard?.entry_blocked, hasError, keysLoaded, liveMode, running, snapshot?.liquidation_triggered, snapshot?.stop_triggered, snapshot?.take_profit_triggered]);
 
   useEffect(() => {
     if (!heroSymbol) {
@@ -873,7 +874,7 @@ function SafetyPanel({
           <span>账户风控</span>
           <strong>{accountRisk ? (accountRisk.entry_blocked ? "阻止" : "正常") : "等待"}</strong>
           <small>
-            {accountRisk?.reason || `敞口 ${formatPercent(accountRisk?.total_exposure_pct ?? 0)} · 建议 ${formatMoney(accountRisk?.risk_based_quote_suggestion ?? 0, textValue(accountRisk?.quote_asset) || "USDT")}`}
+            {accountRisk?.entry_blocked && accountRisk.reason ? accountRisk.reason : accountRiskCapacitySummary(accountRisk)}
           </small>
         </div>
       </div>
@@ -1278,10 +1279,11 @@ function PositionDetailCard({
         <PositionFact label="现价" value={formatPrice(item.snapshot?.current_price)} />
         <PositionFact label={isContractSim ? "名义仓位" : "最高"} value={isContractSim ? formatMoney(item.snapshot?.notional_quote, quoteAsset) : formatPrice(item.highestPrice)} />
         <PositionFact label="有效止损" value={formatPrice(item.snapshot?.dynamic_stop_price)} tone={item.snapshot?.stop_triggered ? "danger" : undefined} />
-        <PositionFact label={isContractSim ? "预估强平" : "止盈价"} value={isContractSim ? formatPrice(item.snapshot?.liquidation_price) : formatPrice(item.snapshot?.take_profit_price)} tone={item.snapshot?.take_profit_triggered ? "success" : undefined} />
+        <PositionFact label={isContractSim ? "预估强平" : "止盈价"} value={isContractSim ? formatPrice(item.snapshot?.liquidation_price) : formatPrice(item.snapshot?.take_profit_price)} tone={item.snapshot?.liquidation_triggered ? "danger" : item.snapshot?.take_profit_triggered ? "success" : undefined} />
         <PositionFact label={isContractSim ? "保证金" : "投入金额"} value={formatMoney(isContractSim ? item.snapshot?.margin_quote : item.quoteSpent, quoteAsset)} />
         <PositionFact label="开仓时间" value={item.openedAt ? formatTime(item.openedAt) : "--"} />
         {isContractSim ? <PositionFact label="配置止损" value={configuredStopValue} tone={item.snapshot?.stop_guard_tightened ? "danger" : undefined} /> : null}
+        {isContractSim ? <PositionFact label="距强平" value={formatPercent(item.snapshot?.liquidation_distance_pct)} tone={item.snapshot?.liquidation_triggered ? "danger" : undefined} /> : null}
         {isContractSim ? <PositionFact label="强平保护" value={bufferValue} tone={item.snapshot?.stop_guard_tightened ? "danger" : undefined} /> : null}
       </div>
       {isContractSim && stopGuardWarning ? <p className="position-risk-warning">{stopGuardWarning}</p> : null}
@@ -1571,6 +1573,12 @@ function StrategyPanel({
     { title: "风控退出", detail: "止损、止盈、保本、移动止损和日内风控。", tab: "risk" },
     { title: "运行模式", detail: "循环秒数、测试网、实盘和浏览器抓广场。", tab: "runtime" },
   ];
+  const simulatedEquity = asNumber(settings.dry_run_initial_equity_usdt);
+  const leverage = asNumber(settings.leverage_multiplier);
+  const maxDryRunNotional =
+    settings.contract_simulation_enabled && simulatedEquity !== null && leverage !== null
+      ? simulatedEquity * leverage
+      : null;
   return (
     <div className="strategy-panel">
       <section className="strategy-hero">
@@ -1599,6 +1607,7 @@ function StrategyPanel({
           {settings.contract_simulation_enabled ? `合约模拟 ${settings.leverage_multiplier}x` : "现货模拟"}
           {" · "}最大持仓 {settings.max_open_positions}
           {" · "}单笔保证金 {settings.order_quote_amount} {settings.quote_asset}
+          {maxDryRunNotional !== null ? ` · 最大名义 ${formatMoney(maxDryRunNotional, settings.quote_asset)}` : ""}
           {" · "}固定止盈 {Number(settings.take_profit_pct) > 0 ? `${settings.take_profit_pct}%` : "关闭"}
         </small>
       </section>
@@ -2127,6 +2136,7 @@ function SettingsPanel({
             <SettingsField {...fieldProps} name="trade_market_mode" label="交易市场模式" help="futures_preferred=合约优先；futures_only=仅合约；spot_only=仅现货。" />
             <SettingsField {...fieldProps} name="futures_margin_type" label="合约保证金模式" help="默认 ISOLATED 逐仓；也可填 CROSSED 全仓。" />
             <SettingsField {...fieldProps} name="order_quote_amount" label="单笔金额" type="number" min="1" step="1" />
+            <SettingsField {...fieldProps} name="dry_run_initial_equity_usdt" label="模拟初始资金 USDT" type="number" min="1" step="1" help="仅用于 dry-run 合约模拟的保证金池；最大名义仓位 = 模拟初始资金 * 杠杆。留空时按单笔金额 * 最大持仓数估算。" />
             <SettingsField {...fieldProps} name="max_open_positions" label="最大持仓数" type="number" min="1" step="1" help="允许同时持有的仓位数量；保守默认为 1，标准预设为 15，激进预设为 20。" />
             <SettingsField {...fieldProps} name="leverage_multiplier" label="杠杆倍数" type="number" min="0.1" step="0.1" help="合约优先模式下用于 USDT-M 合约实盘和 dry-run 合约模拟；现货兜底时不使用杠杆。" />
             <SettingsField {...fieldProps} name="state_file" label="状态文件" full />
@@ -2335,6 +2345,7 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
     trade_market_mode: textValue(config.trade_market_mode) || DEFAULT_SETTINGS.trade_market_mode,
     futures_margin_type: textValue(config.futures_margin_type) || DEFAULT_SETTINGS.futures_margin_type,
     order_quote_amount: textValue(config.order_quote_amount) || DEFAULT_SETTINGS.order_quote_amount,
+    dry_run_initial_equity_usdt: textValue(config.dry_run_initial_equity_usdt) || DEFAULT_SETTINGS.dry_run_initial_equity_usdt,
     max_open_positions: textValue(config.max_open_positions) || DEFAULT_SETTINGS.max_open_positions,
     leverage_multiplier: textValue(config.leverage_multiplier) || DEFAULT_SETTINGS.leverage_multiplier,
     contract_max_margin_loss_pct: textValue(config.contract_max_margin_loss_pct) || DEFAULT_SETTINGS.contract_max_margin_loss_pct,
@@ -2525,9 +2536,23 @@ function positionTotals(positions: PositionView[]) {
   };
 }
 
+function accountRiskCapacitySummary(accountRisk: AccountRiskSnapshot | null): string {
+  const quoteAsset = textValue(accountRisk?.quote_asset) || "USDT";
+  if (accountRisk?.dry_run_max_notional_quote) {
+    return [
+      `最大名义 ${formatMoney(accountRisk.dry_run_max_notional_quote, quoteAsset)}`,
+      `可用保证金 ${formatMoney(accountRisk.available_margin_quote ?? 0, quoteAsset)}`,
+      `可用名义 ${formatMoney(accountRisk.available_notional_quote ?? 0, quoteAsset)}`,
+    ].join(" · ");
+  }
+  return `敞口 ${formatPercent(accountRisk?.total_exposure_pct ?? 0)} · 建议 ${formatMoney(accountRisk?.risk_based_quote_suggestion ?? 0, quoteAsset)}`;
+}
+
 function riskSummary(snapshot: PositionSnapshot | null, guard: EntryGuardSnapshot | null, roundTrips: unknown): string {
   const parts = [];
-  if (snapshot?.stop_triggered) {
+  if (snapshot?.liquidation_triggered) {
+    parts.push("已触发强平");
+  } else if (snapshot?.stop_triggered) {
     parts.push("已触发止损");
   } else if (snapshot?.take_profit_triggered) {
     parts.push("已触发止盈");
@@ -2542,6 +2567,9 @@ function riskSummary(snapshot: PositionSnapshot | null, guard: EntryGuardSnapsho
   }
   if (snapshot?.stop_distance_pct) {
     parts.push(`距止损 ${formatPercent(snapshot.stop_distance_pct)}`);
+  }
+  if (snapshot?.liquidation_distance_pct) {
+    parts.push(`距强平 ${formatPercent(snapshot.liquidation_distance_pct)}`);
   }
   if (snapshot?.take_profit_price) {
     parts.push(`止盈 ${formatPrice(snapshot.take_profit_price)}`);

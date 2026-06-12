@@ -81,6 +81,9 @@ export function actionLabel(action = ""): string {
   if (action.includes("MANUAL")) {
     return "手动平仓";
   }
+  if (action.includes("LIQUIDATION")) {
+    return "模拟爆仓";
+  }
   if (action.includes("SELL")) {
     if (action.includes("TAKE_PROFIT")) {
       return "止盈卖出";

@@ -299,6 +299,10 @@ def test_futures_preferred_candidate_pool_and_reduce_only_order() -> None:
 def test_contract_sim_effective_stop_loss_guard() -> None:
     entry = Decimal("0.51401088")
 
+    assert bot.estimated_liquidation_price(Decimal("100"), Decimal("5")) == Decimal("80")
+    assert bot.estimated_liquidation_price(Decimal("100"), Decimal("10")) == Decimal("90")
+    assert bot.estimated_liquidation_price(Decimal("100"), Decimal("20")) == Decimal("95")
+
     cfg = bot.BotConfig(api_key="", api_secret="", initial_stop_loss_pct=Decimal("20"), leverage_multiplier=Decimal("10"))
     stop_price, snapshot = bot.effective_initial_stop_price(cfg, entry, Decimal("10"), True)
     assert snapshot["effective_stop_loss_pct"] == Decimal("2")
@@ -345,6 +349,92 @@ def test_contract_sim_effective_stop_loss_guard() -> None:
     assert trailing_stop > guarded_stop
 
 
+def test_contract_sim_liquidation_closes_dry_run_position() -> None:
+    class FakeFutures:
+        def ticker_price(self, _symbol: str) -> Decimal:
+            return Decimal("94")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = bot.BotConfig(
+            api_key="",
+            api_secret="",
+            state_file=str(Path(tmp) / "state.json"),
+            trade_journal_file=str(Path(tmp) / "journal.sqlite3"),
+            order_quote_amount=Decimal("100"),
+            leverage_multiplier=Decimal("20"),
+            initial_stop_loss_pct=Decimal("20"),
+            contract_max_margin_loss_pct=Decimal("100"),
+            liquidation_stop_buffer_pct=Decimal("0"),
+        )
+        instance = bot.LongOnlyMomentumBot(cfg)
+        instance.futures_client = FakeFutures()
+        instance.state.positions = [
+            bot.PositionState(
+                symbol="ABCUSDT",
+                base_asset="ABC",
+                quantity="200",
+                entry_price="100",
+                highest_price="100",
+                quote_spent="1000",
+                margin_quote="1000",
+                notional_quote="20000",
+                leverage_multiplier="20",
+                market_type=bot.MARKET_FUTURES,
+                position_mode="contract-sim",
+            )
+        ]
+        instance.state.position = instance.state.positions[0]
+        instance.state.trade_log = [
+            {
+                "ts": bot.utc_now(),
+                "action": "BUY",
+                "symbol": "ABCUSDT",
+                "quantity": "200",
+                "price": "100",
+                "quote_amount": "1000",
+                "dry_run": True,
+            }
+        ]
+
+        instance._manage_single_position(instance.state.positions[0])
+
+        assert instance._active_positions() == []
+        assert instance.state.completed_round_trips == 1
+        assert instance.state.trade_log[-1]["action"] == "DRY_RUN_LIQUIDATION"
+        assert instance.state.trade_log[-1]["price"] == "95"
+        assert instance.state.trade_log[-1]["quote_amount"] == "0"
+        assert instance._daily_trade_stats()["realized_pnl"] == Decimal("-1000")
+
+
+def test_dashboard_position_snapshot_marks_liquidation_risk() -> None:
+    class FakeRunner:
+        def ticker_price_for_status(self, _config, _symbol, _market_type="spot"):
+            return Decimal("94"), ""
+
+    cfg = bot.BotConfig(api_key="", api_secret="", leverage_multiplier=Decimal("20"))
+    state = {"trade_log": [{"symbol": "ABCUSDT", "action": "BUY", "dry_run": True}]}
+    position = {
+        "symbol": "ABCUSDT",
+        "base_asset": "ABC",
+        "quantity": "200",
+        "entry_price": "100",
+        "highest_price": "100",
+        "quote_spent": "1000",
+        "margin_quote": "1000",
+        "notional_quote": "20000",
+        "leverage_multiplier": "20",
+        "market_type": bot.MARKET_FUTURES,
+        "position_mode": "contract-sim",
+    }
+
+    snapshot = web.build_position_snapshot(position, state, cfg, FakeRunner())
+
+    assert snapshot["liquidation_price"] == Decimal("95.00")
+    assert snapshot["liquidation_triggered"] is True
+    assert snapshot["liquidation_distance_pct"] < Decimal("0")
+    assert snapshot["equity_at_risk"] == Decimal("1000")
+
+
 def test_account_risk_guards() -> None:
     candidate = bot.TradeCandidate(
         symbol="BTCUSDT",
@@ -389,6 +479,65 @@ def test_account_risk_guards() -> None:
         snapshot = bot.LongOnlyMomentumBot(cfg)._account_risk_snapshot(candidate)
         assert Decimal(str(snapshot["fixed_order_quote"])) == Decimal("100")
         assert Decimal(str(snapshot["risk_based_quote_suggestion"])) > Decimal("0")
+
+        cfg = bot.BotConfig(
+            api_key="",
+            api_secret="",
+            state_file=state_path,
+            dry_run_initial_equity_usdt=Decimal("1000"),
+            order_quote_amount=Decimal("600"),
+            leverage_multiplier=Decimal("10"),
+            max_open_positions=3,
+        )
+        instance = bot.LongOnlyMomentumBot(cfg)
+        instance.state.positions = [
+            bot.PositionState(
+                symbol="ETHUSDT",
+                base_asset="ETH",
+                quantity="50",
+                entry_price="100",
+                quote_spent="500",
+                margin_quote="500",
+                notional_quote="5000",
+                leverage_multiplier="10",
+                market_type=bot.MARKET_FUTURES,
+                position_mode="contract-sim",
+            )
+        ]
+        futures_candidate = bot.TradeCandidate(
+            symbol="BTCUSDT",
+            base_asset="BTC",
+            mention_count=1,
+            price_change_percent=Decimal("5"),
+            volatility_percent=Decimal("5"),
+            quote_volume=Decimal("10000000"),
+            last_price=Decimal("100"),
+            market_type=bot.MARKET_FUTURES,
+        )
+        reason = instance._account_risk_guard_reason(futures_candidate)
+        assert reason and "dry-run simulated equity" in reason
+        snapshot = instance.state.account_risk_snapshot
+        assert snapshot["dry_run_max_notional_quote"] == "10000"
+        assert snapshot["proposed_notional_quote"] == "6000"
+        assert snapshot["available_notional_quote"] == "5000"
+
+        cfg = bot.BotConfig(
+            api_key="",
+            api_secret="",
+            state_file=str(Path(tmp) / "empty_state.json"),
+            dry_run_initial_equity_usdt=Decimal("1000"),
+            order_quote_amount=Decimal("1000"),
+            leverage_multiplier=Decimal("3"),
+        )
+        snapshot = bot.LongOnlyMomentumBot(cfg)._account_risk_snapshot(futures_candidate)
+        assert snapshot["dry_run_max_notional_quote"] == "3000"
+        assert snapshot["proposed_notional_quote"] == "3000"
+        assert snapshot["available_notional_quote"] == "3000"
+
+        parsed = web.config_from_payload({"order_quote_amount": "250", "max_open_positions": "4"})
+        assert parsed.dry_run_initial_equity_usdt == Decimal("1000")
+        parsed = web.config_from_payload({"dry_run_initial_equity_usdt": "2500"})
+        assert parsed.dry_run_initial_equity_usdt == Decimal("2500")
 
 
 def test_signal_recording_and_analysis() -> None:
@@ -582,12 +731,47 @@ def test_trade_journal_migration_stats_and_pagination() -> None:
         rounds = bot.query_trade_journal(journal_path, "round_trips", 10, 0)
         assert any(item["exit_reason"] == "DRY_RUN_MANUAL_SELL" for item in rounds["items"])
 
+        liquidation_log = [
+            {
+                "ts": "2026-06-10T02:00:00+00:00",
+                "action": "BUY",
+                "symbol": "LIQUSDT",
+                "quantity": "2",
+                "price": "100",
+                "quote_amount": "50",
+                "dry_run": True,
+                "market_type": bot.MARKET_FUTURES,
+                "position_mode": "contract-sim",
+            },
+            {
+                "ts": "2026-06-10T02:03:00+00:00",
+                "action": "DRY_RUN_LIQUIDATION",
+                "symbol": "LIQUSDT",
+                "quantity": "2",
+                "price": "95",
+                "quote_amount": "0",
+                "dry_run": True,
+                "market_type": bot.MARKET_FUTURES,
+                "position_mode": "contract-sim",
+            },
+        ]
+        bot.migrate_trade_log_to_journal(journal_path, liquidation_log)
+        rounds = bot.query_trade_journal(journal_path, "round_trips", 10, 0)
+        assert any(item["symbol"] == "LIQUSDT" and item["exit_reason"] == "DRY_RUN_LIQUIDATION" for item in rounds["items"])
+        liq_round = next(item for item in rounds["items"] if item["symbol"] == "LIQUSDT")
+        assert liq_round["exit_amount"] == "0"
+        assert liq_round["pnl"] == "-50"
+        assert bot.current_loss_streak(liquidation_log) == 1
+
 
 if __name__ == "__main__":
     test_state_migration_and_client_order_id()
     test_live_confirm_and_dashboard_auth()
     test_signal_reliability_filters()
     test_symbol_scoring_rounding_and_dry_run_fill()
+    test_contract_sim_effective_stop_loss_guard()
+    test_contract_sim_liquidation_closes_dry_run_position()
+    test_dashboard_position_snapshot_marks_liquidation_risk()
     test_account_risk_guards()
     test_signal_recording_and_analysis()
     test_trade_journal_migration_stats_and_pagination()

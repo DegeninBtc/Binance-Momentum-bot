@@ -7,6 +7,7 @@ export type SettingsState = {
   trade_market_mode: string;
   futures_margin_type: string;
   order_quote_amount: string;
+  dry_run_initial_equity_usdt: string;
   max_open_positions: string;
   leverage_multiplier: string;
   contract_max_margin_loss_pct: string;
@@ -156,6 +157,8 @@ export type PositionSnapshot = {
   leveraged_unrealized_pnl_pct?: Primitive;
   leverage_multiplier?: Primitive;
   liquidation_price?: Primitive;
+  liquidation_triggered?: boolean;
+  equity_at_risk?: Primitive;
   active_stop_mode?: string;
   configured_stop_price?: Primitive;
   initial_stop_loss_pct?: Primitive;
@@ -333,6 +336,13 @@ export type AccountRiskSnapshot = {
   reason?: string;
   quote_asset?: string;
   equity_estimate?: Primitive;
+  dry_run_initial_equity?: Primitive;
+  used_margin_quote?: Primitive;
+  available_margin_quote?: Primitive;
+  proposed_margin_quote?: Primitive;
+  dry_run_max_notional_quote?: Primitive;
+  available_notional_quote?: Primitive;
+  proposed_notional_quote?: Primitive;
   total_exposure?: Primitive;
   total_exposure_pct?: Primitive;
   symbol_exposure_pct?: Primitive;

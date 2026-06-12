@@ -785,8 +785,10 @@ def build_safety_snapshot(state: dict[str, Any], config: Any, runner: BotRunner)
 
 def build_account_risk_snapshot(state: dict[str, Any], config: Any, runner: BotRunner) -> dict[str, Any]:
     positions = active_positions_from_state(state)
+    module = bot_module()
     total_exposure = Decimal("0")
     unrealized_pnl = Decimal("0")
+    used_margin_quote = Decimal("0")
     for position in positions:
         qty = decimal_from_state(position.get("quantity")) or Decimal("0")
         entry = decimal_from_state(position.get("entry_price")) or Decimal("0")
@@ -797,12 +799,27 @@ def build_account_risk_snapshot(state: dict[str, Any], config: Any, runner: BotR
         price = current_price or entry
         total_exposure += qty * price
         unrealized_pnl += (price - entry) * qty
-    equity = max(
-        total_exposure + config.order_quote_amount,
-        config.order_quote_amount * Decimal(max(1, config.max_open_positions)),
-    )
+        if (
+            config.dry_run
+            and str(position.get("market_type") or "").lower() == module.MARKET_FUTURES
+            and str(position.get("position_mode") or "").lower() == "contract-sim"
+        ):
+            used_margin_quote += decimal_from_state(position.get("margin_quote")) or decimal_from_state(position.get("quote_spent")) or Decimal("0")
     guard = build_entry_guard_snapshot(state, config)
     realized_pnl = decimal_from_state(guard.get("realized_pnl")) or Decimal("0")
+    dry_run_initial_equity = module.effective_dry_run_initial_equity(config) if config.dry_run else Decimal("0")
+    capacity_leverage = config.leverage_multiplier if config.leverage_multiplier > 0 else Decimal("1")
+    available_margin_quote = dry_run_initial_equity - used_margin_quote if config.dry_run else Decimal("0")
+    dry_run_max_notional_quote = dry_run_initial_equity * capacity_leverage if config.dry_run else Decimal("0")
+    available_notional_quote = available_margin_quote * capacity_leverage if config.dry_run else Decimal("0")
+    equity = (
+        dry_run_initial_equity + realized_pnl + unrealized_pnl
+        if config.dry_run
+        else max(
+            total_exposure + config.order_quote_amount,
+            config.order_quote_amount * Decimal(max(1, config.max_open_positions)),
+        )
+    )
     daily_drawdown = (-realized_pnl if realized_pnl < 0 else Decimal("0")) + (-unrealized_pnl if unrealized_pnl < 0 else Decimal("0"))
     drawdown_pct = daily_drawdown / equity * Decimal("100") if equity > 0 else Decimal("0")
     total_exposure_pct = total_exposure / equity * Decimal("100") if equity > 0 else Decimal("0")
@@ -823,6 +840,13 @@ def build_account_risk_snapshot(state: dict[str, Any], config: Any, runner: BotR
         "reason": "; ".join(reasons) if reasons else "account risk checks passed",
         "quote_asset": config.quote_asset,
         "equity_estimate": equity,
+        "dry_run_initial_equity": dry_run_initial_equity,
+        "used_margin_quote": used_margin_quote,
+        "available_margin_quote": available_margin_quote,
+        "dry_run_max_notional_quote": dry_run_max_notional_quote,
+        "available_notional_quote": available_notional_quote,
+        "proposed_margin_quote": Decimal("0"),
+        "proposed_notional_quote": Decimal("0"),
         "total_exposure": total_exposure,
         "total_exposure_pct": total_exposure_pct,
         "realized_pnl_today": realized_pnl,
@@ -1107,12 +1131,9 @@ def build_position_snapshot(
         else price_change_pct
     )
     leveraged_unrealized_pnl_pct = price_change_pct * leverage_multiplier
-    liquidation_price = (
-        entry_price * (Decimal("1") - (Decimal("1") / leverage_multiplier))
-        if is_contract_sim and leverage_multiplier > 0
-        else None
-    )
+    liquidation_price = bot_module().estimated_liquidation_price(entry_price, leverage_multiplier) if is_contract_sim else None
     unrealized_loss = max(Decimal("0"), -unrealized_pnl)
+    liquidation_triggered = bool(liquidation_price is not None and current_price <= liquidation_price)
     stop_triggered = (
         unrealized_loss >= config.fixed_stop_loss_usdt
         if fixed_stop_enabled
@@ -1121,6 +1142,11 @@ def build_position_snapshot(
     stop_triggered = stop_triggered or current_price <= dynamic_stop_price
     take_profit_triggered = config.take_profit_pct > 0 and dynamic_stop_mode != "trailing" and current_price >= take_profit_price
     stop_distance_pct = (current_price - dynamic_stop_price) / current_price * Decimal("100") if current_price > 0 else None
+    liquidation_distance_pct = (
+        (current_price - liquidation_price) / current_price * Decimal("100")
+        if current_price > 0 and liquidation_price is not None
+        else None
+    )
     take_profit_distance_pct = (
         (take_profit_price - current_price) / current_price * Decimal("100")
         if current_price > 0 and not take_profit_triggered
@@ -1134,6 +1160,9 @@ def build_position_snapshot(
             "price_change_pct": price_change_pct,
             "leveraged_unrealized_pnl_pct": leveraged_unrealized_pnl_pct,
             "liquidation_price": liquidation_price,
+            "liquidation_triggered": liquidation_triggered,
+            "liquidation_distance_pct": liquidation_distance_pct,
+            "equity_at_risk": margin_quote if is_contract_sim else quote_spent,
             "unrealized_loss": unrealized_loss,
             "stop_distance_pct": stop_distance_pct,
             "stop_triggered": stop_triggered,
@@ -1189,6 +1218,10 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
     base_url = "https://testnet.binance.vision" if testnet else os.getenv("BINANCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
     futures_base_url = DEFAULT_FUTURES_TESTNET_BASE_URL if testnet else os.getenv("FUTURES_BASE_URL", DEFAULT_FUTURES_BASE_URL).rstrip("/")
     order_quote_amount = decimal_value(payload, "order_quote_amount", "ORDER_QUOTE_USDT", "50")
+    max_open_positions = int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 15)
+    dry_run_initial_equity_usdt = optional_decimal(payload, "dry_run_initial_equity_usdt", "DRY_RUN_INITIAL_EQUITY_USDT")
+    if dry_run_initial_equity_usdt is None:
+        dry_run_initial_equity_usdt = module.default_dry_run_initial_equity_usdt(order_quote_amount, max_open_positions)
     fixed_stop_loss_usdt = optional_decimal(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
         fixed_stop_loss_usdt = module.default_fixed_stop_loss_usdt(order_quote_amount)
@@ -1205,7 +1238,8 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         trade_market_mode=module.normalize_trade_market_mode(str(payload.get("trade_market_mode") or os.getenv("TRADE_MARKET_MODE", "futures_preferred"))),
         futures_margin_type=str(payload.get("futures_margin_type") or os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED")).strip().upper() or "ISOLATED",
         order_quote_amount=order_quote_amount,
-        max_open_positions=int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 15),
+        dry_run_initial_equity_usdt=dry_run_initial_equity_usdt,
+        max_open_positions=max_open_positions,
         leverage_multiplier=leverage_multiplier,
         contract_simulation_enabled=bool_value(payload, "contract_simulation_enabled", True),
         contract_max_margin_loss_pct=decimal_value(payload, "contract_max_margin_loss_pct", "CONTRACT_MAX_MARGIN_LOSS_PCT", "20"),

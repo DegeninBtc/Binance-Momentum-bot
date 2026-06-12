@@ -170,6 +170,7 @@ class BotConfig:
     trade_market_mode: str = "futures_preferred"
     futures_margin_type: str = "ISOLATED"
     order_quote_amount: Decimal = Decimal("50")
+    dry_run_initial_equity_usdt: Decimal | None = None
     max_open_positions: int = 15
     leverage_multiplier: Decimal = Decimal("3")
     contract_simulation_enabled: bool = True
@@ -1292,6 +1293,10 @@ class LongOnlyMomentumBot:
             else (last_price - entry_price) / entry_price * Decimal("100")
         )
         pct_stop, stop_guard = effective_initial_stop_price(self.config, entry_price, leverage_multiplier, contract_simulation)
+        liquidation_price = estimated_liquidation_price(entry_price, leverage_multiplier) if contract_simulation else None
+        if liquidation_price is not None and last_price <= liquidation_price:
+            self._liquidate_contract_sim_position(position, liquidation_price)
+            return
         dynamic_stop, dynamic_stop_mode = self._dynamic_stop_price(entry_price, highest_price, pct_stop)
         take_profit_price = entry_price * (Decimal("1") + self.config.take_profit_pct / Decimal("100"))
         fixed_mode = self._fixed_stop_enabled()
@@ -1335,6 +1340,24 @@ class LongOnlyMomentumBot:
             return
 
         self._close_position(position, last_price, dry_action, live_action, exit_label)
+
+    def _liquidate_contract_sim_position(self, position: PositionState, liquidation_price: Decimal) -> None:
+        symbol = position.symbol
+        qty = Decimal(position.quantity)
+        LOGGER.warning("[dry-run] liquidation triggered for %s at estimated price=%s", symbol, liquidation_price)
+        self._append_trade(
+            "DRY_RUN_LIQUIDATION",
+            symbol,
+            qty,
+            liquidation_price,
+            None,
+            fee_amount=Decimal("0"),
+            quote_amount=Decimal("0"),
+        )
+        self.state.completed_round_trips += 1
+        self._remove_position(symbol)
+        self._touch_state()
+        self._notify(f"[dry-run] liquidation {symbol} qty={qty} price={liquidation_price}")
 
     def manual_close_position(self, symbol: str | None = None, quantity: Decimal | None = None) -> None:
         if not self.config.dry_run:
@@ -2200,6 +2223,7 @@ class LongOnlyMomentumBot:
         position_values: dict[str, Decimal] = {}
         total_exposure = Decimal("0")
         unrealized_pnl = Decimal("0")
+        used_margin_quote = Decimal("0")
         for position in positions:
             qty = Decimal(position.quantity)
             entry_price = Decimal(position.entry_price)
@@ -2211,6 +2235,8 @@ class LongOnlyMomentumBot:
             position_values[position.symbol] = value
             total_exposure += value
             unrealized_pnl += (price - entry_price) * qty
+            if self.config.dry_run and self._position_is_contract_sim(position):
+                used_margin_quote += self._position_margin(position)
 
         quote_balance = Decimal("0")
         if not self.config.dry_run:
@@ -2218,22 +2244,44 @@ class LongOnlyMomentumBot:
                 quote_balance = self._account_asset_balance(self.config.quote_asset)
             except Exception:
                 LOGGER.exception("account risk quote balance lookup failed; using local exposure basis")
-        equity = quote_balance + total_exposure
-        if equity <= 0:
-            equity = max(
-                total_exposure + self.config.order_quote_amount,
-                self.config.order_quote_amount * Decimal(max(1, self.config.max_open_positions)),
-            )
+        stats = self._daily_trade_stats()
+        if self.config.dry_run:
+            dry_run_initial_equity = effective_dry_run_initial_equity(self.config)
+            equity = dry_run_initial_equity + stats["realized_pnl"] + unrealized_pnl
+            dry_run_capacity_leverage = self.config.leverage_multiplier if self.config.leverage_multiplier > 0 else Decimal("1")
+            available_margin_quote = dry_run_initial_equity - used_margin_quote
+            dry_run_max_notional_quote = dry_run_initial_equity * dry_run_capacity_leverage
+            available_notional_quote = available_margin_quote * dry_run_capacity_leverage
+        else:
+            dry_run_initial_equity = Decimal("0")
+            available_margin_quote = Decimal("0")
+            dry_run_max_notional_quote = Decimal("0")
+            available_notional_quote = Decimal("0")
+            equity = quote_balance + total_exposure
+            if equity <= 0:
+                equity = max(
+                    total_exposure + self.config.order_quote_amount,
+                    self.config.order_quote_amount * Decimal(max(1, self.config.max_open_positions)),
+                )
 
         proposed_quote = self.config.order_quote_amount if candidate else Decimal("0")
         if candidate and candidate.market_type == MARKET_FUTURES:
             proposed_quote *= self.config.leverage_multiplier
+        proposed_notional_quote = (
+            proposed_quote
+            if self.config.dry_run and candidate and candidate.market_type == MARKET_FUTURES
+            else Decimal("0")
+        )
+        proposed_margin_quote = (
+            self.config.order_quote_amount
+            if self.config.dry_run and candidate and candidate.market_type == MARKET_FUTURES
+            else Decimal("0")
+        )
         proposed_total_exposure = total_exposure + proposed_quote
         proposed_symbol_exposure = proposed_quote
         if candidate:
             proposed_symbol_exposure += position_values.get(candidate.symbol, Decimal("0"))
 
-        stats = self._daily_trade_stats()
         loss_streak = current_loss_streak(self.state.trade_log)
         daily_unrealized_drawdown = -unrealized_pnl if unrealized_pnl < 0 else Decimal("0")
         daily_drawdown = daily_unrealized_drawdown + (-stats["realized_pnl"] if stats["realized_pnl"] < 0 else Decimal("0"))
@@ -2246,6 +2294,18 @@ class LongOnlyMomentumBot:
             risk_based_quote = risk_budget / (self.config.initial_stop_loss_pct / Decimal("100"))
 
         reasons: list[str] = []
+        if (
+            self.config.dry_run
+            and candidate
+            and candidate.market_type == MARKET_FUTURES
+            and used_margin_quote + proposed_margin_quote > dry_run_initial_equity
+        ):
+            reasons.append(
+                f"dry-run simulated equity {format_decimal(dry_run_initial_equity)} {self.config.quote_asset} "
+                f"at {format_decimal(self.config.leverage_multiplier)}x permits max notional {format_decimal(dry_run_max_notional_quote)}; "
+                f"cannot cover used margin {format_decimal(used_margin_quote)} + proposed margin {format_decimal(proposed_margin_quote)} "
+                f"(notional {format_decimal(total_exposure)} + {format_decimal(proposed_notional_quote)})"
+            )
         if self.config.max_total_exposure_pct > 0 and total_exposure_pct > self.config.max_total_exposure_pct:
             reasons.append(f"total exposure {format_decimal(total_exposure_pct)}% exceeds {self.config.max_total_exposure_pct}%")
         if candidate and self.config.max_symbol_exposure_pct > 0 and symbol_exposure_pct > self.config.max_symbol_exposure_pct:
@@ -2262,6 +2322,13 @@ class LongOnlyMomentumBot:
                 "quote_asset": self.config.quote_asset,
                 "equity_estimate": equity,
                 "quote_balance": quote_balance,
+                "dry_run_initial_equity": dry_run_initial_equity,
+                "used_margin_quote": used_margin_quote,
+                "available_margin_quote": available_margin_quote,
+                "proposed_margin_quote": proposed_margin_quote,
+                "dry_run_max_notional_quote": dry_run_max_notional_quote,
+                "available_notional_quote": available_notional_quote,
+                "proposed_notional_quote": proposed_notional_quote,
                 "total_exposure": total_exposure,
                 "proposed_total_exposure": proposed_total_exposure,
                 "total_exposure_pct": total_exposure_pct,
@@ -2334,7 +2401,7 @@ class LongOnlyMomentumBot:
         cooldown_seconds = self.config.cooldown_minutes * 60
         for item in reversed(self.state.trade_log):
             action = str(item.get("action", ""))
-            if item.get("symbol") != symbol or "SELL" not in action:
+            if item.get("symbol") != symbol or not is_exit_trade_action(action):
                 continue
             closed_at = parse_timestamp(item.get("ts"))
             if closed_at is None:
@@ -2359,12 +2426,12 @@ class LongOnlyMomentumBot:
             price = decimal_from_any(item.get("price"))
             if not symbol or qty is None or price is None:
                 continue
-            amount = decimal_from_any(item.get("quote_amount")) or qty * price
+            amount = trade_quote_amount_or_notional(item, qty, price)
             if "BUY" in action:
                 open_costs.setdefault(symbol, []).append({"qty": qty, "amount": amount})
                 if ts and ts.date() == today:
                     buy_count += 1
-            elif "SELL" in action:
+            elif is_exit_trade_action(action):
                 queue = open_costs.get(symbol) or []
                 remaining_sell_qty = qty
                 while remaining_sell_qty > 0 and queue:
@@ -3067,6 +3134,17 @@ def square_confidence_snapshot(posts: list[SquarePost], diagnostics: dict[str, A
     )
 
 
+def is_exit_trade_action(action: str) -> bool:
+    return "SELL" in action or "LIQUIDATION" in action
+
+
+def trade_quote_amount_or_notional(item: dict[str, Any], qty: Decimal, price: Decimal) -> Decimal:
+    amount = decimal_from_any(item.get("quote_amount"))
+    if amount is not None:
+        return amount
+    return qty * price
+
+
 def current_loss_streak(trade_log: list[dict[str, Any]]) -> int:
     completed: list[Decimal] = []
     open_trades: dict[str, list[dict[str, Decimal]]] = {}
@@ -3077,10 +3155,10 @@ def current_loss_streak(trade_log: list[dict[str, Any]]) -> int:
         price = decimal_from_any(item.get("price"))
         if not symbol or qty is None or price is None:
             continue
-        amount = decimal_from_any(item.get("quote_amount")) or qty * price
+        amount = trade_quote_amount_or_notional(item, qty, price)
         if "BUY" in action:
             open_trades.setdefault(symbol, []).append({"qty": qty, "amount": amount})
-        elif "SELL" in action and open_trades.get(symbol):
+        elif is_exit_trade_action(action) and open_trades.get(symbol):
             queue = open_trades[symbol]
             remaining_sell_qty = qty
             pnl = Decimal("0")
@@ -3300,7 +3378,7 @@ def build_round_trips_from_events(events: list[dict[str, Any]]) -> list[dict[str
         price = decimal_from_any(event.get("price"))
         if not symbol or qty is None or price is None or qty <= 0:
             continue
-        amount = decimal_from_any(event.get("quote_amount")) or qty * price
+        amount = trade_quote_amount_or_notional(event, qty, price)
         if "BUY" in action:
             open_trades.setdefault(symbol, []).append(
                 {
@@ -3317,7 +3395,7 @@ def build_round_trips_from_events(events: list[dict[str, Any]]) -> list[dict[str
                 }
             )
             continue
-        if "SELL" not in action or not open_trades.get(symbol):
+        if not is_exit_trade_action(action) or not open_trades.get(symbol):
             continue
         remaining_sell_qty = qty
         queue = open_trades[symbol]
@@ -3874,6 +3952,22 @@ def default_fixed_stop_loss_usdt(order_quote_amount: Decimal) -> Decimal:
     return max(MIN_FIXED_STOP_LOSS_USDT, order_quote_amount * DEFAULT_FIXED_STOP_LOSS_RATIO)
 
 
+def default_dry_run_initial_equity_usdt(order_quote_amount: Decimal, max_open_positions: int) -> Decimal:
+    return order_quote_amount * Decimal(max(1, max_open_positions))
+
+
+def effective_dry_run_initial_equity(config: BotConfig) -> Decimal:
+    if config.dry_run_initial_equity_usdt is not None:
+        return config.dry_run_initial_equity_usdt
+    return default_dry_run_initial_equity_usdt(config.order_quote_amount, config.max_open_positions)
+
+
+def estimated_liquidation_price(entry_price: Decimal, leverage_multiplier: Decimal) -> Decimal | None:
+    if entry_price <= 0 or leverage_multiplier <= 0:
+        return None
+    return entry_price * (Decimal("1") - (Decimal("1") / leverage_multiplier))
+
+
 def effective_stop_loss_snapshot(config: BotConfig, leverage_multiplier: Decimal, contract_simulation: bool) -> dict[str, Any]:
     configured_pct = max(Decimal("0"), config.initial_stop_loss_pct)
     effective_pct = configured_pct
@@ -3958,6 +4052,10 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         futures_base_url = DEFAULT_FUTURES_TESTNET_BASE_URL
 
     order_quote_amount = decimal_env("ORDER_QUOTE_USDT", "50") or Decimal("50")
+    max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "15"))
+    dry_run_initial_equity_usdt = decimal_env("DRY_RUN_INITIAL_EQUITY_USDT")
+    if dry_run_initial_equity_usdt is None:
+        dry_run_initial_equity_usdt = default_dry_run_initial_equity_usdt(order_quote_amount, max_open_positions)
     fixed_stop_loss_usdt = decimal_env("FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
         fixed_stop_loss_usdt = default_fixed_stop_loss_usdt(order_quote_amount)
@@ -3974,7 +4072,8 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         trade_market_mode=normalize_trade_market_mode(os.getenv("TRADE_MARKET_MODE", "futures_preferred")),
         futures_margin_type=os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED").strip().upper() or "ISOLATED",
         order_quote_amount=order_quote_amount,
-        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "15")),
+        dry_run_initial_equity_usdt=dry_run_initial_equity_usdt,
+        max_open_positions=max_open_positions,
         leverage_multiplier=leverage_multiplier,
         contract_simulation_enabled=bool_env("CONTRACT_SIMULATION_ENABLED", True),
         contract_max_margin_loss_pct=decimal_env("CONTRACT_MAX_MARGIN_LOSS_PCT", "20") or Decimal("20"),
