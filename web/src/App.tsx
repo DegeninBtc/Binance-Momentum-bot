@@ -105,8 +105,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   fixed_stop_loss_usdt: "10",
   fixed_stop_equity_usdt: "",
   cooldown_minutes: "30",
-  max_daily_trades: "5",
-  max_daily_loss_usdt: "25",
+  max_daily_trades: "9999999",
+  max_daily_loss_usdt: "9999999",
   max_total_exposure_pct: "0",
   max_symbol_exposure_pct: "0",
   max_consecutive_losses: "0",
@@ -166,8 +166,8 @@ const STRATEGY_PRESETS = {
     min_volatility_percent: "6",
     min_quote_volume: "10000000",
     cooldown_minutes: "60",
-    max_daily_trades: "3",
-    max_daily_loss_usdt: "15",
+    max_daily_trades: "9999999",
+    max_daily_loss_usdt: "9999999",
     max_open_positions: "1",
     fee_rate_pct: "0.1",
     slippage_pct: "0.08",
@@ -177,8 +177,8 @@ const STRATEGY_PRESETS = {
     min_volatility_percent: "5",
     min_quote_volume: "5000000",
     cooldown_minutes: "30",
-    max_daily_trades: "5",
-    max_daily_loss_usdt: "25",
+    max_daily_trades: "9999999",
+    max_daily_loss_usdt: "9999999",
     max_open_positions: "15",
     leverage_multiplier: "3",
     fee_rate_pct: "0.1",
@@ -189,8 +189,8 @@ const STRATEGY_PRESETS = {
     min_volatility_percent: "4",
     min_quote_volume: "2500000",
     cooldown_minutes: "15",
-    max_daily_trades: "8",
-    max_daily_loss_usdt: "40",
+    max_daily_trades: "9999999",
+    max_daily_loss_usdt: "9999999",
     max_open_positions: "20",
     leverage_multiplier: "5",
     fee_rate_pct: "0.1",
@@ -211,6 +211,7 @@ const SETTINGS_STORAGE_KEY = "dashboard-settings";
 const SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY = "dashboard-settings-browser-default-v1";
 const SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY = "dashboard-settings-contract-default-v1";
 const SETTINGS_PRESET_DEFAULT_MIGRATION_KEY = "dashboard-settings-preset-default-v1";
+const SETTINGS_DRY_RUN_LIMIT_MIGRATION_KEY = "dashboard-settings-dry-run-limits-v1";
 const FAVORITES_STORAGE_KEY = "dashboard-favorite-symbols";
 
 function App() {
@@ -2186,8 +2187,8 @@ function SettingsPanel({
             <SettingsField {...fieldProps} name="fixed_stop_loss_usdt" label="固定止损 USDT" type="number" min="1" step="1" help="仅在固定止损模式启用后生效；建议为单笔金额的 10%-25%。" />
             <SettingsField {...fieldProps} name="fixed_stop_equity_usdt" label="权益触发 USDT" type="number" min="0" step="1" help="留空则不按账户权益切换固定止损。" />
             <SettingsField {...fieldProps} name="cooldown_minutes" label="冷却分钟" type="number" min="0" step="1" help="同一币种卖出后暂停重新开仓；填 0 关闭。" />
-            <SettingsField {...fieldProps} name="max_daily_trades" label="每日最大开仓" type="number" min="0" step="1" help="按 UTC 日期统计买入次数；填 0 关闭。" />
-            <SettingsField {...fieldProps} name="max_daily_loss_usdt" label="每日最大亏损 USDT" type="number" min="0" step="1" help="已实现亏损达到后停止新开仓；填 0 关闭。" full />
+            <SettingsField {...fieldProps} name="max_daily_trades" label="每日最大开仓" type="number" min="0" step="1" help="模拟默认 9999999，基本等同不限制；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="max_daily_loss_usdt" label="每日最大亏损 USDT" type="number" min="0" step="1" help="模拟默认 9999999，基本等同不限制；填 0 关闭。" full />
             <SettingsField {...fieldProps} name="max_total_exposure_pct" label="最大总敞口 %" type="number" min="0" step="1" help="所有持仓加本次拟开仓占权益估算的上限；填 0 关闭。" />
             <SettingsField {...fieldProps} name="max_symbol_exposure_pct" label="最大单币敞口 %" type="number" min="0" step="1" help="单一币种持仓加本次拟开仓占权益估算的上限；填 0 关闭。" />
             <SettingsField {...fieldProps} name="max_consecutive_losses" label="最大连亏次数" type="number" min="0" step="1" help="连续亏损达到该次数后暂停新开仓；填 0 关闭。" />
@@ -2432,6 +2433,15 @@ function loadSavedSettings(): Partial<SettingsState> {
       }
       localStorage.setItem(SETTINGS_PRESET_DEFAULT_MIGRATION_KEY, "1");
     }
+    if (!localStorage.getItem(SETTINGS_DRY_RUN_LIMIT_MIGRATION_KEY)) {
+      if (["3", "5", "8", "100"].includes(String(parsed.max_daily_trades || ""))) {
+        parsed.max_daily_trades = DEFAULT_SETTINGS.max_daily_trades;
+      }
+      if (["15", "25", "40", "999999999"].includes(String(parsed.max_daily_loss_usdt || ""))) {
+        parsed.max_daily_loss_usdt = DEFAULT_SETTINGS.max_daily_loss_usdt;
+      }
+      localStorage.setItem(SETTINGS_DRY_RUN_LIMIT_MIGRATION_KEY, "1");
+    }
     const allowedKeys = new Set(Object.keys(DEFAULT_SETTINGS));
     return Object.fromEntries(Object.entries(parsed).filter(([key]) => allowedKeys.has(key))) as Partial<SettingsState>;
   } catch {
@@ -2457,6 +2467,7 @@ function saveSettings(settings: SettingsState) {
   localStorage.setItem(SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY, "1");
   localStorage.setItem(SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY, "1");
   localStorage.setItem(SETTINGS_PRESET_DEFAULT_MIGRATION_KEY, "1");
+  localStorage.setItem(SETTINGS_DRY_RUN_LIMIT_MIGRATION_KEY, "1");
 }
 
 function formatDefaultFixedStop(value: number): string {

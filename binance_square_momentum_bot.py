@@ -193,8 +193,8 @@ class BotConfig:
     fixed_stop_after_first_round_trip: bool = False
     fixed_stop_equity_usdt: Decimal | None = None
     cooldown_minutes: int = 30
-    max_daily_trades: int = 5
-    max_daily_loss_usdt: Decimal = Decimal("25")
+    max_daily_trades: int = 9999999
+    max_daily_loss_usdt: Decimal = Decimal("9999999")
     max_total_exposure_pct: Decimal = Decimal("0")
     max_symbol_exposure_pct: Decimal = Decimal("0")
     max_consecutive_losses: int = 0
@@ -4095,8 +4095,8 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         fixed_stop_after_first_round_trip=bool_env("FIXED_STOP_AFTER_FIRST_ROUND_TRIP", False),
         fixed_stop_equity_usdt=decimal_env("FIXED_STOP_EQUITY_USDT"),
         cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "30")),
-        max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "5")),
-        max_daily_loss_usdt=decimal_env("MAX_DAILY_LOSS_USDT", "25"),
+        max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "9999999")),
+        max_daily_loss_usdt=decimal_env("MAX_DAILY_LOSS_USDT", "9999999"),
         max_total_exposure_pct=decimal_env("MAX_TOTAL_EXPOSURE_PCT", "0") or Decimal("0"),
         max_symbol_exposure_pct=decimal_env("MAX_SYMBOL_EXPOSURE_PCT", "0") or Decimal("0"),
         max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0")),
