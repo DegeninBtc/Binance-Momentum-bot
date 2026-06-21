@@ -19,6 +19,7 @@ import time
 import webbrowser
 from collections import deque
 from dataclasses import asdict
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -113,6 +114,7 @@ class BotRunner:
         self.bound_host = DEFAULT_HOST
         self.price_cache: dict[str, dict[str, Any]] = {}
         self.safety_cache: dict[str, dict[str, Any]] = {}
+        self.mark_price_cache: Any | None = None
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -359,8 +361,23 @@ class BotRunner:
         self._finish()
 
     def _loop_worker(self, config: Any) -> None:
+        feed = None
+        risk_thread = None
         try:
-            bot = bot_module().LongOnlyMomentumBot(config)
+            module = bot_module()
+            bot = module.LongOnlyMomentumBot(config)
+            if config.dry_run and config.adaptive_exit_enabled:
+                self.mark_price_cache = module.MarkPriceCache()
+                feed = module.MarkPriceWebSocketFeed(self.mark_price_cache)
+                feed.start()
+                bot.external_risk_monitor_active = True
+                risk_thread = threading.Thread(
+                    target=self._risk_monitor_worker,
+                    args=(bot, self.mark_price_cache, config),
+                    daemon=True,
+                    name="adaptive-risk-monitor",
+                )
+                risk_thread.start()
             while not self.stop_event.is_set():
                 cycle_started_at = now_text()
                 with self.lock:
@@ -393,7 +410,25 @@ class BotRunner:
             LOGGER.exception("loop failed")
             self._finish(str(exc))
             return
+        finally:
+            self.stop_event.set()
+            if feed is not None:
+                feed.stop()
+            if risk_thread is not None and risk_thread.is_alive():
+                risk_thread.join(timeout=3)
+            self.mark_price_cache = None
         self._finish()
+
+    def _risk_monitor_worker(self, bot: Any, price_cache: Any, config: Any) -> None:
+        interval = max(0.2, float(config.risk_monitor_interval_seconds))
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            try:
+                bot.monitor_open_positions_once(price_cache, now_monotonic=started)
+            except Exception:
+                LOGGER.exception("adaptive risk monitor cycle failed")
+            elapsed = time.monotonic() - started
+            self.stop_event.wait(max(0.05, interval - elapsed))
 
     def _sync_signal_from_record(self, record: dict[str, Any] | None, checked_at: str) -> None:
         if not record:
@@ -709,9 +744,11 @@ def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunne
     except Exception as exc:
         LOGGER.warning("trade journal stats failed: %s", exc)
     enriched["performance_stats"] = stringify_decimals(journal_stats or build_performance_stats(state, config.quote_asset))
+    if journal_stats is not None:
+        enriched["completed_round_trips"] = int(journal_stats.get("trade_count") or 0)
     try:
         journal_events = module.query_trade_journal(config.trade_journal_file, "events", 1, 0)
-        journal_rounds = module.query_trade_journal(config.trade_journal_file, "round_trips", 1, 0)
+        journal_rounds = module.query_trade_journal(config.trade_journal_file, "complete_trades", 1, 0)
         enriched["trade_journal"] = {
             "enabled": True,
             "file": config.trade_journal_file,
@@ -731,7 +768,7 @@ def enrich_state_for_status(state: dict[str, Any], config: Any, runner: BotRunne
 
     snapshots = [
         snapshot
-        for snapshot in (build_position_snapshot(position, state, config, runner) for position in positions)
+        for snapshot in (build_position_snapshot(position, enriched, config, runner) for position in positions)
         if snapshot
     ]
     if not snapshots:
@@ -747,7 +784,14 @@ def build_trade_journal_response(config: Any, view: str, limit: int, offset: int
     module = bot_module()
     state = safe_load_state(config.state_file)
     module.migrate_trade_log_to_journal(config.trade_journal_file, state.get("trade_log") or [])
-    payload = module.query_trade_journal(config.trade_journal_file, view, limit, offset)
+    effective_view = "complete_trades" if view == "round_trips" else view
+    payload = module.query_trade_journal(
+        config.trade_journal_file,
+        effective_view,
+        limit,
+        offset,
+    )
+    payload["view"] = view
     payload["stats"] = stringify_decimals(module.trade_journal_stats(config.trade_journal_file, config.quote_asset) or {})
     return stringify_decimals(payload)
 
@@ -1005,7 +1049,7 @@ def build_entry_guard_snapshot(state: dict[str, Any], config: Any) -> dict[str, 
             open_costs.setdefault(symbol, []).append({"qty": qty, "amount": amount})
             if ts and ts.date() == today:
                 buy_count += 1
-        elif "SELL" in action:
+        elif bot_module().is_exit_trade_action(action):
             queue = open_costs.get(symbol) or []
             remaining_sell_qty = qty
             while remaining_sell_qty > 0 and queue:
@@ -1082,6 +1126,25 @@ def build_position_snapshot(
         stop_price,
     )
     take_profit_price = entry_price * (Decimal("1") + config.take_profit_pct / Decimal("100"))
+    adaptive_snapshot: dict[str, Any] | None = None
+    if is_dry_run and config.adaptive_exit_enabled and position_mode == "contract-sim":
+        adaptive_snapshot = bot_module().adaptive_exit_snapshot(
+            config,
+            bot_module().position_state_from_raw(position),
+            current_price or highest_price,
+            decimal_from_state(position.get("atr_value")),
+        )
+        if adaptive_snapshot.get("action") not in {"disabled", "invalid_price", "invalid_risk"}:
+            dynamic_stop_price = adaptive_snapshot["active_stop_price"]
+            dynamic_stop_mode = str(adaptive_snapshot["stage"])
+
+    last_market_price_at = str(position.get("last_market_price_at") or "")
+    last_market_timestamp = bot_module().parse_timestamp(last_market_price_at)
+    market_data_age_seconds = (
+        max(Decimal("0"), Decimal(str((datetime.now(timezone.utc) - last_market_timestamp).total_seconds())))
+        if last_market_timestamp is not None
+        else None
+    )
 
     snapshot: dict[str, Any] = {
         "symbol": symbol,
@@ -1117,7 +1180,35 @@ def build_position_snapshot(
         "breakeven_offset_pct": config.breakeven_offset_pct,
         "trailing_start_pct": config.trailing_start_pct,
         "trailing_stop_pct": config.trailing_stop_pct,
+        "trade_id": position.get("trade_id", ""),
+        "initial_quantity": decimal_from_state(position.get("initial_quantity")),
+        "risk_per_unit": decimal_from_state(position.get("risk_per_unit")),
+        "adaptive_active_stop_price": (
+            adaptive_snapshot.get("active_stop_price")
+            if adaptive_snapshot
+            else decimal_from_state(position.get("active_stop_price"))
+        ),
+        "exit_stage": (
+            adaptive_snapshot.get("stage")
+            if adaptive_snapshot
+            else position.get("exit_stage", "")
+        ),
+        "partial_take_profit_done": bool(position.get("partial_take_profit_done")),
+        "atr_value": decimal_from_state(position.get("atr_value")),
+        "realized_pnl": decimal_from_state(position.get("realized_pnl")) or Decimal("0"),
+        "last_market_price_at": last_market_price_at,
+        "market_data_age_seconds": market_data_age_seconds,
     }
+    if adaptive_snapshot:
+        snapshot.update(
+            {
+                "r_multiple": adaptive_snapshot.get("r_multiple"),
+                "peak_drawdown_pct": adaptive_snapshot.get("peak_drawdown_pct"),
+                "next_partial_take_profit_price": adaptive_snapshot.get(
+                    "next_partial_take_profit_price"
+                ),
+            }
+        )
 
     if current_price is None:
         return snapshot
@@ -1140,7 +1231,13 @@ def build_position_snapshot(
         else current_price <= dynamic_stop_price
     )
     stop_triggered = stop_triggered or current_price <= dynamic_stop_price
-    take_profit_triggered = config.take_profit_pct > 0 and dynamic_stop_mode != "trailing" and current_price >= take_profit_price
+    take_profit_triggered = (
+        False
+        if adaptive_snapshot
+        else config.take_profit_pct > 0
+        and dynamic_stop_mode != "trailing"
+        and current_price >= take_profit_price
+    )
     stop_distance_pct = (current_price - dynamic_stop_price) / current_price * Decimal("100") if current_price > 0 else None
     liquidation_distance_pct = (
         (current_price - liquidation_price) / current_price * Decimal("100")
@@ -1218,14 +1315,14 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
     base_url = "https://testnet.binance.vision" if testnet else os.getenv("BINANCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
     futures_base_url = DEFAULT_FUTURES_TESTNET_BASE_URL if testnet else os.getenv("FUTURES_BASE_URL", DEFAULT_FUTURES_BASE_URL).rstrip("/")
     order_quote_amount = decimal_value(payload, "order_quote_amount", "ORDER_QUOTE_USDT", "50")
-    max_open_positions = int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 15)
+    max_open_positions = int_value(payload, "max_open_positions", "MAX_OPEN_POSITIONS", 4)
     dry_run_initial_equity_usdt = optional_decimal(payload, "dry_run_initial_equity_usdt", "DRY_RUN_INITIAL_EQUITY_USDT")
     if dry_run_initial_equity_usdt is None:
         dry_run_initial_equity_usdt = module.default_dry_run_initial_equity_usdt(order_quote_amount, max_open_positions)
     fixed_stop_loss_usdt = optional_decimal(payload, "fixed_stop_loss_usdt", "FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
         fixed_stop_loss_usdt = module.default_fixed_stop_loss_usdt(order_quote_amount)
-    leverage_multiplier = decimal_value(payload, "leverage_multiplier", "LEVERAGE_MULTIPLIER", "3")
+    leverage_multiplier = decimal_value(payload, "leverage_multiplier", "LEVERAGE_MULTIPLIER", "5")
     if leverage_multiplier <= 0:
         raise ValueError("leverage_multiplier must be greater than zero")
 
@@ -1257,17 +1354,53 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         breakeven_offset_pct=decimal_value(payload, "breakeven_offset_pct", "BREAKEVEN_OFFSET_PCT", "0.2"),
         trailing_start_pct=decimal_value(payload, "trailing_start_pct", "TRAILING_START_PCT", "6"),
         trailing_stop_pct=decimal_value(payload, "trailing_stop_pct", "TRAILING_STOP_PCT", "3"),
+        adaptive_exit_enabled=bool_value(payload, "adaptive_exit_enabled", True),
+        risk_monitor_interval_seconds=max(
+            1,
+            int_value(payload, "risk_monitor_interval_seconds", "RISK_MONITOR_INTERVAL_SECONDS", 1),
+        ),
+        atr_period=max(1, int_value(payload, "atr_period", "ATR_PERIOD", 14)),
+        atr_multiplier=decimal_value(payload, "atr_multiplier", "ATR_MULTIPLIER", "3"),
+        trailing_min_pct=decimal_value(payload, "trailing_min_pct", "TRAILING_MIN_PCT", "2"),
+        trailing_max_pct=decimal_value(payload, "trailing_max_pct", "TRAILING_MAX_PCT", "8"),
+        partial_take_profit_r=decimal_value(payload, "partial_take_profit_r", "PARTIAL_TAKE_PROFIT_R", "2"),
+        partial_take_profit_fraction=decimal_value(
+            payload,
+            "partial_take_profit_fraction",
+            "PARTIAL_TAKE_PROFIT_FRACTION",
+            "0.5",
+        ),
+        breakeven_trigger_r=decimal_value(payload, "breakeven_trigger_r", "BREAKEVEN_TRIGGER_R", "1"),
+        breakeven_cost_buffer_pct=decimal_value(
+            payload,
+            "breakeven_cost_buffer_pct",
+            "BREAKEVEN_COST_BUFFER_PCT",
+            "0.25",
+        ),
+        post_partial_profit_floor_r=decimal_value(
+            payload,
+            "post_partial_profit_floor_r",
+            "POST_PARTIAL_PROFIT_FLOOR_R",
+            "0.5",
+        ),
         fixed_stop_loss_usdt=fixed_stop_loss_usdt,
         fixed_stop_after_first_round_trip=bool_value(payload, "fixed_stop_after_first_round_trip", False),
         fixed_stop_equity_usdt=optional_decimal(payload, "fixed_stop_equity_usdt", "FIXED_STOP_EQUITY_USDT"),
-        cooldown_minutes=int_value(payload, "cooldown_minutes", "COOLDOWN_MINUTES", 30),
-        max_daily_trades=int_value(payload, "max_daily_trades", "MAX_DAILY_TRADES", 9999999),
+        cooldown_minutes=int_value(payload, "cooldown_minutes", "COOLDOWN_MINUTES", 60),
+        max_daily_trades=int_value(payload, "max_daily_trades", "MAX_DAILY_TRADES", 12),
         max_daily_loss_usdt=decimal_value(payload, "max_daily_loss_usdt", "MAX_DAILY_LOSS_USDT", "9999999"),
-        max_total_exposure_pct=decimal_value(payload, "max_total_exposure_pct", "MAX_TOTAL_EXPOSURE_PCT", "0"),
-        max_symbol_exposure_pct=decimal_value(payload, "max_symbol_exposure_pct", "MAX_SYMBOL_EXPOSURE_PCT", "0"),
-        max_consecutive_losses=int_value_allow_zero(payload, "max_consecutive_losses", "MAX_CONSECUTIVE_LOSSES", 0),
+        max_daily_loss_pct=decimal_value(payload, "max_daily_loss_pct", "MAX_DAILY_LOSS_PCT", "2"),
+        max_total_exposure_pct=decimal_value(payload, "max_total_exposure_pct", "MAX_TOTAL_EXPOSURE_PCT", "100"),
+        max_symbol_exposure_pct=decimal_value(payload, "max_symbol_exposure_pct", "MAX_SYMBOL_EXPOSURE_PCT", "25"),
+        max_consecutive_losses=int_value_allow_zero(payload, "max_consecutive_losses", "MAX_CONSECUTIVE_LOSSES", 3),
+        consecutive_loss_pause_minutes=int_value(
+            payload,
+            "consecutive_loss_pause_minutes",
+            "CONSECUTIVE_LOSS_PAUSE_MINUTES",
+            240,
+        ),
         max_intraday_drawdown_pct=decimal_value(payload, "max_intraday_drawdown_pct", "MAX_INTRADAY_DRAWDOWN_PCT", "0"),
-        risk_per_trade_pct=decimal_value(payload, "risk_per_trade_pct", "RISK_PER_TRADE_PCT", "0"),
+        risk_per_trade_pct=decimal_value(payload, "risk_per_trade_pct", "RISK_PER_TRADE_PCT", "0.75"),
         fee_rate_pct=decimal_value(payload, "fee_rate_pct", "FEE_RATE_PCT", "0.1"),
         slippage_pct=decimal_value(payload, "slippage_pct", "SLIPPAGE_PCT", "0.05"),
         asset_whitelist=symbol_list_value(payload, "asset_whitelist", "ASSET_WHITELIST"),
@@ -1281,6 +1414,17 @@ def config_from_payload(payload: dict[str, Any]) -> Any:
         min_square_confidence_score=decimal_value(payload, "min_square_confidence_score", "MIN_SQUARE_CONFIDENCE_SCORE", "35"),
         max_spread_bps=decimal_value(payload, "max_spread_bps", "MAX_SPREAD_BPS", "50"),
         min_orderbook_depth_usdt=decimal_value(payload, "min_orderbook_depth_usdt", "MIN_ORDERBOOK_DEPTH_USDT", "1000"),
+        max_entry_roc_15m_pct=decimal_value(payload, "max_entry_roc_15m_pct", "MAX_ENTRY_ROC_15M_PCT", "12"),
+        max_entry_roc_1h_pct=decimal_value(payload, "max_entry_roc_1h_pct", "MAX_ENTRY_ROC_1H_PCT", "20"),
+        max_entry_extension_atr=decimal_value(payload, "max_entry_extension_atr", "MAX_ENTRY_EXTENSION_ATR", "2.5"),
+        max_entry_candle_range_atr=decimal_value(
+            payload,
+            "max_entry_candle_range_atr",
+            "MAX_ENTRY_CANDLE_RANGE_ATR",
+            "2.5",
+        ),
+        early_failure_minutes=int_value(payload, "early_failure_minutes", "EARLY_FAILURE_MINUTES", 15),
+        early_failure_min_r=decimal_value(payload, "early_failure_min_r", "EARLY_FAILURE_MIN_R", "0.5"),
         exchange_protection_enabled=bool_value(payload, "exchange_protection_enabled", True),
         oco_stop_limit_slippage_pct=decimal_value(payload, "oco_stop_limit_slippage_pct", "OCO_STOP_LIMIT_SLIPPAGE_PCT", "0.5"),
         signal_recording_enabled=bool_value(payload, "signal_recording_enabled", True),

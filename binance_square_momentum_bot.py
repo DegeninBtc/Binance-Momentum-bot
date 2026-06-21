@@ -19,6 +19,7 @@ import re
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from collections import Counter
 from contextlib import closing
@@ -34,6 +35,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 try:
+    import websocket
+except ImportError:
+    websocket = None
+
+try:
     from bs4 import BeautifulSoup
 except ImportError:  # The scraper can still extract from raw HTML without bs4.
     BeautifulSoup = None
@@ -43,6 +49,7 @@ LOGGER = logging.getLogger("square-momentum-bot")
 DEFAULT_STATE_FILE = "bot_state.json"
 DEFAULT_SIGNAL_RECORD_FILE = "signal_records.jsonl"
 DEFAULT_TRADE_JOURNAL_FILE = "trade_journal.sqlite3"
+STRATEGY_VERSION = "adaptive-b-v1"
 DEFAULT_BASE_URL = "https://api.binance.com"
 DEFAULT_FUTURES_BASE_URL = "https://fapi.binance.com"
 DEFAULT_FUTURES_TESTNET_BASE_URL = "https://demo-fapi.binance.com"
@@ -171,14 +178,14 @@ class BotConfig:
     futures_margin_type: str = "ISOLATED"
     order_quote_amount: Decimal = Decimal("50")
     dry_run_initial_equity_usdt: Decimal | None = None
-    max_open_positions: int = 15
-    leverage_multiplier: Decimal = Decimal("3")
+    max_open_positions: int = 4
+    leverage_multiplier: Decimal = Decimal("5")
     contract_simulation_enabled: bool = True
     contract_max_margin_loss_pct: Decimal = Decimal("20")
     liquidation_stop_buffer_pct: Decimal = Decimal("2")
-    min_quote_volume: Decimal = Decimal("5000000")
-    min_price_change_percent: Decimal = Decimal("3")
-    min_volatility_percent: Decimal = Decimal("5")
+    min_quote_volume: Decimal = Decimal("2500000")
+    min_price_change_percent: Decimal = Decimal("2")
+    min_volatility_percent: Decimal = Decimal("4")
     top_post_limit: int = 25
     top_coin_limit: int = 10
     poll_seconds: int = 300
@@ -189,19 +196,32 @@ class BotConfig:
     breakeven_offset_pct: Decimal = Decimal("0.2")
     trailing_start_pct: Decimal = Decimal("6")
     trailing_stop_pct: Decimal = Decimal("3")
+    adaptive_exit_enabled: bool = True
+    risk_monitor_interval_seconds: int = 1
+    atr_period: int = 14
+    atr_multiplier: Decimal = Decimal("3")
+    trailing_min_pct: Decimal = Decimal("2")
+    trailing_max_pct: Decimal = Decimal("8")
+    partial_take_profit_r: Decimal = Decimal("2")
+    partial_take_profit_fraction: Decimal = Decimal("0.5")
+    breakeven_trigger_r: Decimal = Decimal("1")
+    breakeven_cost_buffer_pct: Decimal = Decimal("0.25")
+    post_partial_profit_floor_r: Decimal = Decimal("0.5")
     fixed_stop_loss_usdt: Decimal = Decimal("10")
     fixed_stop_after_first_round_trip: bool = False
     fixed_stop_equity_usdt: Decimal | None = None
-    cooldown_minutes: int = 30
-    max_daily_trades: int = 9999999
+    cooldown_minutes: int = 60
+    max_daily_trades: int = 12
     max_daily_loss_usdt: Decimal = Decimal("9999999")
-    max_total_exposure_pct: Decimal = Decimal("0")
-    max_symbol_exposure_pct: Decimal = Decimal("0")
-    max_consecutive_losses: int = 0
+    max_daily_loss_pct: Decimal = Decimal("2")
+    max_total_exposure_pct: Decimal = Decimal("100")
+    max_symbol_exposure_pct: Decimal = Decimal("25")
+    max_consecutive_losses: int = 3
+    consecutive_loss_pause_minutes: int = 240
     max_intraday_drawdown_pct: Decimal = Decimal("0")
-    risk_per_trade_pct: Decimal = Decimal("0")
+    risk_per_trade_pct: Decimal = Decimal("0.75")
     fee_rate_pct: Decimal = Decimal("0.1")
-    slippage_pct: Decimal = Decimal("0.05")
+    slippage_pct: Decimal = Decimal("0.08")
     asset_whitelist: tuple[str, ...] = ()
     asset_blacklist: tuple[str, ...] = ()
     market_filter_enabled: bool = False
@@ -213,6 +233,12 @@ class BotConfig:
     min_square_confidence_score: Decimal = Decimal("35")
     max_spread_bps: Decimal = Decimal("50")
     min_orderbook_depth_usdt: Decimal = Decimal("1000")
+    max_entry_roc_15m_pct: Decimal = Decimal("12")
+    max_entry_roc_1h_pct: Decimal = Decimal("20")
+    max_entry_extension_atr: Decimal = Decimal("2.5")
+    max_entry_candle_range_atr: Decimal = Decimal("2.5")
+    early_failure_minutes: int = 15
+    early_failure_min_r: Decimal = Decimal("0.5")
     exchange_protection_enabled: bool = True
     oco_stop_limit_slippage_pct: Decimal = Decimal("0.5")
     signal_recording_enabled: bool = True
@@ -289,6 +315,16 @@ class PositionState:
     leverage_multiplier: str = "1"
     market_type: str = MARKET_SPOT
     margin_type: str = ""
+    trade_id: str = ""
+    strategy_version: str = ""
+    initial_quantity: str = "0"
+    risk_per_unit: str = "0"
+    active_stop_price: str = "0"
+    exit_stage: str = "initial"
+    partial_take_profit_done: bool = False
+    atr_value: str = "0"
+    realized_pnl: str = "0"
+    last_market_price_at: str = ""
 
 
 @dataclass
@@ -342,6 +378,130 @@ class BotState:
 
 class BinanceAPIError(RuntimeError):
     pass
+
+
+class MarkPriceCache:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._prices: dict[str, dict[str, Any]] = {}
+
+    def update(
+        self,
+        symbol: str,
+        price: Decimal,
+        received_monotonic: float | None = None,
+    ) -> None:
+        if not symbol or price <= 0:
+            return
+        with self._lock:
+            self._prices[symbol.upper()] = {
+                "price": price,
+                "received_monotonic": (
+                    time.monotonic() if received_monotonic is None else float(received_monotonic)
+                ),
+                "received_at": utc_now(),
+            }
+
+    def snapshot(
+        self,
+        symbol: str,
+        now_monotonic: float | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            item = dict(self._prices.get(symbol.upper()) or {})
+        if not item:
+            return None
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        age = max(0.0, now - float(item["received_monotonic"]))
+        item["age_seconds"] = Decimal(str(age))
+        return item
+
+
+def update_mark_price_cache_from_message(
+    cache: MarkPriceCache,
+    message: str,
+    received_monotonic: float | None = None,
+) -> int:
+    payload = json.loads(message)
+    rows = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return 0
+    updated = 0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("s") or item.get("symbol") or "")
+        price = decimal_from_any(item.get("p") or item.get("markPrice"))
+        if symbol and price is not None and price > 0:
+            cache.update(symbol, price, received_monotonic=received_monotonic)
+            updated += 1
+    return updated
+
+
+class MarkPriceWebSocketFeed:
+    def __init__(
+        self,
+        cache: MarkPriceCache,
+        url: str = "wss://fstream.binance.com/ws/!markPrice@arr@1s",
+    ) -> None:
+        self.cache = cache
+        self.url = url
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._connection: Any | None = None
+
+    def start(self) -> bool:
+        if websocket is None:
+            LOGGER.warning("websocket-client is unavailable; risk monitor will use REST fallback")
+            return False
+        if self._thread and self._thread.is_alive():
+            return True
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="mark-price-feed")
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        connection = self._connection
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=3)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._connection = websocket.create_connection(self.url, timeout=10)
+                LOGGER.info("mark price websocket connected")
+                while not self._stop_event.is_set():
+                    message = self._connection.recv()
+                    if not message:
+                        break
+                    update_mark_price_cache_from_message(self.cache, str(message))
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    LOGGER.warning("mark price websocket disconnected: %s", exc)
+                    self._stop_event.wait(2)
+            finally:
+                connection = self._connection
+                self._connection = None
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+
+
+def is_invalid_symbol_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "invalid symbol" in message or "-1121" in message
 
 
 class BinanceSpotClient:
@@ -1021,6 +1181,8 @@ class LongOnlyMomentumBot:
         self.client = self.spot_client
         self.square = BinanceSquareScraper(build_retry_session(), config.square_urls)
         self.state = load_state(config.state_file)
+        self._state_lock = threading.RLock()
+        self.external_risk_monitor_active = False
         migrate_trade_log_to_journal(config.trade_journal_file, self.state.trade_log)
         self._load_square_feed_state()
         self._sync_legacy_position()
@@ -1050,10 +1212,10 @@ class LongOnlyMomentumBot:
         return MARKET_FUTURES if candidate.market_type == MARKET_FUTURES else MARKET_SPOT
 
     def _position_market_type(self, position: PositionState) -> str:
-        if position.position_mode in {"futures-live", "contract-sim"}:
-            return MARKET_FUTURES
         if position.market_type in {MARKET_FUTURES, MARKET_SPOT}:
             return position.market_type
+        if position.position_mode in {"futures-live", "contract-sim"}:
+            return MARKET_FUTURES
         return MARKET_SPOT
 
     def _position_is_futures_live(self, position: PositionState) -> bool:
@@ -1062,12 +1224,44 @@ class LongOnlyMomentumBot:
     def run_forever(self) -> None:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
-        while not self.stop_requested:
-            self.run_once()
-            for _ in range(self.config.poll_seconds):
-                if self.stop_requested:
-                    break
-                time.sleep(1)
+        price_cache: MarkPriceCache | None = None
+        feed: MarkPriceWebSocketFeed | None = None
+        risk_stop_event = threading.Event()
+        risk_thread: threading.Thread | None = None
+        if self.config.dry_run and self.config.adaptive_exit_enabled:
+            price_cache = MarkPriceCache()
+            feed = MarkPriceWebSocketFeed(price_cache)
+            feed.start()
+            self.external_risk_monitor_active = True
+            interval = max(0.2, float(self.config.risk_monitor_interval_seconds))
+
+            def risk_loop() -> None:
+                while not risk_stop_event.is_set() and not self.stop_requested:
+                    started = time.monotonic()
+                    self.monitor_open_positions_once(price_cache, now_monotonic=started)
+                    elapsed = time.monotonic() - started
+                    risk_stop_event.wait(max(0.05, interval - elapsed))
+
+            risk_thread = threading.Thread(
+                target=risk_loop,
+                daemon=True,
+                name="adaptive-risk-monitor",
+            )
+            risk_thread.start()
+        next_scan_at = 0.0
+        try:
+            while not self.stop_requested:
+                now = time.monotonic()
+                if now >= next_scan_at:
+                    self.run_once()
+                    next_scan_at = time.monotonic() + max(1, self.config.poll_seconds)
+                time.sleep(min(1.0, max(0.2, next_scan_at - time.monotonic())))
+        finally:
+            risk_stop_event.set()
+            if feed is not None:
+                feed.stop()
+            if risk_thread is not None and risk_thread.is_alive():
+                risk_thread.join(timeout=3)
 
     def run_once(self) -> None:
         try:
@@ -1078,7 +1272,12 @@ class LongOnlyMomentumBot:
             self._ensure_live_account_safety()
             self._recover_pending_order()
             self._sync_open_position_with_account()
-            self._manage_open_position()
+            if not (
+                self.external_risk_monitor_active
+                and self.config.dry_run
+                and self.config.adaptive_exit_enabled
+            ):
+                self._manage_open_position()
             if len(self._active_positions()) < max(1, self.config.max_open_positions):
                 self._scan_and_enter()
             else:
@@ -1095,7 +1294,7 @@ class LongOnlyMomentumBot:
                     note="max open positions reached",
                 )
             self._sync_square_feed_state()
-            save_state(self.config.state_file, self.state)
+            self._touch_state()
             if self.config.signal_recording_enabled and self.last_signal_record:
                 append_signal_record(self.config.signal_record_file, self.last_signal_record)
         except Exception:
@@ -1266,7 +1465,120 @@ class LongOnlyMomentumBot:
 
     def _manage_open_position(self) -> None:
         for position in list(self._active_positions()):
-            self._manage_single_position(position)
+            try:
+                self._manage_single_position(position)
+            except Exception as exc:
+                if bool(getattr(getattr(self, "config", None), "dry_run", False)) and is_invalid_symbol_error(exc):
+                    LOGGER.warning(
+                        "[dry-run] clearing unsupported simulated position %s: %s",
+                        position.symbol or "<unknown>",
+                        exc,
+                    )
+                    self._append_trade(
+                        "DRY_RUN_STALE_POSITION_CLEAR",
+                        position.symbol,
+                        Decimal(position.quantity),
+                        Decimal(position.entry_price),
+                        None,
+                        quote_amount=Decimal("0"),
+                    )
+                    self._remove_position(position.symbol)
+                    self._touch_state()
+                    continue
+                LOGGER.exception(
+                    "position management failed for %s; continuing cycle",
+                    position.symbol or "<unknown>",
+                )
+
+    def _risk_price_for_position(
+        self,
+        position: PositionState,
+        price_cache: MarkPriceCache,
+        now_monotonic: float | None = None,
+    ) -> tuple[Decimal | None, str, Decimal]:
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        snapshot = price_cache.snapshot(position.symbol, now_monotonic=now)
+        websocket_age = (
+            Decimal(snapshot["age_seconds"])
+            if snapshot is not None
+            else Decimal("999999")
+        )
+        if snapshot is not None and websocket_age <= Decimal("5"):
+            return Decimal(snapshot["price"]), "websocket", websocket_age
+
+        rest_cache = getattr(self, "_risk_rest_cache", None)
+        if rest_cache is None:
+            rest_cache = {}
+            self._risk_rest_cache = rest_cache
+        cached_rest = rest_cache.get(position.symbol)
+        if cached_rest is not None:
+            rest_age = Decimal(str(max(0.0, now - float(cached_rest["received_monotonic"]))))
+            if rest_age < Decimal("5"):
+                return Decimal(cached_rest["price"]), "rest-cache", rest_age
+        try:
+            price = self._market_client(self._position_market_type(position)).ticker_price(position.symbol)
+            rest_cache[position.symbol] = {
+                "price": price,
+                "received_monotonic": now,
+            }
+            return price, "rest", Decimal("0")
+        except Exception as exc:
+            if websocket_age > Decimal("15"):
+                LOGGER.warning(
+                    "risk price stale for %s age=%ss and REST fallback failed: %s",
+                    position.symbol,
+                    websocket_age,
+                    exc,
+                )
+                return None, "stale", websocket_age
+            LOGGER.warning("REST risk price fallback failed for %s: %s", position.symbol, exc)
+            return None, "unavailable", websocket_age
+
+    def monitor_open_positions_once(
+        self,
+        price_cache: MarkPriceCache,
+        now_monotonic: float | None = None,
+    ) -> None:
+        if not self.config.dry_run or not self.config.adaptive_exit_enabled:
+            return
+        for position in list(self._active_positions()):
+            if not self._position_is_contract_sim(position):
+                continue
+            price, source, age = self._risk_price_for_position(
+                position,
+                price_cache,
+                now_monotonic=now_monotonic,
+            )
+            if price is None:
+                continue
+            LOGGER.debug(
+                "risk price %s=%s source=%s age=%ss",
+                position.symbol,
+                price,
+                source,
+                age,
+            )
+            entry_price = decimal_from_any(position.entry_price) or Decimal("0")
+            liquidation_price = estimated_liquidation_price(
+                entry_price,
+                self._position_leverage(position),
+            )
+            if liquidation_price is not None and price <= liquidation_price:
+                self._liquidate_contract_sim_position(position, liquidation_price)
+                continue
+            try:
+                atr_value = (
+                    self._latest_position_atr(position)
+                    if position.partial_take_profit_done
+                    else None
+                )
+                self._manage_adaptive_dry_run_position(
+                    position,
+                    price,
+                    atr_value,
+                )
+            except Exception:
+                LOGGER.exception("adaptive risk management failed for %s", position.symbol)
 
     def _manage_single_position(self, position: PositionState) -> None:
         if not position.symbol:
@@ -1276,14 +1588,25 @@ class LongOnlyMomentumBot:
         qty = Decimal(position.quantity)
         entry_price = Decimal(position.entry_price)
         last_price = self._market_client(self._position_market_type(position)).ticker_price(symbol)
+        leverage_multiplier = self._position_leverage(position)
+        contract_simulation = self._position_is_contract_sim(position)
+        liquidation_price = estimated_liquidation_price(entry_price, leverage_multiplier) if contract_simulation else None
+        if liquidation_price is not None and last_price <= liquidation_price:
+            self._liquidate_contract_sim_position(position, liquidation_price)
+            return
+        if (
+            self.config.dry_run
+            and self.config.adaptive_exit_enabled
+            and contract_simulation
+        ):
+            self._manage_adaptive_dry_run_position(position, last_price, self._latest_position_atr(position))
+            return
         highest_price = decimal_from_any(position.highest_price) or entry_price
         highest_updated = False
         if last_price > highest_price:
             highest_price = last_price
             position.highest_price = format_decimal(highest_price)
             highest_updated = True
-        leverage_multiplier = self._position_leverage(position)
-        contract_simulation = self._position_is_contract_sim(position)
         margin_quote = self._position_margin(position)
         unrealized_pnl = (last_price - entry_price) * qty
         unrealized_loss = max(Decimal("0"), -unrealized_pnl)
@@ -1293,10 +1616,6 @@ class LongOnlyMomentumBot:
             else (last_price - entry_price) / entry_price * Decimal("100")
         )
         pct_stop, stop_guard = effective_initial_stop_price(self.config, entry_price, leverage_multiplier, contract_simulation)
-        liquidation_price = estimated_liquidation_price(entry_price, leverage_multiplier) if contract_simulation else None
-        if liquidation_price is not None and last_price <= liquidation_price:
-            self._liquidate_contract_sim_position(position, liquidation_price)
-            return
         dynamic_stop, dynamic_stop_mode = self._dynamic_stop_price(entry_price, highest_price, pct_stop)
         take_profit_price = entry_price * (Decimal("1") + self.config.take_profit_pct / Decimal("100"))
         fixed_mode = self._fixed_stop_enabled()
@@ -1340,6 +1659,202 @@ class LongOnlyMomentumBot:
             return
 
         self._close_position(position, last_price, dry_action, live_action, exit_label)
+
+    def _initialize_adaptive_position_state(self, position: PositionState) -> None:
+        entry_price = decimal_from_any(position.entry_price) or Decimal("0")
+        quantity = decimal_from_any(position.quantity) or Decimal("0")
+        if not position.trade_id:
+            position.trade_id = build_client_order_id("trade", position.symbol)
+        if (decimal_from_any(position.initial_quantity) or Decimal("0")) <= 0:
+            position.initial_quantity = format_decimal(quantity)
+        if (decimal_from_any(position.risk_per_unit) or Decimal("0")) <= 0 and entry_price > 0:
+            initial_stop, _ = effective_initial_stop_price(
+                self.config,
+                entry_price,
+                self._position_leverage(position),
+                True,
+            )
+            position.risk_per_unit = format_decimal(max(Decimal("0"), entry_price - initial_stop))
+        if (decimal_from_any(position.active_stop_price) or Decimal("0")) <= 0:
+            risk_per_unit = decimal_from_any(position.risk_per_unit) or Decimal("0")
+            position.active_stop_price = format_decimal(max(Decimal("0"), entry_price - risk_per_unit))
+        if not position.exit_stage:
+            position.exit_stage = "initial"
+
+    def _latest_position_atr(self, position: PositionState) -> Decimal | None:
+        cache = getattr(self, "_atr_cache", None)
+        if cache is None:
+            cache = {}
+            self._atr_cache = cache
+        now = time.monotonic()
+        cached = cache.get(position.symbol)
+        if cached and now - float(cached.get("updated_monotonic", 0)) < 60:
+            return cached.get("atr")
+        try:
+            rows = self._market_client(self._position_market_type(position)).klines(
+                position.symbol,
+                "1m",
+                max(2, self.config.atr_period + 1),
+            )
+            atr = average_true_range(rows[:-1], self.config.atr_period)
+        except Exception as exc:
+            LOGGER.warning("ATR refresh failed for %s: %s", position.symbol, exc)
+            atr = decimal_from_any(position.atr_value)
+        cache[position.symbol] = {"atr": atr, "updated_monotonic": now}
+        return atr
+
+    def _manage_adaptive_dry_run_position(
+        self,
+        position: PositionState,
+        last_price: Decimal,
+        atr_value: Decimal | None,
+    ) -> None:
+        self._initialize_adaptive_position_state(position)
+        decision = adaptive_exit_snapshot(self.config, position, last_price, atr_value)
+        if decision.get("action") in {"disabled", "invalid_price", "invalid_risk"}:
+            return
+
+        previous_high = decimal_from_any(position.highest_price) or Decimal(position.entry_price)
+        previous_stop = decimal_from_any(position.active_stop_price) or Decimal("0")
+        previous_stage = position.exit_stage
+        position.highest_price = format_decimal(decision["highest_price"])
+        position.active_stop_price = format_decimal(decision["active_stop_price"])
+        position.exit_stage = str(decision["stage"])
+        position.atr_value = format_decimal(atr_value or Decimal("0"))
+        position.last_market_price_at = utc_now()
+        peak_changed = Decimal(position.highest_price) > previous_high
+        critical_state_changed = (
+            Decimal(position.active_stop_price) > previous_stop
+            or position.exit_stage != previous_stage
+        )
+        peak_persisted_at = getattr(self, "_peak_persisted_at", None)
+        if peak_persisted_at is None:
+            peak_persisted_at = {}
+            self._peak_persisted_at = peak_persisted_at
+        now_monotonic = time.monotonic()
+        peak_persist_due = peak_changed and (
+            now_monotonic - float(peak_persisted_at.get(position.symbol, 0)) >= 5
+        )
+        heartbeat_persist_due = (
+            now_monotonic - float(getattr(self, "_risk_state_last_persisted", 0)) >= 5
+        )
+
+        action = str(decision["action"])
+        metadata = {
+            "exit_reason": action,
+            "trigger_price": decision.get("trigger_price"),
+            "r_multiple": decision.get("r_multiple"),
+            "atr_value": atr_value,
+            "peak_price": decision.get("highest_price"),
+            "peak_drawdown_pct": decision.get("peak_drawdown_pct"),
+        }
+        if action == "partial_take_profit":
+            quantity = Decimal(position.quantity) * Decimal(decision["close_fraction"])
+            previous_partial_state = position.partial_take_profit_done
+            previous_exit_stage = position.exit_stage
+            position.partial_take_profit_done = True
+            position.exit_stage = "atr_trailing"
+            closed = self._close_position(
+                position,
+                last_price,
+                "DRY_RUN_PARTIAL_TAKE_PROFIT",
+                "TAKE_PROFIT_SELL",
+                "adaptive partial take profit",
+                close_quantity=quantity,
+                trigger_price=decision.get("trigger_price"),
+                decision_metadata=metadata,
+            )
+            if not closed:
+                position.partial_take_profit_done = previous_partial_state
+                position.exit_stage = previous_exit_stage
+            return
+
+        exit_actions = {
+            "hard_stop": ("DRY_RUN_HARD_STOP", "adaptive hard stop"),
+            "breakeven_exit": ("DRY_RUN_BREAKEVEN_EXIT", "adaptive breakeven exit"),
+            "atr_trailing_exit": ("DRY_RUN_ATR_TRAILING_EXIT", "adaptive ATR trailing exit"),
+            "gap_exit": ("DRY_RUN_GAP_EXIT", "adaptive gap-through-stop exit"),
+        }
+        if action in exit_actions:
+            dry_action, label = exit_actions[action]
+            self._close_position(
+                position,
+                last_price,
+                dry_action,
+                "STOP_SELL",
+                label,
+                trigger_price=decision.get("trigger_price"),
+                decision_metadata=metadata,
+            )
+            return
+        if action == "hold" and not position.partial_take_profit_done:
+            early_decision = self._early_failure_decision(position, last_price)
+            if early_decision.get("action") == "early_failure_exit":
+                early_metadata = {
+                    **metadata,
+                    "exit_reason": "early_failure_exit",
+                    "trigger_price": early_decision.get("trigger_price"),
+                    "peak_r_multiple": early_decision.get("peak_r_multiple"),
+                }
+                self._close_position(
+                    position,
+                    last_price,
+                    "DRY_RUN_EARLY_FAILURE_EXIT",
+                    "STOP_SELL",
+                    "adaptive early-failure exit",
+                    trigger_price=early_decision.get("trigger_price"),
+                    decision_metadata=early_metadata,
+                )
+                return
+        if critical_state_changed or peak_persist_due or heartbeat_persist_due:
+            if peak_persist_due:
+                peak_persisted_at[position.symbol] = now_monotonic
+            self._risk_state_last_persisted = now_monotonic
+            self._replace_position(position)
+            self._touch_state()
+
+    def _early_failure_decision(
+        self,
+        position: PositionState,
+        last_price: Decimal,
+    ) -> dict[str, Any]:
+        opened_at = parse_timestamp(position.opened_at)
+        if opened_at is None:
+            return {"action": "missing_open_time"}
+        if datetime.now(timezone.utc) - opened_at < timedelta(
+            minutes=self.config.early_failure_minutes
+        ):
+            return {"action": "hold"}
+        cache = getattr(self, "_early_failure_cache", None)
+        if cache is None:
+            cache = {}
+            self._early_failure_cache = cache
+        now_monotonic = time.monotonic()
+        cached = cache.get(position.symbol)
+        if cached and now_monotonic - float(cached["updated_monotonic"]) < 60:
+            ema9 = Decimal(cached["ema9"])
+        else:
+            try:
+                rows = self._market_client(self._position_market_type(position)).klines(
+                    position.symbol,
+                    "5m",
+                    13,
+                )
+                snapshot = kline_confirmation_snapshot(rows[:-1])
+                ema9 = decimal_from_any(snapshot.get("ema9")) or Decimal("0")
+                cache[position.symbol] = {
+                    "ema9": ema9,
+                    "updated_monotonic": now_monotonic,
+                }
+            except Exception as exc:
+                LOGGER.warning("early-failure EMA refresh failed for %s: %s", position.symbol, exc)
+                return {"action": "market_data_unavailable"}
+        return early_failure_exit_snapshot(
+            self.config,
+            position,
+            last_price,
+            ema9,
+        )
 
     def _liquidate_contract_sim_position(self, position: PositionState, liquidation_price: Decimal) -> None:
         symbol = position.symbol
@@ -1387,7 +1902,9 @@ class LongOnlyMomentumBot:
         live_action: str,
         exit_label: str,
         close_quantity: Decimal | None = None,
-    ) -> None:
+        trigger_price: Decimal | None = None,
+        decision_metadata: dict[str, Any] | None = None,
+    ) -> bool:
         symbol = position.symbol
         qty = Decimal(position.quantity)
         wanted_qty = min(qty, close_quantity) if close_quantity is not None else qty
@@ -1399,6 +1916,11 @@ class LongOnlyMomentumBot:
         if not self.config.dry_run:
             self._release_exchange_protection_for_close(position)
         sell_qty = self._safe_sell_quantity(symbol, position.base_asset, wanted_qty, market_type)
+        if self.config.dry_run and full_close_requested:
+            # A simulation has no exchange-side residual balance. Recording the
+            # rounded order quantity here would leak dust into the next FIFO
+            # lifecycle and corrupt trade statistics.
+            sell_qty = qty
         if sell_qty <= 0:
             if self.config.dry_run and full_close_requested:
                 LOGGER.info("[dry-run] cleared %s residual quantity below sell step after full close request: %s", symbol, qty)
@@ -1406,9 +1928,9 @@ class LongOnlyMomentumBot:
                 self._remove_position(symbol)
                 self._touch_state()
                 self._notify(f"[dry-run] {exit_label} {symbol} cleared residual qty={qty}")
-                return
+                return True
             LOGGER.error("no sellable balance for %s; clearing local position is unsafe, keeping state", symbol)
-            return
+            return False
         order_check_price = (
             last_price * (Decimal("1") - self.config.slippage_pct / Decimal("100"))
             if self.config.dry_run
@@ -1420,7 +1942,7 @@ class LongOnlyMomentumBot:
                 LOGGER.info("[dry-run] ignoring close validation for full close %s: %s", symbol, sell_error)
             else:
                 LOGGER.error("cannot close %s: %s; keeping state", symbol, sell_error)
-                return
+                return False
 
         if self.config.dry_run:
             fill_price, fee_amount, quote_received = self._dry_run_sell_fill(last_price, sell_qty)
@@ -1441,7 +1963,14 @@ class LongOnlyMomentumBot:
                 None,
                 fee_amount=fee_amount,
                 quote_amount=quote_received,
+                trigger_price=trigger_price,
+                decision_metadata=decision_metadata,
             )
+            if self._position_is_contract_sim(position):
+                entry_price = Decimal(position.entry_price)
+                realized_pnl = (fill_price - entry_price) * sell_qty - fee_amount
+                previous_realized = decimal_from_any(position.realized_pnl) or Decimal("0")
+                position.realized_pnl = format_decimal(previous_realized + realized_pnl)
             remaining_qty = max(Decimal("0"), qty - sell_qty)
             if remaining_qty > 0 and not full_close_requested:
                 if self._position_is_contract_sim(position):
@@ -1461,7 +1990,7 @@ class LongOnlyMomentumBot:
             self._touch_state()
             mode = "[dry-run] " if self.config.dry_run else ""
             self._notify(f"{mode}{exit_label} {symbol} qty={sell_qty} price={fill_price}")
-            return
+            return True
 
         client_order_id = build_client_order_id(live_action.lower(), symbol)
         self._set_pending_order(symbol, "SELL", client_order_id, live_action, quantity=sell_qty, market_type=market_type)
@@ -1492,6 +2021,7 @@ class LongOnlyMomentumBot:
             self._remove_position(symbol)
         self._touch_state()
         self._notify(f"{exit_label} {symbol} qty={sell_qty} price={avg_price}")
+        return True
 
     def _scan_and_enter(self) -> None:
         daily_guard = self._daily_entry_guard_reason()
@@ -1660,7 +2190,14 @@ class LongOnlyMomentumBot:
         LOGGER.info("selected candidate: %s", asdict(candidate))
         market_type = self._candidate_market_type(candidate)
         if self.config.dry_run:
-            fill_price, qty, fee_amount, quote_spent = self._dry_run_buy_fill(candidate.last_price, market_type)
+            proposed_margin = decimal_from_any(
+                self.state.account_risk_snapshot.get("proposed_margin_quote")
+            )
+            fill_price, qty, fee_amount, quote_spent = self._dry_run_buy_fill(
+                candidate.last_price,
+                market_type,
+                proposed_margin,
+            )
             LOGGER.warning(
                 "[dry-run] would BUY %s with %s %s price=%s fee=%s mode=%s leverage=%sx",
                 candidate.symbol,
@@ -1911,6 +2448,16 @@ class LongOnlyMomentumBot:
             position_mode = "spot"
         margin_quote = spent if market_type == MARKET_FUTURES else Decimal("0")
         notional_quote = quantity * entry_price
+        adaptive_risk_per_unit = Decimal("0")
+        adaptive_stop_price = Decimal("0")
+        if self.config.dry_run and market_type == MARKET_FUTURES and self.config.adaptive_exit_enabled:
+            adaptive_stop_price, _ = effective_initial_stop_price(
+                self.config,
+                entry_price,
+                leverage,
+                True,
+            )
+            adaptive_risk_per_unit = max(Decimal("0"), entry_price - adaptive_stop_price)
         new_position = PositionState(
             symbol=candidate.symbol,
             base_asset=candidate.base_asset,
@@ -1926,6 +2473,16 @@ class LongOnlyMomentumBot:
             leverage_multiplier=format_decimal(leverage),
             market_type=market_type,
             margin_type=self.config.futures_margin_type.upper() if market_type == MARKET_FUTURES else "",
+            trade_id=build_client_order_id("trade", candidate.symbol),
+            strategy_version=STRATEGY_VERSION,
+            initial_quantity=format_decimal(quantity),
+            risk_per_unit=format_decimal(adaptive_risk_per_unit),
+            active_stop_price=format_decimal(adaptive_stop_price),
+            exit_stage="initial",
+            partial_take_profit_done=False,
+            atr_value="0",
+            realized_pnl="0",
+            last_market_price_at=utc_now(),
         )
         positions = [item for item in self._active_positions() if item.symbol != candidate.symbol]
         positions.append(new_position)
@@ -2068,6 +2625,18 @@ class LongOnlyMomentumBot:
             return f"daily trade limit reached ({stats['buy_count']}/{self.config.max_daily_trades})"
         if self.config.max_daily_loss_usdt > 0 and stats["realized_pnl"] <= -self.config.max_daily_loss_usdt:
             return f"daily loss limit reached ({stats['realized_pnl']} {self.config.quote_asset})"
+        if self.config.max_daily_loss_pct > 0:
+            equity_basis = (
+                effective_dry_run_initial_equity(self.config)
+                if self.config.dry_run
+                else max(self.config.order_quote_amount, Decimal("1"))
+            )
+            loss_limit = equity_basis * self.config.max_daily_loss_pct / Decimal("100")
+            if stats["realized_pnl"] <= -loss_limit:
+                return (
+                    f"daily loss {stats['realized_pnl']} {self.config.quote_asset} "
+                    f"reached {self.config.max_daily_loss_pct}% equity limit"
+                )
         return None
 
     def _first_allowed_candidate(self, candidates: list[TradeCandidate]) -> TradeCandidate | None:
@@ -2127,9 +2696,9 @@ class LongOnlyMomentumBot:
     def _kline_confirmation(self, candidate: TradeCandidate) -> dict[str, Any]:
         client = self._market_client(self._candidate_market_type(candidate))
         snapshots = {
-            "5m": kline_confirmation_snapshot(client.klines(candidate.symbol, "5m", 24)),
-            "15m": kline_confirmation_snapshot(client.klines(candidate.symbol, "15m", 24)),
-            "1h": kline_confirmation_snapshot(client.klines(candidate.symbol, "1h", 24)),
+            "5m": kline_confirmation_snapshot(client.klines(candidate.symbol, "5m", 25)[:-1]),
+            "15m": kline_confirmation_snapshot(client.klines(candidate.symbol, "15m", 25)[:-1]),
+            "1h": kline_confirmation_snapshot(client.klines(candidate.symbol, "1h", 25)[:-1]),
         }
         failures = []
         if snapshots["15m"]["roc_pct"] <= Decimal("0"):
@@ -2144,6 +2713,8 @@ class LongOnlyMomentumBot:
             snapshots["5m"]["roc_pct"] < Decimal("0") or snapshots["15m"]["roc_pct"] < Decimal("0")
         ):
             failures.append("24h mover is high but short-term ROC is rolling over")
+        if self.config.dry_run:
+            failures.extend(entry_overextension_reasons(self.config, snapshots))
         return stringify_decimals(
             {
                 "passed": not failures,
@@ -2264,7 +2835,30 @@ class LongOnlyMomentumBot:
                     self.config.order_quote_amount * Decimal(max(1, self.config.max_open_positions)),
                 )
 
-        proposed_quote = self.config.order_quote_amount if candidate else Decimal("0")
+        proposed_margin_quote = self.config.order_quote_amount if candidate else Decimal("0")
+        risk_sizing: dict[str, Decimal] | None = None
+        if (
+            candidate
+            and candidate.market_type == MARKET_FUTURES
+            and self.config.dry_run
+            and self.config.risk_per_trade_pct > 0
+        ):
+            initial_stop, _ = effective_initial_stop_price(
+                self.config,
+                candidate.last_price,
+                self.config.leverage_multiplier,
+                True,
+            )
+            risk_sizing = risk_based_order_size(
+                equity,
+                candidate.last_price,
+                initial_stop,
+                self.config.leverage_multiplier,
+                self.config.risk_per_trade_pct,
+                self.config.order_quote_amount,
+            )
+            proposed_margin_quote = risk_sizing["margin_quote"]
+        proposed_quote = proposed_margin_quote
         if candidate and candidate.market_type == MARKET_FUTURES:
             proposed_quote *= self.config.leverage_multiplier
         proposed_notional_quote = (
@@ -2272,17 +2866,25 @@ class LongOnlyMomentumBot:
             if self.config.dry_run and candidate and candidate.market_type == MARKET_FUTURES
             else Decimal("0")
         )
-        proposed_margin_quote = (
-            self.config.order_quote_amount
-            if self.config.dry_run and candidate and candidate.market_type == MARKET_FUTURES
-            else Decimal("0")
-        )
+        if not (self.config.dry_run and candidate and candidate.market_type == MARKET_FUTURES):
+            proposed_margin_quote = Decimal("0")
         proposed_total_exposure = total_exposure + proposed_quote
         proposed_symbol_exposure = proposed_quote
         if candidate:
             proposed_symbol_exposure += position_values.get(candidate.symbol, Decimal("0"))
 
-        loss_streak = current_loss_streak(self.state.trade_log)
+        completed_trades = build_complete_trades_from_events(self._trade_events_for_risk())
+        loss_streak = 0
+        for trade in reversed(completed_trades):
+            if (decimal_from_any(trade.get("pnl")) or Decimal("0")) < 0:
+                loss_streak += 1
+            else:
+                break
+        loss_pause_until = consecutive_loss_pause_until(
+            completed_trades,
+            self.config.max_consecutive_losses,
+            self.config.consecutive_loss_pause_minutes,
+        )
         daily_unrealized_drawdown = -unrealized_pnl if unrealized_pnl < 0 else Decimal("0")
         daily_drawdown = daily_unrealized_drawdown + (-stats["realized_pnl"] if stats["realized_pnl"] < 0 else Decimal("0"))
         drawdown_pct = daily_drawdown / equity * Decimal("100") if equity > 0 else Decimal("0")
@@ -2310,8 +2912,10 @@ class LongOnlyMomentumBot:
             reasons.append(f"total exposure {format_decimal(total_exposure_pct)}% exceeds {self.config.max_total_exposure_pct}%")
         if candidate and self.config.max_symbol_exposure_pct > 0 and symbol_exposure_pct > self.config.max_symbol_exposure_pct:
             reasons.append(f"{candidate.symbol} exposure {format_decimal(symbol_exposure_pct)}% exceeds {self.config.max_symbol_exposure_pct}%")
-        if self.config.max_consecutive_losses > 0 and loss_streak >= self.config.max_consecutive_losses:
-            reasons.append(f"consecutive losses {loss_streak} reached {self.config.max_consecutive_losses}")
+        if loss_pause_until is not None:
+            reasons.append(
+                f"consecutive losses {loss_streak} triggered pause until {loss_pause_until.isoformat()}"
+            )
         if self.config.max_intraday_drawdown_pct > 0 and drawdown_pct >= self.config.max_intraday_drawdown_pct:
             reasons.append(f"intraday drawdown {format_decimal(drawdown_pct)}% reached {self.config.max_intraday_drawdown_pct}%")
 
@@ -2340,14 +2944,20 @@ class LongOnlyMomentumBot:
                 "intraday_drawdown": daily_drawdown,
                 "intraday_drawdown_pct": drawdown_pct,
                 "consecutive_losses": loss_streak,
+                "consecutive_loss_pause_until": loss_pause_until.isoformat() if loss_pause_until else "",
                 "fixed_order_quote": self.config.order_quote_amount,
-                "risk_based_quote_suggestion": risk_based_quote,
+                "risk_based_quote_suggestion": (
+                    risk_sizing["margin_quote"] if risk_sizing is not None else risk_based_quote
+                ),
+                "risk_budget": risk_sizing["risk_budget"] if risk_sizing is not None else Decimal("0"),
                 "limits": {
                     "max_total_exposure_pct": self.config.max_total_exposure_pct,
                     "max_symbol_exposure_pct": self.config.max_symbol_exposure_pct,
                     "max_consecutive_losses": self.config.max_consecutive_losses,
+                    "consecutive_loss_pause_minutes": self.config.consecutive_loss_pause_minutes,
                     "max_intraday_drawdown_pct": self.config.max_intraday_drawdown_pct,
                     "risk_per_trade_pct": self.config.risk_per_trade_pct,
+                    "max_daily_loss_pct": self.config.max_daily_loss_pct,
                 },
                 "checked_at": utc_now(),
             }
@@ -2414,43 +3024,54 @@ class LongOnlyMomentumBot:
 
     def _daily_trade_stats(self) -> dict[str, Decimal | int]:
         today = datetime.now(timezone.utc).date()
-        buy_count = 0
+        events = self._trade_events_for_risk()
+        buy_count = sum(
+            1
+            for item in events
+            if "BUY" in str(item.get("action") or "").upper()
+            and not is_synthetic_trade_event(item)
+            and (parse_timestamp(item.get("ts")) or datetime.min.replace(tzinfo=timezone.utc)).date()
+            == today
+        )
         realized_pnl = Decimal("0")
-        open_costs: dict[str, list[dict[str, Decimal]]] = {}
-
-        for item in self.state.trade_log:
-            action = str(item.get("action", ""))
-            symbol = str(item.get("symbol", ""))
-            ts = parse_timestamp(item.get("ts"))
-            qty = decimal_from_any(item.get("quantity"))
-            price = decimal_from_any(item.get("price"))
-            if not symbol or qty is None or price is None:
-                continue
-            amount = trade_quote_amount_or_notional(item, qty, price)
-            if "BUY" in action:
-                open_costs.setdefault(symbol, []).append({"qty": qty, "amount": amount})
-                if ts and ts.date() == today:
-                    buy_count += 1
-            elif is_exit_trade_action(action):
-                queue = open_costs.get(symbol) or []
-                remaining_sell_qty = qty
-                while remaining_sell_qty > 0 and queue:
-                    open_trade = queue[0]
-                    open_qty = open_trade["qty"]
-                    closed_qty = min(open_qty, remaining_sell_qty)
-                    ratio = closed_qty / qty if qty > 0 else Decimal("1")
-                    open_ratio = closed_qty / open_qty if open_qty > 0 else Decimal("1")
-                    exit_amount = amount * ratio
-                    entry_amount = open_trade["amount"] * open_ratio
-                    if ts and ts.date() == today:
-                        realized_pnl += exit_amount - entry_amount
-                    open_trade["qty"] = open_qty - closed_qty
-                    open_trade["amount"] = open_trade["amount"] - entry_amount
-                    remaining_sell_qty -= closed_qty
-                    if open_trade["qty"] <= 0:
-                        queue.pop(0)
-
+        for item in build_complete_trades_from_events(events):
+            ts = parse_timestamp(item.get("exit_time"))
+            if ts and ts.date() == today:
+                realized_pnl += decimal_from_any(item.get("pnl")) or Decimal("0")
         return {"buy_count": buy_count, "realized_pnl": realized_pnl}
+
+    def _trade_events_for_risk(self) -> list[dict[str, Any]]:
+        path = trade_journal_path(self.config.trade_journal_file)
+        if trade_journal_enabled(self.config.trade_journal_file) and path.exists():
+            try:
+                ensure_trade_journal(self.config.trade_journal_file)
+                with closing(sqlite3.connect(path)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    events = [
+                        dict(row)
+                        for row in conn.execute(
+                            "SELECT * FROM trade_events ORDER BY ts ASC, id ASC"
+                        )
+                    ]
+                known_uids = {str(item.get("event_uid") or "") for item in events}
+                for state_event in self.state.trade_log:
+                    uid = str(
+                        state_event.get("event_uid")
+                        or trade_event_uid(state_event)
+                    )
+                    if uid not in known_uids:
+                        events.append(dict(state_event, event_uid=uid))
+                        known_uids.add(uid)
+                return sorted(
+                    events,
+                    key=lambda item: (
+                        str(item.get("ts") or ""),
+                        int(item.get("id") or 0),
+                    ),
+                )
+            except Exception:
+                LOGGER.exception("risk history journal read failed; using state trade log")
+        return list(self.state.trade_log)
 
     def _fixed_stop_enabled(self) -> bool:
         if self.config.fixed_stop_after_first_round_trip and self.state.completed_round_trips > 0:
@@ -2522,9 +3143,18 @@ class LongOnlyMomentumBot:
             return f"notional {notional} is below min notional {rules.min_notional}"
         return None
 
-    def _dry_run_buy_fill(self, market_price: Decimal, market_type: str = MARKET_FUTURES) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    def _dry_run_buy_fill(
+        self,
+        market_price: Decimal,
+        market_type: str = MARKET_FUTURES,
+        margin_quote_override: Decimal | None = None,
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         fill_price = market_price * (Decimal("1") + self.config.slippage_pct / Decimal("100"))
-        margin_quote = self.config.order_quote_amount
+        margin_quote = (
+            margin_quote_override
+            if margin_quote_override is not None and margin_quote_override > 0
+            else self.config.order_quote_amount
+        )
         gross_quote = margin_quote * self.config.leverage_multiplier if market_type == MARKET_FUTURES else margin_quote
         fee_amount = gross_quote * self.config.fee_rate_pct / Decimal("100")
         net_quote = max(Decimal("0"), gross_quote - fee_amount)
@@ -2547,6 +3177,8 @@ class LongOnlyMomentumBot:
         raw_order: dict[str, Any] | None,
         fee_amount: Decimal | None = None,
         quote_amount: Decimal | None = None,
+        trigger_price: Decimal | None = None,
+        decision_metadata: dict[str, Any] | None = None,
     ) -> None:
         position = next((item for item in self._active_positions() if item.symbol == symbol), None)
         market_type = self._position_market_type(position) if position else MARKET_SPOT
@@ -2561,12 +3193,21 @@ class LongOnlyMomentumBot:
             "price": format_decimal(price),
             "dry_run": self.config.dry_run,
             "order": raw_order,
+            "trade_id": position.trade_id if position else "",
+            "strategy_version": position.strategy_version if position else STRATEGY_VERSION,
+            "is_synthetic": False,
         }
         if fee_amount is not None:
             record["fee_amount"] = format_decimal(fee_amount)
             record["fee_asset"] = self.config.quote_asset
         if quote_amount is not None:
             record["quote_amount"] = format_decimal(quote_amount)
+        if trigger_price is not None:
+            record["trigger_price"] = format_decimal(trigger_price)
+        for key, value in (decision_metadata or {}).items():
+            if value is None:
+                continue
+            record[key] = format_decimal(value) if isinstance(value, Decimal) else value
         record["event_uid"] = trade_event_uid(record)
         try:
             insert_trade_event(self.config.trade_journal_file, record)
@@ -2576,8 +3217,14 @@ class LongOnlyMomentumBot:
         self.state.trade_log = self.state.trade_log[-100:]
 
     def _touch_state(self) -> None:
-        self.state.updated_at = utc_now()
-        save_state(self.config.state_file, self.state)
+        state_lock = getattr(self, "_state_lock", None)
+        if state_lock is None:
+            self.state.updated_at = utc_now()
+            save_state(self.config.state_file, self.state)
+            return
+        with state_lock:
+            self.state.updated_at = utc_now()
+            save_state(self.config.state_file, self.state)
 
 
 def build_retry_session() -> requests.Session:
@@ -2598,6 +3245,18 @@ def build_retry_session() -> requests.Session:
     return session
 
 
+def position_state_from_raw(raw: dict[str, Any]) -> PositionState:
+    data = dict(raw)
+    if not str(data.get("market_type") or "").strip():
+        position_mode = str(data.get("position_mode") or "")
+        data["market_type"] = (
+            MARKET_FUTURES
+            if position_mode in {"futures-live", "contract-sim"}
+            else MARKET_SPOT
+        )
+    return PositionState(**data)
+
+
 def load_state(path: str) -> BotState:
     if not os.path.exists(path):
         return BotState(updated_at=utc_now())
@@ -2605,9 +3264,9 @@ def load_state(path: str) -> BotState:
         raw = json.load(handle)
     position = raw.get("position")
     positions_raw = raw.get("positions") or []
-    positions = [PositionState(**item) for item in positions_raw if item]
+    positions = [position_state_from_raw(item) for item in positions_raw if item]
     if position and not positions:
-        positions = [PositionState(**position)]
+        positions = [position_state_from_raw(position)]
     pending_raw = raw.get("pending_order")
     pending_order = PendingOrderState(**pending_raw) if isinstance(pending_raw, dict) and pending_raw else None
     protection_orders = [
@@ -3023,10 +3682,14 @@ def average_fill_price(order: dict[str, Any]) -> Decimal | None:
 def kline_confirmation_snapshot(rows: list[Any]) -> dict[str, Any]:
     closes: list[Decimal] = []
     quote_volumes: list[Decimal] = []
+    highs: list[Decimal] = []
+    lows: list[Decimal] = []
     for row in rows:
         if not isinstance(row, list) or len(row) < 8:
             continue
         closes.append(Decimal(str(row[4])))
+        highs.append(Decimal(str(row[2])))
+        lows.append(Decimal(str(row[3])))
         quote_volumes.append(Decimal(str(row[7])))
     if len(closes) < 3:
         return {
@@ -3035,6 +3698,9 @@ def kline_confirmation_snapshot(rows: list[Any]) -> dict[str, Any]:
             "volume_expanding": False,
             "close": Decimal("0"),
             "ema9": Decimal("0"),
+            "atr": Decimal("0"),
+            "ema_distance_atr": Decimal("0"),
+            "last_range_atr": Decimal("0"),
             "reason": "not enough kline data",
         }
     first_close = closes[0]
@@ -3048,15 +3714,58 @@ def kline_confirmation_snapshot(rows: list[Any]) -> dict[str, Any]:
         if previous_slice
         else Decimal("0")
     )
+    atr_value = average_true_range(rows, min(14, len(rows))) or Decimal("0")
     return {
         "roc_pct": roc_pct,
         "above_ema9": last_close >= ema9,
         "volume_expanding": previous_volume <= 0 or recent_volume >= previous_volume,
         "close": last_close,
         "ema9": ema9,
+        "atr": atr_value,
+        "ema_distance_atr": (
+            (last_close - ema9) / atr_value if atr_value > 0 else Decimal("0")
+        ),
+        "last_range_atr": (
+            (highs[-1] - lows[-1]) / atr_value if atr_value > 0 else Decimal("0")
+        ),
         "recent_quote_volume": recent_volume,
         "previous_quote_volume": previous_volume,
     }
+
+
+def entry_overextension_reasons(
+    config: BotConfig,
+    snapshots: dict[str, dict[str, Any]],
+) -> list[str]:
+    reasons: list[str] = []
+    roc_15m = decimal_from_any((snapshots.get("15m") or {}).get("roc_pct")) or Decimal("0")
+    roc_1h = decimal_from_any((snapshots.get("1h") or {}).get("roc_pct")) or Decimal("0")
+    ema_distance = (
+        decimal_from_any((snapshots.get("5m") or {}).get("ema_distance_atr"))
+        or Decimal("0")
+    )
+    candle_range = (
+        decimal_from_any((snapshots.get("5m") or {}).get("last_range_atr"))
+        or Decimal("0")
+    )
+    if config.max_entry_roc_15m_pct > 0 and roc_15m > config.max_entry_roc_15m_pct:
+        reasons.append(
+            f"15m ROC {roc_15m}% exceeds {config.max_entry_roc_15m_pct}%"
+        )
+    if config.max_entry_roc_1h_pct > 0 and roc_1h > config.max_entry_roc_1h_pct:
+        reasons.append(f"1h ROC {roc_1h}% exceeds {config.max_entry_roc_1h_pct}%")
+    if config.max_entry_extension_atr > 0 and ema_distance > config.max_entry_extension_atr:
+        reasons.append(
+            f"5m close is {ema_distance} ATR above EMA9, exceeds {config.max_entry_extension_atr}"
+        )
+    if (
+        config.max_entry_candle_range_atr > 0
+        and candle_range > config.max_entry_candle_range_atr
+    ):
+        reasons.append(
+            f"5m candle range {candle_range} ATR exceeds {config.max_entry_candle_range_atr}"
+        )
+    return reasons
 
 
 def ema(values: list[Decimal]) -> Decimal:
@@ -3135,7 +3844,20 @@ def square_confidence_snapshot(posts: list[SquarePost], diagnostics: dict[str, A
 
 
 def is_exit_trade_action(action: str) -> bool:
-    return "SELL" in action or "LIQUIDATION" in action
+    normalized = str(action or "").upper()
+    return (
+        "SELL" in normalized
+        or "LIQUIDATION" in normalized
+        or normalized
+        in {
+            "DRY_RUN_PARTIAL_TAKE_PROFIT",
+            "DRY_RUN_HARD_STOP",
+            "DRY_RUN_BREAKEVEN_EXIT",
+            "DRY_RUN_ATR_TRAILING_EXIT",
+            "DRY_RUN_GAP_EXIT",
+            "DRY_RUN_EARLY_FAILURE_EXIT",
+        }
+    )
 
 
 def trade_quote_amount_or_notional(item: dict[str, Any], qty: Decimal, price: Decimal) -> Decimal:
@@ -3233,11 +3955,37 @@ def ensure_trade_journal(path: str) -> None:
                 fee_amount TEXT NOT NULL DEFAULT '',
                 fee_asset TEXT NOT NULL DEFAULT '',
                 quote_amount TEXT NOT NULL DEFAULT '',
+                trigger_price TEXT NOT NULL DEFAULT '',
+                exit_reason TEXT NOT NULL DEFAULT '',
+                r_multiple TEXT NOT NULL DEFAULT '',
+                atr_value TEXT NOT NULL DEFAULT '',
+                peak_price TEXT NOT NULL DEFAULT '',
+                peak_drawdown_pct TEXT NOT NULL DEFAULT '',
+                trade_id TEXT NOT NULL DEFAULT '',
+                strategy_version TEXT NOT NULL DEFAULT '',
+                is_synthetic INTEGER NOT NULL DEFAULT 0,
                 order_json TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             )
             """
         )
+        event_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(trade_events)")}
+        for column_name in (
+            "trigger_price",
+            "exit_reason",
+            "r_multiple",
+            "atr_value",
+            "peak_price",
+            "peak_drawdown_pct",
+            "trade_id",
+            "strategy_version",
+            "is_synthetic",
+        ):
+            if column_name not in event_columns:
+                column_type = "INTEGER NOT NULL DEFAULT 0" if column_name == "is_synthetic" else "TEXT NOT NULL DEFAULT ''"
+                conn.execute(
+                    f"ALTER TABLE trade_events ADD COLUMN {column_name} {column_type}"
+                )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS trade_round_trips (
@@ -3282,8 +4030,10 @@ def insert_trade_event(path: str, record: dict[str, Any], rebuild: bool = True) 
             """
             INSERT OR IGNORE INTO trade_events (
                 event_uid, ts, action, symbol, market_type, position_mode, dry_run,
-                quantity, price, fee_amount, fee_asset, quote_amount, order_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                quantity, price, fee_amount, fee_asset, quote_amount, trigger_price,
+                exit_reason, r_multiple, atr_value, peak_price, peak_drawdown_pct,
+                trade_id, strategy_version, is_synthetic, order_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_uid,
@@ -3298,6 +4048,15 @@ def insert_trade_event(path: str, record: dict[str, Any], rebuild: bool = True) 
                 str(record.get("fee_amount") or ""),
                 str(record.get("fee_asset") or ""),
                 str(record.get("quote_amount") or ""),
+                str(record.get("trigger_price") or ""),
+                str(record.get("exit_reason") or ""),
+                str(record.get("r_multiple") or ""),
+                str(record.get("atr_value") or ""),
+                str(record.get("peak_price") or ""),
+                str(record.get("peak_drawdown_pct") or ""),
+                str(record.get("trade_id") or ""),
+                str(record.get("strategy_version") or ""),
+                1 if bool(record.get("is_synthetic", False)) else 0,
                 json.dumps(record.get("order") or {}, ensure_ascii=False, default=str),
                 utc_now(),
             ),
@@ -3445,6 +4204,143 @@ def build_round_trips_from_events(events: list[dict[str, Any]]) -> list[dict[str
     return completed
 
 
+def is_synthetic_trade_event(event: dict[str, Any]) -> bool:
+    if bool(event.get("is_synthetic")):
+        return True
+    # Older test runs accidentally used the default journal. Preserve those
+    # rows for audit, but keep their unmistakable fixed fixtures out of PnL.
+    symbol = str(event.get("symbol") or "").upper()
+    action = str(event.get("action") or "").upper()
+    qty = decimal_from_any(event.get("quantity"))
+    price = decimal_from_any(event.get("price"))
+    market_type = str(event.get("market_type") or "")
+    position_mode = str(event.get("position_mode") or "")
+    return (
+        not market_type
+        and not position_mode
+        and symbol in {"BTCUSDT", "ETHUSDT", "AAAUSDT", "BBBUSDT"}
+        and qty == Decimal("1")
+        and (
+            (action == "BUY" and price == Decimal("100"))
+            or (action == "SELL" and price in {Decimal("90"), Decimal("95")})
+        )
+    )
+
+
+def build_complete_trades_from_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    completed: list[dict[str, Any]] = []
+    active_by_trade_id: dict[str, dict[str, Any]] = {}
+    active_by_symbol: dict[str, list[str]] = {}
+
+    ordered_events = sorted(
+        events,
+        key=lambda item: (str(item.get("ts") or ""), int(item.get("id") or 0)),
+    )
+    for sequence, event in enumerate(ordered_events, start=1):
+        if is_synthetic_trade_event(event):
+            continue
+        action = str(event.get("action") or "").upper()
+        symbol = str(event.get("symbol") or "").upper()
+        qty = decimal_from_any(event.get("quantity")) or Decimal("0")
+        if not symbol or qty <= 0:
+            continue
+        event_trade_id = str(event.get("trade_id") or "")
+
+        if "BUY" in action:
+            trade_id = event_trade_id or f"legacy-{int(event.get('id') or sequence)}"
+            item = {
+                "trade_id": trade_id,
+                "strategy_version": str(event.get("strategy_version") or "legacy"),
+                "entry_event_id": int(event.get("id") or 0),
+                "symbol": symbol,
+                "market_type": str(event.get("market_type") or ""),
+                "position_mode": str(event.get("position_mode") or ""),
+                "dry_run": bool(event.get("dry_run", True)),
+                "entry_time": str(event.get("ts") or ""),
+                "entry_price": decimal_from_any(event.get("price")) or Decimal("0"),
+                "entry_quantity": qty,
+                "entry_amount": trade_quote_amount_or_notional(
+                    event,
+                    qty,
+                    decimal_from_any(event.get("price")) or Decimal("0"),
+                ),
+                "exit_amount": Decimal("0"),
+                "fee_amount": decimal_from_any(event.get("fee_amount")) or Decimal("0"),
+                "closed_quantity": Decimal("0"),
+                "partial_exit_count": 0,
+            }
+            active_by_trade_id[trade_id] = item
+            active_by_symbol.setdefault(symbol, []).append(trade_id)
+            continue
+
+        if not is_exit_trade_action(action):
+            continue
+        trade_id = event_trade_id if event_trade_id in active_by_trade_id else ""
+        if not trade_id:
+            candidates = active_by_symbol.get(symbol) or []
+            trade_id = candidates[0] if candidates else ""
+        item = active_by_trade_id.get(trade_id)
+        if item is None:
+            continue
+        is_legacy_orphan_dust = (
+            not event_trade_id
+            and action != "DRY_RUN_PARTIAL_TAKE_PROFIT"
+            and item["closed_quantity"] <= 0
+            and qty < item["entry_quantity"] * Decimal("0.01")
+        )
+        if is_legacy_orphan_dust:
+            continue
+
+        price = decimal_from_any(event.get("price")) or Decimal("0")
+        item["closed_quantity"] += qty
+        item["exit_amount"] += trade_quote_amount_or_notional(event, qty, price)
+        item["fee_amount"] += decimal_from_any(event.get("fee_amount")) or Decimal("0")
+        if action == "DRY_RUN_PARTIAL_TAKE_PROFIT":
+            item["partial_exit_count"] += 1
+            continue
+
+        exit_time = str(event.get("ts") or "")
+        opened_at = parse_timestamp(item["entry_time"])
+        closed_at = parse_timestamp(exit_time)
+        pnl = item["exit_amount"] - item["entry_amount"]
+        entry_amount = item["entry_amount"]
+        completed.append(
+            {
+                "trade_id": item["trade_id"],
+                "strategy_version": item["strategy_version"],
+                "entry_event_id": item["entry_event_id"],
+                "exit_event_id": int(event.get("id") or 0),
+                "symbol": symbol,
+                "market_type": item["market_type"],
+                "position_mode": item["position_mode"],
+                "dry_run": item["dry_run"],
+                "entry_time": item["entry_time"],
+                "exit_time": exit_time,
+                "quantity": format_decimal(item["entry_quantity"]),
+                "entry_price": format_decimal(item["entry_price"]),
+                "exit_price": format_decimal(price),
+                "entry_amount": format_decimal(entry_amount),
+                "exit_amount": format_decimal(item["exit_amount"]),
+                "fee_amount": format_decimal(item["fee_amount"]),
+                "pnl": format_decimal(pnl),
+                "return_pct": format_decimal(
+                    pnl / entry_amount * Decimal("100") if entry_amount > 0 else Decimal("0")
+                ),
+                "exit_reason": action,
+                "partial_exit_count": item["partial_exit_count"],
+                "duration_seconds": int((closed_at - opened_at).total_seconds())
+                if opened_at and closed_at
+                else 0,
+            }
+        )
+        active_by_trade_id.pop(trade_id, None)
+        active_by_symbol[symbol] = [
+            candidate for candidate in active_by_symbol.get(symbol, []) if candidate != trade_id
+        ]
+
+    return completed
+
+
 def query_trade_journal(path: str, view: str = "round_trips", limit: int = 50, offset: int = 0) -> dict[str, Any]:
     if not trade_journal_enabled(path):
         return {"view": view, "items": [], "total": 0, "limit": limit, "offset": offset}
@@ -3452,7 +4348,13 @@ def query_trade_journal(path: str, view: str = "round_trips", limit: int = 50, o
     db_path = trade_journal_path(path)
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
-    normalized_view = "events" if view == "events" else "round_trips"
+    normalized_view = (
+        "events"
+        if view == "events"
+        else "complete_trades"
+        if view == "complete_trades"
+        else "round_trips"
+    )
     with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         if normalized_view == "events":
@@ -3461,15 +4363,23 @@ def query_trade_journal(path: str, view: str = "round_trips", limit: int = 50, o
                 "SELECT * FROM trade_events ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
-        else:
+        elif normalized_view == "round_trips":
             total = int(conn.execute("SELECT COUNT(*) FROM trade_round_trips").fetchone()[0])
             rows = conn.execute(
                 "SELECT * FROM trade_round_trips ORDER BY exit_time DESC, id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
+        else:
+            events = [
+                dict(row)
+                for row in conn.execute("SELECT * FROM trade_events ORDER BY ts ASC, id ASC")
+            ]
+            complete = list(reversed(build_complete_trades_from_events(events)))
+            total = len(complete)
+            rows = complete[offset : offset + limit]
     return {
         "view": normalized_view,
-        "items": [dict(row) for row in rows],
+        "items": [dict(row) if not isinstance(row, dict) else row for row in rows],
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -3484,8 +4394,9 @@ def trade_journal_stats(path: str, quote_asset: str) -> dict[str, Any] | None:
     db_path = trade_journal_path(path)
     with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        rows = [dict(row) for row in conn.execute("SELECT * FROM trade_round_trips ORDER BY exit_time ASC, id ASC")]
+        events = [dict(row) for row in conn.execute("SELECT * FROM trade_events ORDER BY ts ASC, id ASC")]
         event_count = int(conn.execute("SELECT COUNT(*) FROM trade_events").fetchone()[0])
+    rows = build_complete_trades_from_events(events)
     if not rows:
         return None
     pnls = [decimal_from_any(item.get("pnl")) or Decimal("0") for item in rows]
@@ -3665,13 +4576,22 @@ def build_signal_record(
 ) -> dict[str, Any]:
     return stringify_decimals(
         {
-            "schema_version": 1,
+            "schema_version": 2,
+            "strategy_version": STRATEGY_VERSION,
             "recorded_at": utc_now(),
             "source": source,
             "dry_run": config.dry_run,
             "quote_asset": config.quote_asset,
             "fixed_order_quote_usdt": config.order_quote_amount,
             "min_square_confidence_score": config.min_square_confidence_score,
+            "strategy_parameters": {
+                "leverage_multiplier": config.leverage_multiplier,
+                "risk_per_trade_pct": config.risk_per_trade_pct,
+                "max_entry_roc_15m_pct": config.max_entry_roc_15m_pct,
+                "max_entry_roc_1h_pct": config.max_entry_roc_1h_pct,
+                "max_entry_extension_atr": config.max_entry_extension_atr,
+                "max_entry_candle_range_atr": config.max_entry_candle_range_atr,
+            },
             "square_confidence": square_confidence or {},
             "hot_posts": signal_post_summary(posts),
             "candidates": [signal_candidate_row(item) for item in candidates[: config.top_coin_limit]],
@@ -3805,15 +4725,23 @@ def update_signal_record_future_returns(
     config: BotConfig,
     record_file: str | None = None,
     client: BinanceSpotClient | None = None,
+    futures_client: BinanceFuturesClient | None = None,
 ) -> dict[str, Any]:
     path = record_file or config.signal_record_file
     records = read_signal_records(path)
     if not records:
         return {"record_file": path, "record_count": 0, "updated_count": 0}
-    market_client = client or BinanceSpotClient(config)
+    spot_market_client = client or BinanceSpotClient(config)
+    futures_market_client = futures_client or (
+        spot_market_client if client is not None else BinanceFuturesClient(config)
+    )
     updated = 0
     for record in records:
-        if update_record_future_returns(record, market_client):
+        if update_record_future_returns(
+            record,
+            spot_market_client,
+            futures_market_client,
+        ):
             updated += 1
     if updated:
         write_signal_records(path, records)
@@ -3822,13 +4750,23 @@ def update_signal_record_future_returns(
     return result
 
 
-def update_record_future_returns(record: dict[str, Any], client: BinanceSpotClient) -> bool:
+def update_record_future_returns(
+    record: dict[str, Any],
+    spot_client: BinanceSpotClient,
+    futures_client: BinanceFuturesClient | None = None,
+) -> bool:
     candidate = record.get("candidate") or {}
     symbol = str(candidate.get("symbol") or "")
     entry_price = decimal_from_any(candidate.get("last_price"))
     recorded_at = parse_timestamp(record.get("recorded_at") or record.get("checked_at"))
     if not symbol or not entry_price or entry_price <= 0 or recorded_at is None:
         return False
+    market_type = str(candidate.get("market_type") or MARKET_SPOT)
+    client = (
+        futures_client
+        if market_type == MARKET_FUTURES and futures_client is not None
+        else spot_client
+    )
     returns = dict(record.get("future_returns") or {})
     changed = False
     for key, interval, minutes in FUTURE_RETURN_INTERVALS:
@@ -3956,6 +4894,69 @@ def default_dry_run_initial_equity_usdt(order_quote_amount: Decimal, max_open_po
     return order_quote_amount * Decimal(max(1, max_open_positions))
 
 
+def risk_based_order_size(
+    equity: Decimal,
+    entry_price: Decimal,
+    stop_price: Decimal,
+    leverage: Decimal,
+    risk_pct: Decimal,
+    max_margin_quote: Decimal,
+) -> dict[str, Decimal]:
+    if (
+        equity <= 0
+        or entry_price <= 0
+        or stop_price <= 0
+        or stop_price >= entry_price
+        or leverage <= 0
+        or risk_pct <= 0
+    ):
+        return {
+            "risk_budget": Decimal("0"),
+            "quantity": Decimal("0"),
+            "notional_quote": Decimal("0"),
+            "margin_quote": Decimal("0"),
+        }
+    risk_budget = equity * risk_pct / Decimal("100")
+    risk_per_unit = entry_price - stop_price
+    quantity = risk_budget / risk_per_unit
+    notional_quote = quantity * entry_price
+    margin_quote = notional_quote / leverage
+    if max_margin_quote > 0 and margin_quote > max_margin_quote:
+        margin_quote = max_margin_quote
+        notional_quote = margin_quote * leverage
+        quantity = notional_quote / entry_price
+    return {
+        "risk_budget": risk_budget,
+        "quantity": quantity,
+        "notional_quote": notional_quote,
+        "margin_quote": margin_quote,
+    }
+
+
+def consecutive_loss_pause_until(
+    completed_trades: list[dict[str, Any]],
+    max_consecutive_losses: int,
+    pause_minutes: int,
+    now: datetime | None = None,
+) -> datetime | None:
+    if max_consecutive_losses <= 0 or pause_minutes <= 0:
+        return None
+    streak: list[dict[str, Any]] = []
+    for trade in reversed(completed_trades):
+        pnl = decimal_from_any(trade.get("pnl")) or Decimal("0")
+        if pnl >= 0:
+            break
+        streak.append(trade)
+    if len(streak) < max_consecutive_losses:
+        return None
+    last_exit = parse_timestamp(streak[0].get("exit_time"))
+    if last_exit is None:
+        return None
+    until = last_exit + timedelta(minutes=pause_minutes)
+    current = now or datetime.now(timezone.utc)
+    return until if until > current else None
+
+
 def effective_dry_run_initial_equity(config: BotConfig) -> Decimal:
     if config.dry_run_initial_equity_usdt is not None:
         return config.dry_run_initial_equity_usdt
@@ -4032,6 +5033,182 @@ def dynamic_stop_price(config: BotConfig, entry_price: Decimal, highest_price: D
     return stop_price, stop_mode
 
 
+def average_true_range(rows: list[Any], period: int = 14) -> Decimal | None:
+    if period <= 0 or len(rows) < period:
+        return None
+    true_ranges: list[Decimal] = []
+    previous_close: Decimal | None = None
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        high = decimal_from_any(row[2])
+        low = decimal_from_any(row[3])
+        close = decimal_from_any(row[4])
+        if high is None or low is None or close is None:
+            continue
+        true_range = high - low
+        if previous_close is not None:
+            true_range = max(true_range, abs(high - previous_close), abs(low - previous_close))
+        true_ranges.append(true_range)
+        previous_close = close
+    if len(true_ranges) < period:
+        return None
+    selected = true_ranges[-period:]
+    return sum(selected, Decimal("0")) / Decimal(period)
+
+
+def adaptive_exit_snapshot(
+    config: BotConfig,
+    position: PositionState,
+    current_price: Decimal,
+    atr_value: Decimal | None = None,
+) -> dict[str, Any]:
+    if (
+        not config.dry_run
+        or not config.adaptive_exit_enabled
+        or position.market_type != MARKET_FUTURES
+        or position.position_mode != "contract-sim"
+    ):
+        return {"action": "disabled"}
+
+    entry_price = decimal_from_any(position.entry_price) or Decimal("0")
+    if entry_price <= 0 or current_price <= 0:
+        return {"action": "invalid_price"}
+    highest_price = max(
+        entry_price,
+        current_price,
+        decimal_from_any(position.highest_price) or entry_price,
+    )
+    risk_per_unit = decimal_from_any(position.risk_per_unit) or Decimal("0")
+    if risk_per_unit <= 0:
+        initial_stop, _ = effective_initial_stop_price(
+            config,
+            entry_price,
+            decimal_from_any(position.leverage_multiplier) or config.leverage_multiplier,
+            True,
+        )
+        risk_per_unit = max(Decimal("0"), entry_price - initial_stop)
+    if risk_per_unit <= 0:
+        return {"action": "invalid_risk"}
+
+    initial_stop = entry_price - risk_per_unit
+    previous_stop = decimal_from_any(position.active_stop_price) or initial_stop
+    active_stop = max(initial_stop, previous_stop)
+    r_multiple = (current_price - entry_price) / risk_per_unit
+    stage = str(position.exit_stage or "initial")
+
+    if r_multiple >= config.breakeven_trigger_r:
+        breakeven_stop = entry_price * (
+            Decimal("1") + config.breakeven_cost_buffer_pct / Decimal("100")
+        )
+        if breakeven_stop > active_stop:
+            active_stop = breakeven_stop
+        if stage == "initial":
+            stage = "breakeven"
+
+    if position.partial_take_profit_done:
+        raw_distance = (
+            atr_value * config.atr_multiplier
+            if atr_value is not None and atr_value > 0
+            else highest_price * Decimal("0.03")
+        )
+        minimum_distance = highest_price * config.trailing_min_pct / Decimal("100")
+        maximum_distance = highest_price * config.trailing_max_pct / Decimal("100")
+        trailing_distance = min(max(raw_distance, minimum_distance), maximum_distance)
+        profit_floor = entry_price + risk_per_unit * config.post_partial_profit_floor_r
+        active_stop = max(active_stop, highest_price - trailing_distance, profit_floor)
+        stage = "atr_trailing"
+
+    action = "hold"
+    trigger_price: Decimal | None = None
+    close_fraction = Decimal("0")
+    if current_price <= active_stop:
+        trigger_price = active_stop
+        stop_gap_pct = (
+            (active_stop - current_price) / active_stop * Decimal("100")
+            if active_stop > 0
+            else Decimal("0")
+        )
+        gap_threshold_pct = max(Decimal("0.5"), config.slippage_pct * Decimal("2"))
+        if stop_gap_pct >= gap_threshold_pct:
+            action = "gap_exit"
+        elif stage == "atr_trailing":
+            action = "atr_trailing_exit"
+        elif stage == "breakeven":
+            action = "breakeven_exit"
+        else:
+            action = "hard_stop"
+        close_fraction = Decimal("1")
+    elif (
+        not position.partial_take_profit_done
+        and r_multiple >= config.partial_take_profit_r
+    ):
+        action = "partial_take_profit"
+        trigger_price = entry_price + risk_per_unit * config.partial_take_profit_r
+        close_fraction = config.partial_take_profit_fraction
+
+    return {
+        "action": action,
+        "stage": stage,
+        "entry_price": entry_price,
+        "highest_price": highest_price,
+        "risk_per_unit": risk_per_unit,
+        "r_multiple": r_multiple,
+        "atr_value": atr_value,
+        "active_stop_price": active_stop,
+        "trigger_price": trigger_price,
+        "close_fraction": close_fraction,
+        "partial_take_profit_done": position.partial_take_profit_done,
+        "peak_drawdown_pct": (
+            (highest_price - current_price) / highest_price * Decimal("100")
+            if highest_price > 0
+            else Decimal("0")
+        ),
+        "next_partial_take_profit_price": entry_price + risk_per_unit * config.partial_take_profit_r,
+    }
+
+
+def early_failure_exit_snapshot(
+    config: BotConfig,
+    position: PositionState,
+    current_price: Decimal,
+    ema9: Decimal,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if (
+        not config.dry_run
+        or config.early_failure_minutes <= 0
+        or position.partial_take_profit_done
+    ):
+        return {"action": "disabled"}
+    opened_at = parse_timestamp(position.opened_at)
+    if opened_at is None:
+        return {"action": "missing_open_time"}
+    current = now or datetime.now(timezone.utc)
+    elapsed_seconds = Decimal(str((current - opened_at).total_seconds()))
+    if elapsed_seconds < Decimal(config.early_failure_minutes * 60):
+        return {"action": "hold"}
+    entry_price = decimal_from_any(position.entry_price) or Decimal("0")
+    highest_price = decimal_from_any(position.highest_price) or entry_price
+    risk_per_unit = decimal_from_any(position.risk_per_unit) or Decimal("0")
+    if entry_price <= 0 or risk_per_unit <= 0:
+        return {"action": "invalid_risk"}
+    peak_r = (highest_price - entry_price) / risk_per_unit
+    should_exit = (
+        peak_r < config.early_failure_min_r
+        and current_price < entry_price
+        and ema9 > 0
+        and current_price < ema9
+    )
+    return {
+        "action": "early_failure_exit" if should_exit else "hold",
+        "peak_r_multiple": peak_r,
+        "elapsed_seconds": elapsed_seconds,
+        "ema9": ema9,
+        "trigger_price": min(entry_price, ema9) if should_exit else None,
+    }
+
+
 def normalize_trade_market_mode(value: str) -> str:
     mode = str(value or "futures_preferred").strip().lower().replace("-", "_")
     if mode not in TRADE_MARKET_MODES:
@@ -4052,14 +5229,14 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         futures_base_url = DEFAULT_FUTURES_TESTNET_BASE_URL
 
     order_quote_amount = decimal_env("ORDER_QUOTE_USDT", "50") or Decimal("50")
-    max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "15"))
+    max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "4"))
     dry_run_initial_equity_usdt = decimal_env("DRY_RUN_INITIAL_EQUITY_USDT")
     if dry_run_initial_equity_usdt is None:
         dry_run_initial_equity_usdt = default_dry_run_initial_equity_usdt(order_quote_amount, max_open_positions)
     fixed_stop_loss_usdt = decimal_env("FIXED_STOP_LOSS_USDT")
     if fixed_stop_loss_usdt is None:
         fixed_stop_loss_usdt = default_fixed_stop_loss_usdt(order_quote_amount)
-    leverage_multiplier = decimal_env("LEVERAGE_MULTIPLIER", "3") or Decimal("3")
+    leverage_multiplier = decimal_env("LEVERAGE_MULTIPLIER", "5") or Decimal("5")
     if leverage_multiplier <= 0:
         raise ValueError("LEVERAGE_MULTIPLIER must be greater than zero")
 
@@ -4078,9 +5255,9 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         contract_simulation_enabled=bool_env("CONTRACT_SIMULATION_ENABLED", True),
         contract_max_margin_loss_pct=decimal_env("CONTRACT_MAX_MARGIN_LOSS_PCT", "20") or Decimal("20"),
         liquidation_stop_buffer_pct=decimal_env("LIQUIDATION_STOP_BUFFER_PCT", "2") or Decimal("2"),
-        min_quote_volume=decimal_env("MIN_QUOTE_VOLUME_USDT", "5000000") or Decimal("5000000"),
-        min_price_change_percent=decimal_env("MIN_PRICE_CHANGE_PERCENT", "3") or Decimal("3"),
-        min_volatility_percent=decimal_env("MIN_VOLATILITY_PERCENT", "5") or Decimal("5"),
+        min_quote_volume=decimal_env("MIN_QUOTE_VOLUME_USDT", "2500000") or Decimal("2500000"),
+        min_price_change_percent=decimal_env("MIN_PRICE_CHANGE_PERCENT", "2") or Decimal("2"),
+        min_volatility_percent=decimal_env("MIN_VOLATILITY_PERCENT", "4") or Decimal("4"),
         top_post_limit=int(os.getenv("TOP_POST_LIMIT", "25")),
         top_coin_limit=int(os.getenv("TOP_COIN_LIMIT", "10")),
         poll_seconds=int(os.getenv("POLL_SECONDS", "300")),
@@ -4091,19 +5268,32 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         breakeven_offset_pct=decimal_env("BREAKEVEN_OFFSET_PCT", "0.2"),
         trailing_start_pct=decimal_env("TRAILING_START_PCT", "6"),
         trailing_stop_pct=decimal_env("TRAILING_STOP_PCT", "3"),
+        adaptive_exit_enabled=bool_env("ADAPTIVE_EXIT_ENABLED", True),
+        risk_monitor_interval_seconds=max(1, int(os.getenv("RISK_MONITOR_INTERVAL_SECONDS", "1"))),
+        atr_period=max(1, int(os.getenv("ATR_PERIOD", "14"))),
+        atr_multiplier=decimal_env("ATR_MULTIPLIER", "3") or Decimal("3"),
+        trailing_min_pct=decimal_env("TRAILING_MIN_PCT", "2") or Decimal("2"),
+        trailing_max_pct=decimal_env("TRAILING_MAX_PCT", "8") or Decimal("8"),
+        partial_take_profit_r=decimal_env("PARTIAL_TAKE_PROFIT_R", "2") or Decimal("2"),
+        partial_take_profit_fraction=decimal_env("PARTIAL_TAKE_PROFIT_FRACTION", "0.5") or Decimal("0.5"),
+        breakeven_trigger_r=decimal_env("BREAKEVEN_TRIGGER_R", "1") or Decimal("1"),
+        breakeven_cost_buffer_pct=decimal_env("BREAKEVEN_COST_BUFFER_PCT", "0.25") or Decimal("0.25"),
+        post_partial_profit_floor_r=decimal_env("POST_PARTIAL_PROFIT_FLOOR_R", "0.5") or Decimal("0.5"),
         fixed_stop_loss_usdt=fixed_stop_loss_usdt,
         fixed_stop_after_first_round_trip=bool_env("FIXED_STOP_AFTER_FIRST_ROUND_TRIP", False),
         fixed_stop_equity_usdt=decimal_env("FIXED_STOP_EQUITY_USDT"),
-        cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "30")),
-        max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "9999999")),
+        cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "60")),
+        max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "12")),
         max_daily_loss_usdt=decimal_env("MAX_DAILY_LOSS_USDT", "9999999"),
-        max_total_exposure_pct=decimal_env("MAX_TOTAL_EXPOSURE_PCT", "0") or Decimal("0"),
-        max_symbol_exposure_pct=decimal_env("MAX_SYMBOL_EXPOSURE_PCT", "0") or Decimal("0"),
-        max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0")),
+        max_daily_loss_pct=decimal_env("MAX_DAILY_LOSS_PCT", "2") or Decimal("2"),
+        max_total_exposure_pct=decimal_env("MAX_TOTAL_EXPOSURE_PCT", "100") or Decimal("100"),
+        max_symbol_exposure_pct=decimal_env("MAX_SYMBOL_EXPOSURE_PCT", "25") or Decimal("25"),
+        max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")),
+        consecutive_loss_pause_minutes=int(os.getenv("CONSECUTIVE_LOSS_PAUSE_MINUTES", "240")),
         max_intraday_drawdown_pct=decimal_env("MAX_INTRADAY_DRAWDOWN_PCT", "0") or Decimal("0"),
-        risk_per_trade_pct=decimal_env("RISK_PER_TRADE_PCT", "0") or Decimal("0"),
+        risk_per_trade_pct=decimal_env("RISK_PER_TRADE_PCT", "0.75") or Decimal("0.75"),
         fee_rate_pct=decimal_env("FEE_RATE_PCT", "0.1"),
-        slippage_pct=decimal_env("SLIPPAGE_PCT", "0.05"),
+        slippage_pct=decimal_env("SLIPPAGE_PCT", "0.08"),
         asset_whitelist=tuple_env("ASSET_WHITELIST"),
         asset_blacklist=tuple_env("ASSET_BLACKLIST"),
         market_filter_enabled=bool_env("MARKET_FILTER_ENABLED", False),
@@ -4115,6 +5305,12 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         min_square_confidence_score=decimal_env("MIN_SQUARE_CONFIDENCE_SCORE", "35") or Decimal("35"),
         max_spread_bps=decimal_env("MAX_SPREAD_BPS", "50") or Decimal("50"),
         min_orderbook_depth_usdt=decimal_env("MIN_ORDERBOOK_DEPTH_USDT", "1000") or Decimal("1000"),
+        max_entry_roc_15m_pct=decimal_env("MAX_ENTRY_ROC_15M_PCT", "12") or Decimal("12"),
+        max_entry_roc_1h_pct=decimal_env("MAX_ENTRY_ROC_1H_PCT", "20") or Decimal("20"),
+        max_entry_extension_atr=decimal_env("MAX_ENTRY_EXTENSION_ATR", "2.5") or Decimal("2.5"),
+        max_entry_candle_range_atr=decimal_env("MAX_ENTRY_CANDLE_RANGE_ATR", "2.5") or Decimal("2.5"),
+        early_failure_minutes=int(os.getenv("EARLY_FAILURE_MINUTES", "15")),
+        early_failure_min_r=decimal_env("EARLY_FAILURE_MIN_R", "0.5") or Decimal("0.5"),
         exchange_protection_enabled=bool_env("EXCHANGE_PROTECTION_ENABLED", True),
         oco_stop_limit_slippage_pct=decimal_env("OCO_STOP_LIMIT_SLIPPAGE_PCT", "0.5") or Decimal("0.5"),
         signal_recording_enabled=bool_env("SIGNAL_RECORDING_ENABLED", True),

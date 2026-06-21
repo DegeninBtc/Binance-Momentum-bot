@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -27,7 +28,13 @@ def main() -> int:
         "event_count": 0,
         "total_pnl": "0",
     }
-    rounds = bot.query_trade_journal(args.path, "round_trips", 500, 0).get("items", [])
+    with sqlite3.connect(args.path) as conn:
+        conn.row_factory = sqlite3.Row
+        events = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM trade_events ORDER BY ts ASC, id ASC")
+        ]
+    rounds = bot.build_complete_trades_from_events(events)
     by_reason: dict[str, int] = {}
     by_symbol: dict[str, int] = {}
     for item in rounds:

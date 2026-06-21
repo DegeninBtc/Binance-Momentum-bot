@@ -63,12 +63,13 @@ npm run build
 
 ```powershell
 $env:ORDER_QUOTE_USDT="50"
-$env:MAX_OPEN_POSITIONS="15"
-$env:LEVERAGE_MULTIPLIER="3"
+$env:MAX_OPEN_POSITIONS="4"
+$env:LEVERAGE_MULTIPLIER="5"
 $env:TRADE_MARKET_MODE="futures_preferred"
 $env:FUTURES_MARGIN_TYPE="ISOLATED"
-$env:MAX_DAILY_TRADES="9999999"
-$env:MAX_DAILY_LOSS_USDT="9999999"
+$env:MAX_DAILY_TRADES="12"
+$env:MAX_DAILY_LOSS_PCT="2"
+$env:RISK_PER_TRADE_PCT="0.75"
 $env:POLL_SECONDS="300"
 ```
 
@@ -135,7 +136,7 @@ python .\binance_square_momentum_bot.py --live
 | 预设 | 用途 | 杠杆 | 最大持仓 |
 | --- | --- | ---: | ---: |
 | 保守 | 更高门槛、更低频 | 当前设置 | 1 |
-| 标准 | 默认观察模式 | 3x | 15 |
+| 标准 | B 路线默认观察模式 | 5x | 4 |
 | 激进 | 更宽松、更高风险 | 5x | 20 |
 
 ## 核心策略
@@ -160,8 +161,22 @@ python .\binance_square_momentum_bot.py --live
 
 - Square 数据置信度。
 - 5m / 15m / 1h 短周期 K 线确认。
+- 只使用已收盘 K 线，拒绝 15m / 1h 过度拉升、偏离 EMA 或单根振幅过大的追高信号。
 - order book spread 和深度。
 - 账户级风控和每日限制。
+
+### B 路线默认策略
+
+B 路线针对历史记录中“高频追涨、短时失败、敞口过大和交易切片误计为多笔交易”的问题：
+
+- 每笔完整交易使用稳定的 `trade_id`，分批止盈与最终退出合并统计；测试夹具和旧孤立残仓不计入收益。
+- 单笔权益风险默认 `0.75%`，按有效止损距离反推仓位，`ORDER_QUOTE_USDT` 作为保证金上限。
+- 最多 4 个仓位、总敞口 100%、单币敞口 25%、每天最多 12 次开仓、日亏损 2% 熔断。
+- 连续亏损 3 笔后暂停 240 分钟。
+- 默认拒绝 `15m ROC > 12%`、`1h ROC > 20%`、距 EMA 超过 `2.5 ATR` 或最新已收盘 K 线振幅超过 `2.5 ATR` 的候选。
+- 入场后 15 分钟内若峰值未达到 `+0.5R`，触发早期失败退出；已有分批止盈的仓位不适用。
+
+这些参数默认只改变 dry-run 的动态定仓、过热过滤和早期失败退出。切换 live 前仍需用新的样本完成 walk-forward 验证。
 
 ## 市场模式
 
@@ -193,6 +208,28 @@ live 合约开仓前会尝试设置逐仓/全仓模式和杠杆；合约平仓�
 - 移动止损：`TRAILING_START_PCT` / `TRAILING_STOP_PCT`。
 - 固定金额止损：`FIXED_STOP_LOSS_USDT`。
 
+Dry-run 合约模拟默认启用独立的 1 秒自适应退出监控。扫描频率仍由
+`POLL_SECONDS` 控制，持仓风控优先读取 Binance Futures 1 秒 Mark Price
+WebSocket，行情超过 5 秒未更新时按最多每 5 秒一次的频率回退到 REST。
+
+```powershell
+$env:ADAPTIVE_EXIT_ENABLED="true"
+$env:RISK_MONITOR_INTERVAL_SECONDS="1"
+$env:ATR_PERIOD="14"
+$env:ATR_MULTIPLIER="3"
+$env:TRAILING_MIN_PCT="2"
+$env:TRAILING_MAX_PCT="8"
+$env:PARTIAL_TAKE_PROFIT_R="2"
+$env:PARTIAL_TAKE_PROFIT_FRACTION="0.5"
+$env:BREAKEVEN_TRIGGER_R="1"
+$env:BREAKEVEN_COST_BUFFER_PCT="0.25"
+$env:POST_PARTIAL_PROFIT_FLOOR_R="0.5"
+```
+
+自适应策略以有效初始止损距离作为 `1R`：`+1R` 抬升成本保护，`+2R`
+止盈 50%，余仓使用 `峰值 - 3 × ATR(14, 1m)`，并把跟踪距离限制在峰值
+的 2%–8%。该引擎只作用于 dry-run；live 继续使用原有退出逻辑。
+
 合约模拟和合约 live 会额外使用强平保护：
 
 ```text
@@ -213,14 +250,17 @@ $env:LIQUIDATION_STOP_BUFFER_PCT="2"
 ### 账户级风控
 
 ```powershell
-$env:MAX_TOTAL_EXPOSURE_PCT="0"
-$env:MAX_SYMBOL_EXPOSURE_PCT="0"
-$env:MAX_CONSECUTIVE_LOSSES="0"
+$env:MAX_TOTAL_EXPOSURE_PCT="100"
+$env:MAX_SYMBOL_EXPOSURE_PCT="25"
+$env:MAX_CONSECUTIVE_LOSSES="3"
+$env:CONSECUTIVE_LOSS_PAUSE_MINUTES="240"
+$env:MAX_DAILY_TRADES="12"
+$env:MAX_DAILY_LOSS_PCT="2"
 $env:MAX_INTRADAY_DRAWDOWN_PCT="0"
-$env:RISK_PER_TRADE_PCT="0"
+$env:RISK_PER_TRADE_PCT="0.75"
 ```
 
-默认 `0` 表示关闭对应限制。
+对应参数设为 `0` 可关闭限制。
 
 ### live 安全检查
 
@@ -292,7 +332,7 @@ python .\tools\walk_forward_signal_records.py .\signal_records.jsonl
 
 ```powershell
 python .\tools\analyze_trade_journal.py .\trade_journal.sqlite3
-python .\tools\export_trade_journal.py .\trade_journal.sqlite3 --view round_trips --output .\trade_journal_round_trips.csv
+python .\tools\export_trade_journal.py .\trade_journal.sqlite3 --view complete_trades --output .\trade_journal_complete_trades.csv
 python .\tools\export_trade_journal.py .\trade_journal.sqlite3 --view events --output .\trade_journal_events.csv
 ```
 

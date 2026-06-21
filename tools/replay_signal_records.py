@@ -59,6 +59,8 @@ def replay(records: list[dict[str, Any]], horizon: str = "1h") -> dict[str, Any]
         "horizon": horizon,
         "trade_count": len(entered_records),
         "trades_with_future_return": len(known_returns),
+        "validation_ready": bool(entered_records) and len(known_returns) == len(entered_records),
+        "missing_future_returns": len(entered_records) - len(known_returns),
         "win_rate": (len(wins) / len(known_returns)) if known_returns else None,
         "average_return_pct": (sum(known_returns) / len(known_returns)) if known_returns else None,
         "max_consecutive_losses": max_consecutive_losses(records, horizon),

@@ -78,6 +78,24 @@ export function actionLabel(action = ""): string {
   if (action.includes("BUY")) {
     return "买入";
   }
+  if (action.includes("PARTIAL_TAKE_PROFIT")) {
+    return "部分止盈";
+  }
+  if (action.includes("BREAKEVEN_EXIT")) {
+    return "保本退出";
+  }
+  if (action.includes("ATR_TRAILING_EXIT")) {
+    return "ATR 移动止盈";
+  }
+  if (action.includes("GAP_EXIT")) {
+    return "跳空穿越止损";
+  }
+  if (action.includes("HARD_STOP")) {
+    return "硬止损";
+  }
+  if (action.includes("EARLY_FAILURE_EXIT")) {
+    return "早期失败退出";
+  }
   if (action.includes("MANUAL")) {
     return "手动平仓";
   }

@@ -81,8 +81,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   futures_margin_type: "ISOLATED",
   order_quote_amount: "50",
   dry_run_initial_equity_usdt: "750",
-  max_open_positions: "15",
-  leverage_multiplier: "3",
+  max_open_positions: "4",
+  leverage_multiplier: "5",
   contract_max_margin_loss_pct: "20",
   liquidation_stop_buffer_pct: "2",
   contract_simulation_enabled: true,
@@ -102,16 +102,35 @@ const DEFAULT_SETTINGS: SettingsState = {
   breakeven_offset_pct: "0.2",
   trailing_start_pct: "6",
   trailing_stop_pct: "3",
+  adaptive_exit_enabled: true,
+  risk_monitor_interval_seconds: "1",
+  atr_period: "14",
+  atr_multiplier: "3",
+  trailing_min_pct: "2",
+  trailing_max_pct: "8",
+  partial_take_profit_r: "2",
+  partial_take_profit_fraction: "0.5",
+  breakeven_trigger_r: "1",
+  breakeven_cost_buffer_pct: "0.25",
+  post_partial_profit_floor_r: "0.5",
   fixed_stop_loss_usdt: "10",
   fixed_stop_equity_usdt: "",
-  cooldown_minutes: "30",
-  max_daily_trades: "9999999",
+  cooldown_minutes: "60",
+  max_daily_trades: "12",
   max_daily_loss_usdt: "9999999",
-  max_total_exposure_pct: "0",
-  max_symbol_exposure_pct: "0",
-  max_consecutive_losses: "0",
+  max_daily_loss_pct: "2",
+  max_total_exposure_pct: "100",
+  max_symbol_exposure_pct: "25",
+  max_consecutive_losses: "3",
+  consecutive_loss_pause_minutes: "240",
   max_intraday_drawdown_pct: "0",
-  risk_per_trade_pct: "0",
+  risk_per_trade_pct: "0.75",
+  max_entry_roc_15m_pct: "12",
+  max_entry_roc_1h_pct: "20",
+  max_entry_extension_atr: "2.5",
+  max_entry_candle_range_atr: "2.5",
+  early_failure_minutes: "15",
+  early_failure_min_r: "0.5",
   fee_rate_pct: "0.1",
   slippage_pct: "0.05",
   poll_seconds: "300",
@@ -173,16 +192,22 @@ const STRATEGY_PRESETS = {
     slippage_pct: "0.08",
   },
   standard: {
-    min_price_change_percent: "3",
-    min_volatility_percent: "5",
-    min_quote_volume: "5000000",
-    cooldown_minutes: "30",
-    max_daily_trades: "9999999",
+    min_price_change_percent: "2",
+    min_volatility_percent: "4",
+    min_quote_volume: "2500000",
+    cooldown_minutes: "60",
+    max_daily_trades: "12",
     max_daily_loss_usdt: "9999999",
-    max_open_positions: "15",
-    leverage_multiplier: "3",
+    max_daily_loss_pct: "2",
+    max_open_positions: "4",
+    leverage_multiplier: "5",
+    max_total_exposure_pct: "100",
+    max_symbol_exposure_pct: "25",
+    max_consecutive_losses: "3",
+    consecutive_loss_pause_minutes: "240",
+    risk_per_trade_pct: "0.75",
     fee_rate_pct: "0.1",
-    slippage_pct: "0.05",
+    slippage_pct: "0.08",
   },
   aggressive: {
     min_price_change_percent: "2",
@@ -212,6 +237,7 @@ const SETTINGS_BROWSER_DEFAULT_MIGRATION_KEY = "dashboard-settings-browser-defau
 const SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY = "dashboard-settings-contract-default-v1";
 const SETTINGS_PRESET_DEFAULT_MIGRATION_KEY = "dashboard-settings-preset-default-v1";
 const SETTINGS_DRY_RUN_LIMIT_MIGRATION_KEY = "dashboard-settings-dry-run-limits-v1";
+const SETTINGS_B_ROUTE_MIGRATION_KEY = "dashboard-settings-b-route-v1";
 const FAVORITES_STORAGE_KEY = "dashboard-favorite-symbols";
 
 function App() {
@@ -1281,6 +1307,14 @@ function PositionDetailCard({
         <PositionFact label={isContractSim ? "名义仓位" : "最高"} value={isContractSim ? formatMoney(item.snapshot?.notional_quote, quoteAsset) : formatPrice(item.highestPrice)} />
         <PositionFact label="有效止损" value={formatPrice(item.snapshot?.dynamic_stop_price)} tone={item.snapshot?.stop_triggered ? "danger" : undefined} />
         <PositionFact label={isContractSim ? "预估强平" : "止盈价"} value={isContractSim ? formatPrice(item.snapshot?.liquidation_price) : formatPrice(item.snapshot?.take_profit_price)} tone={item.snapshot?.liquidation_triggered ? "danger" : item.snapshot?.take_profit_triggered ? "success" : undefined} />
+        {item.snapshot?.exit_stage ? <PositionFact label="退出阶段" value={textValue(item.snapshot.exit_stage)} /> : null}
+        {item.snapshot?.r_multiple != null ? <PositionFact label="当前 R" value={`${trimNumber(item.snapshot.r_multiple, 2, 2)}R`} /> : null}
+        {item.snapshot?.atr_value != null ? <PositionFact label="ATR(1m)" value={formatPrice(item.snapshot.atr_value)} /> : null}
+        {item.snapshot?.peak_drawdown_pct != null ? <PositionFact label="峰值回撤" value={formatPercent(item.snapshot.peak_drawdown_pct)} /> : null}
+        {item.snapshot?.highest_price != null ? <PositionFact label="峰值" value={formatPrice(item.snapshot.highest_price)} /> : null}
+        {item.snapshot?.next_partial_take_profit_price != null && !item.snapshot.partial_take_profit_done ? <PositionFact label="下一止盈" value={formatPrice(item.snapshot.next_partial_take_profit_price)} /> : null}
+        {item.snapshot?.realized_pnl != null ? <PositionFact label="已实现利润" value={signedMoney(item.snapshot.realized_pnl, quoteAsset)} /> : null}
+        {item.snapshot?.market_data_age_seconds != null ? <PositionFact label="行情新鲜度" value={`${trimNumber(item.snapshot.market_data_age_seconds, 1, 1)} 秒`} tone={Number(item.snapshot.market_data_age_seconds) > 15 ? "danger" : undefined} /> : null}
         <PositionFact label={isContractSim ? "保证金" : "投入金额"} value={formatMoney(isContractSim ? item.snapshot?.margin_quote : item.quoteSpent, quoteAsset)} />
         <PositionFact label="开仓时间" value={item.openedAt ? formatTime(item.openedAt) : "--"} />
         {isContractSim ? <PositionFact label="配置止损" value={configuredStopValue} tone={item.snapshot?.stop_guard_tightened ? "danger" : undefined} /> : null}
@@ -1782,6 +1816,8 @@ function TradeEventTable({ items, quote }: { items: TradeItem[]; quote: string }
             <th>标的</th>
             <th>数量</th>
             <th>价格</th>
+            <th>触发价</th>
+            <th>退出原因</th>
             <th>手续费</th>
             <th>成交额</th>
           </tr>
@@ -1803,6 +1839,8 @@ function TradeEventTable({ items, quote }: { items: TradeItem[]; quote: string }
                 <td className="symbol-cell">{item.symbol || "--"}</td>
                 <td className="mono">{formatQty(item.quantity)}</td>
                 <td className="mono">{formatPrice(item.price)}</td>
+                <td className="mono">{formatPrice(item.trigger_price)}</td>
+                <td>{item.exit_reason || "--"}</td>
                 <td className="mono">{formatMoney(item.fee_amount, item.fee_asset || quote)}</td>
                 <td className="mono">{formatMoney(tradeAmount(item), quote)}</td>
               </tr>
@@ -2154,6 +2192,10 @@ function SettingsPanel({
             <SettingsField {...fieldProps} name="top_post_limit" label="热门帖子数" type="number" min="1" step="1" />
             <SettingsField {...fieldProps} name="top_coin_limit" label="热门币种数" type="number" min="1" step="1" />
             <SettingsField {...fieldProps} name="min_square_confidence_score" label="Square 最低置信度" type="number" min="0" max="100" step="1" help="低于该分数时跳过自动入场，避免数据源失效后退化成纯追涨。" />
+            <SettingsField {...fieldProps} name="max_entry_roc_15m_pct" label="15m 最大 ROC %" type="number" min="0" step="0.5" help="dry-run 拒绝 15 分钟内已经过度拉升的候选。" />
+            <SettingsField {...fieldProps} name="max_entry_roc_1h_pct" label="1h 最大 ROC %" type="number" min="0" step="0.5" />
+            <SettingsField {...fieldProps} name="max_entry_extension_atr" label="距 EMA9 最大 ATR" type="number" min="0" step="0.1" />
+            <SettingsField {...fieldProps} name="max_entry_candle_range_atr" label="单根最大振幅 ATR" type="number" min="0" step="0.1" />
             <div className="toggle-grid is-full">
               <SettingsToggle {...toggleProps} name="kline_confirmation_enabled" label="启用短周期 K 线确认" />
             </div>
@@ -2184,18 +2226,33 @@ function SettingsPanel({
             <SettingsField {...fieldProps} name="breakeven_offset_pct" label="保本偏移 %" type="number" step="0.1" help="保本止损相对开仓价的偏移，0 表示刚好成本价。" />
             <SettingsField {...fieldProps} name="trailing_start_pct" label="移动止盈启动 %" type="number" min="0" step="0.1" help="最高价达到该涨幅后启用移动止盈。" />
             <SettingsField {...fieldProps} name="trailing_stop_pct" label="移动止盈回撤 %" type="number" min="0" step="0.1" help="从最高价回撤该比例时卖出；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="risk_monitor_interval_seconds" label="风控监控秒数" type="number" min="1" step="1" help="仅模拟盘自适应退出使用；默认每秒检查。" />
+            <SettingsField {...fieldProps} name="atr_period" label="ATR 周期（1m）" type="number" min="2" step="1" />
+            <SettingsField {...fieldProps} name="atr_multiplier" label="ATR 跟踪倍数" type="number" min="0.1" step="0.1" />
+            <SettingsField {...fieldProps} name="trailing_min_pct" label="最小跟踪距离 %" type="number" min="0" step="0.1" />
+            <SettingsField {...fieldProps} name="trailing_max_pct" label="最大跟踪距离 %" type="number" min="0" step="0.1" />
+            <SettingsField {...fieldProps} name="partial_take_profit_r" label="部分止盈 R" type="number" min="0.1" step="0.1" />
+            <SettingsField {...fieldProps} name="partial_take_profit_fraction" label="部分止盈比例" type="number" min="0.01" max="0.99" step="0.05" />
+            <SettingsField {...fieldProps} name="breakeven_trigger_r" label="保本触发 R" type="number" min="0.1" step="0.1" />
+            <SettingsField {...fieldProps} name="breakeven_cost_buffer_pct" label="成本保护缓冲 %" type="number" min="0" step="0.05" />
+            <SettingsField {...fieldProps} name="post_partial_profit_floor_r" label="部分止盈后利润底线 R" type="number" min="0" step="0.1" />
             <SettingsField {...fieldProps} name="fixed_stop_loss_usdt" label="固定止损 USDT" type="number" min="1" step="1" help="仅在固定止损模式启用后生效；建议为单笔金额的 10%-25%。" />
             <SettingsField {...fieldProps} name="fixed_stop_equity_usdt" label="权益触发 USDT" type="number" min="0" step="1" help="留空则不按账户权益切换固定止损。" />
             <SettingsField {...fieldProps} name="cooldown_minutes" label="冷却分钟" type="number" min="0" step="1" help="同一币种卖出后暂停重新开仓；填 0 关闭。" />
-            <SettingsField {...fieldProps} name="max_daily_trades" label="每日最大开仓" type="number" min="0" step="1" help="模拟默认 9999999，基本等同不限制；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="max_daily_trades" label="每日最大开仓" type="number" min="0" step="1" help="B 路线默认 12；填 0 关闭。" />
             <SettingsField {...fieldProps} name="max_daily_loss_usdt" label="每日最大亏损 USDT" type="number" min="0" step="1" help="模拟默认 9999999，基本等同不限制；填 0 关闭。" full />
+            <SettingsField {...fieldProps} name="max_daily_loss_pct" label="每日最大亏损 %" type="number" min="0" step="0.1" help="按模拟初始权益计算，默认 2%。" />
             <SettingsField {...fieldProps} name="max_total_exposure_pct" label="最大总敞口 %" type="number" min="0" step="1" help="所有持仓加本次拟开仓占权益估算的上限；填 0 关闭。" />
             <SettingsField {...fieldProps} name="max_symbol_exposure_pct" label="最大单币敞口 %" type="number" min="0" step="1" help="单一币种持仓加本次拟开仓占权益估算的上限；填 0 关闭。" />
             <SettingsField {...fieldProps} name="max_consecutive_losses" label="最大连亏次数" type="number" min="0" step="1" help="连续亏损达到该次数后暂停新开仓；填 0 关闭。" />
+            <SettingsField {...fieldProps} name="consecutive_loss_pause_minutes" label="连亏暂停分钟" type="number" min="0" step="15" help="默认 240 分钟，之后自动恢复。" />
             <SettingsField {...fieldProps} name="max_intraday_drawdown_pct" label="日内回撤熔断 %" type="number" min="0" step="0.1" help="已实现亏损加浮亏达到该回撤比例后暂停新开仓；填 0 关闭。" />
-            <SettingsField {...fieldProps} name="risk_per_trade_pct" label="风险定仓建议 %" type="number" min="0" step="0.1" help="仅计算建议仓位，不改变当前固定金额下单。" />
+            <SettingsField {...fieldProps} name="risk_per_trade_pct" label="单笔权益风险 %" type="number" min="0" step="0.05" help="dry-run 按止损距离反推仓位，固定金额作为保证金上限。" />
+            <SettingsField {...fieldProps} name="early_failure_minutes" label="早期失败分钟" type="number" min="0" step="1" />
+            <SettingsField {...fieldProps} name="early_failure_min_r" label="早期最低峰值 R" type="number" min="0" step="0.1" />
             <SettingsField {...fieldProps} name="oco_stop_limit_slippage_pct" label="OCO stop-limit slippage %" type="number" min="0" step="0.1" help="Live protection stop-limit price offset after stop trigger." />
             <div className="toggle-grid">
+              <SettingsToggle {...toggleProps} name="adaptive_exit_enabled" label="模拟盘自适应退出" />
               <SettingsToggle {...toggleProps} name="fixed_stop_after_first_round_trip" label="首回合后固定止损" />
               <SettingsToggle {...toggleProps} name="exchange_protection_enabled" label="Exchange protection orders" />
             </div>
@@ -2368,16 +2425,35 @@ function settingsFromConfig(config: ConfigPayload): SettingsState {
     breakeven_offset_pct: textValue(config.breakeven_offset_pct) || DEFAULT_SETTINGS.breakeven_offset_pct,
     trailing_start_pct: textValue(config.trailing_start_pct) || DEFAULT_SETTINGS.trailing_start_pct,
     trailing_stop_pct: textValue(config.trailing_stop_pct) || DEFAULT_SETTINGS.trailing_stop_pct,
+    adaptive_exit_enabled: config.adaptive_exit_enabled !== false,
+    risk_monitor_interval_seconds: textValue(config.risk_monitor_interval_seconds) || DEFAULT_SETTINGS.risk_monitor_interval_seconds,
+    atr_period: textValue(config.atr_period) || DEFAULT_SETTINGS.atr_period,
+    atr_multiplier: textValue(config.atr_multiplier) || DEFAULT_SETTINGS.atr_multiplier,
+    trailing_min_pct: textValue(config.trailing_min_pct) || DEFAULT_SETTINGS.trailing_min_pct,
+    trailing_max_pct: textValue(config.trailing_max_pct) || DEFAULT_SETTINGS.trailing_max_pct,
+    partial_take_profit_r: textValue(config.partial_take_profit_r) || DEFAULT_SETTINGS.partial_take_profit_r,
+    partial_take_profit_fraction: textValue(config.partial_take_profit_fraction) || DEFAULT_SETTINGS.partial_take_profit_fraction,
+    breakeven_trigger_r: textValue(config.breakeven_trigger_r) || DEFAULT_SETTINGS.breakeven_trigger_r,
+    breakeven_cost_buffer_pct: textValue(config.breakeven_cost_buffer_pct) || DEFAULT_SETTINGS.breakeven_cost_buffer_pct,
+    post_partial_profit_floor_r: textValue(config.post_partial_profit_floor_r) || DEFAULT_SETTINGS.post_partial_profit_floor_r,
     fixed_stop_loss_usdt: textValue(config.fixed_stop_loss_usdt) || DEFAULT_SETTINGS.fixed_stop_loss_usdt,
     fixed_stop_equity_usdt: textValue(config.fixed_stop_equity_usdt),
     cooldown_minutes: textValue(config.cooldown_minutes) || DEFAULT_SETTINGS.cooldown_minutes,
     max_daily_trades: textValue(config.max_daily_trades) || DEFAULT_SETTINGS.max_daily_trades,
     max_daily_loss_usdt: textValue(config.max_daily_loss_usdt) || DEFAULT_SETTINGS.max_daily_loss_usdt,
+    max_daily_loss_pct: textValue(config.max_daily_loss_pct) || DEFAULT_SETTINGS.max_daily_loss_pct,
     max_total_exposure_pct: textValue(config.max_total_exposure_pct) || DEFAULT_SETTINGS.max_total_exposure_pct,
     max_symbol_exposure_pct: textValue(config.max_symbol_exposure_pct) || DEFAULT_SETTINGS.max_symbol_exposure_pct,
     max_consecutive_losses: textValue(config.max_consecutive_losses) || DEFAULT_SETTINGS.max_consecutive_losses,
+    consecutive_loss_pause_minutes: textValue(config.consecutive_loss_pause_minutes) || DEFAULT_SETTINGS.consecutive_loss_pause_minutes,
     max_intraday_drawdown_pct: textValue(config.max_intraday_drawdown_pct) || DEFAULT_SETTINGS.max_intraday_drawdown_pct,
     risk_per_trade_pct: textValue(config.risk_per_trade_pct) || DEFAULT_SETTINGS.risk_per_trade_pct,
+    max_entry_roc_15m_pct: textValue(config.max_entry_roc_15m_pct) || DEFAULT_SETTINGS.max_entry_roc_15m_pct,
+    max_entry_roc_1h_pct: textValue(config.max_entry_roc_1h_pct) || DEFAULT_SETTINGS.max_entry_roc_1h_pct,
+    max_entry_extension_atr: textValue(config.max_entry_extension_atr) || DEFAULT_SETTINGS.max_entry_extension_atr,
+    max_entry_candle_range_atr: textValue(config.max_entry_candle_range_atr) || DEFAULT_SETTINGS.max_entry_candle_range_atr,
+    early_failure_minutes: textValue(config.early_failure_minutes) || DEFAULT_SETTINGS.early_failure_minutes,
+    early_failure_min_r: textValue(config.early_failure_min_r) || DEFAULT_SETTINGS.early_failure_min_r,
     fee_rate_pct: textValue(config.fee_rate_pct) || DEFAULT_SETTINGS.fee_rate_pct,
     slippage_pct: textValue(config.slippage_pct) || DEFAULT_SETTINGS.slippage_pct,
     poll_seconds: textValue(config.poll_seconds) || DEFAULT_SETTINGS.poll_seconds,
@@ -2442,6 +2518,27 @@ function loadSavedSettings(): Partial<SettingsState> {
       }
       localStorage.setItem(SETTINGS_DRY_RUN_LIMIT_MIGRATION_KEY, "1");
     }
+    if (!localStorage.getItem(SETTINGS_B_ROUTE_MIGRATION_KEY)) {
+      Object.assign(parsed, {
+        max_open_positions: DEFAULT_SETTINGS.max_open_positions,
+        leverage_multiplier: DEFAULT_SETTINGS.leverage_multiplier,
+        cooldown_minutes: DEFAULT_SETTINGS.cooldown_minutes,
+        max_daily_trades: DEFAULT_SETTINGS.max_daily_trades,
+        max_daily_loss_pct: DEFAULT_SETTINGS.max_daily_loss_pct,
+        max_total_exposure_pct: DEFAULT_SETTINGS.max_total_exposure_pct,
+        max_symbol_exposure_pct: DEFAULT_SETTINGS.max_symbol_exposure_pct,
+        max_consecutive_losses: DEFAULT_SETTINGS.max_consecutive_losses,
+        consecutive_loss_pause_minutes: DEFAULT_SETTINGS.consecutive_loss_pause_minutes,
+        risk_per_trade_pct: DEFAULT_SETTINGS.risk_per_trade_pct,
+        max_entry_roc_15m_pct: DEFAULT_SETTINGS.max_entry_roc_15m_pct,
+        max_entry_roc_1h_pct: DEFAULT_SETTINGS.max_entry_roc_1h_pct,
+        max_entry_extension_atr: DEFAULT_SETTINGS.max_entry_extension_atr,
+        max_entry_candle_range_atr: DEFAULT_SETTINGS.max_entry_candle_range_atr,
+        early_failure_minutes: DEFAULT_SETTINGS.early_failure_minutes,
+        early_failure_min_r: DEFAULT_SETTINGS.early_failure_min_r,
+      });
+      localStorage.setItem(SETTINGS_B_ROUTE_MIGRATION_KEY, "1");
+    }
     const allowedKeys = new Set(Object.keys(DEFAULT_SETTINGS));
     return Object.fromEntries(Object.entries(parsed).filter(([key]) => allowedKeys.has(key))) as Partial<SettingsState>;
   } catch {
@@ -2468,6 +2565,7 @@ function saveSettings(settings: SettingsState) {
   localStorage.setItem(SETTINGS_CONTRACT_DEFAULT_MIGRATION_KEY, "1");
   localStorage.setItem(SETTINGS_PRESET_DEFAULT_MIGRATION_KEY, "1");
   localStorage.setItem(SETTINGS_DRY_RUN_LIMIT_MIGRATION_KEY, "1");
+  localStorage.setItem(SETTINGS_B_ROUTE_MIGRATION_KEY, "1");
 }
 
 function formatDefaultFixedStop(value: number): string {

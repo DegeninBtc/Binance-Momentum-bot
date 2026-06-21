@@ -60,6 +60,7 @@ def phase_summary(name: str, records: list[dict[str, Any]]) -> dict[str, Any]:
         "decision_groups": summary["decision_groups"],
         "future_returns": summary["future_returns"],
         "entered_future_returns": analysis.return_summary(entered_records),
+        "validation_ready": summary["validation_ready"],
     }
 
 
@@ -69,15 +70,21 @@ def walk_forward(records: list[dict[str, Any]], ratios: tuple[float, float, floa
     train = ordered[:train_count]
     validate = ordered[train_count : train_count + validate_count]
     test = ordered[train_count + validate_count : train_count + validate_count + test_count]
+    phases = {
+        "train": phase_summary("train", train),
+        "validation": phase_summary("validation", validate),
+        "test": phase_summary("test", test),
+    }
     return {
         "record_count": len(ordered),
         "split_ratio": {"train": ratios[0], "validation": ratios[1], "test": ratios[2]},
         "split_count": {"train": len(train), "validation": len(validate), "test": len(test)},
-        "phases": {
-            "train": phase_summary("train", train),
-            "validation": phase_summary("validation", validate),
-            "test": phase_summary("test", test),
-        },
+        "validation_ready": bool(ordered)
+        and all(phase["validation_ready"] for phase in phases.values()),
+        "warning": ""
+        if ordered and all(phase["validation_ready"] for phase in phases.values())
+        else "future-return labels are incomplete; do not treat this report as out-of-sample validation",
+        "phases": phases,
     }
 
 

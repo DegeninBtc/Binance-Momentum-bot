@@ -29,16 +29,35 @@ export type SettingsState = {
   breakeven_offset_pct: string;
   trailing_start_pct: string;
   trailing_stop_pct: string;
+  adaptive_exit_enabled: boolean;
+  risk_monitor_interval_seconds: string;
+  atr_period: string;
+  atr_multiplier: string;
+  trailing_min_pct: string;
+  trailing_max_pct: string;
+  partial_take_profit_r: string;
+  partial_take_profit_fraction: string;
+  breakeven_trigger_r: string;
+  breakeven_cost_buffer_pct: string;
+  post_partial_profit_floor_r: string;
   fixed_stop_loss_usdt: string;
   fixed_stop_equity_usdt: string;
   cooldown_minutes: string;
   max_daily_trades: string;
   max_daily_loss_usdt: string;
+  max_daily_loss_pct: string;
   max_total_exposure_pct: string;
   max_symbol_exposure_pct: string;
   max_consecutive_losses: string;
+  consecutive_loss_pause_minutes: string;
   max_intraday_drawdown_pct: string;
   risk_per_trade_pct: string;
+  max_entry_roc_15m_pct: string;
+  max_entry_roc_1h_pct: string;
+  max_entry_extension_atr: string;
+  max_entry_candle_range_atr: string;
+  early_failure_minutes: string;
+  early_failure_min_r: string;
   fee_rate_pct: string;
   slippage_pct: string;
   poll_seconds: string;
@@ -129,6 +148,15 @@ export type Position = {
   quote_spent?: Primitive;
   highest_price?: Primitive;
   opened_at?: string;
+  trade_id?: string;
+  initial_quantity?: Primitive;
+  risk_per_unit?: Primitive;
+  active_stop_price?: Primitive;
+  exit_stage?: string;
+  partial_take_profit_done?: boolean;
+  atr_value?: Primitive;
+  realized_pnl?: Primitive;
+  last_market_price_at?: string;
 };
 
 export type PositionSnapshot = {
@@ -177,6 +205,19 @@ export type PositionSnapshot = {
   stop_triggered?: boolean;
   take_profit_distance_pct?: Primitive;
   take_profit_triggered?: boolean;
+  trade_id?: string;
+  initial_quantity?: Primitive;
+  risk_per_unit?: Primitive;
+  r_multiple?: Primitive;
+  atr_value?: Primitive;
+  adaptive_active_stop_price?: Primitive;
+  exit_stage?: string;
+  partial_take_profit_done?: boolean;
+  realized_pnl?: Primitive;
+  peak_drawdown_pct?: Primitive;
+  next_partial_take_profit_price?: Primitive;
+  last_market_price_at?: string;
+  market_data_age_seconds?: Primitive;
 };
 
 export type EntryGuardSnapshot = {
@@ -227,6 +268,12 @@ export type TradeItem = {
   fee_amount?: Primitive;
   fee_asset?: string;
   quote_amount?: Primitive;
+  trigger_price?: Primitive;
+  exit_reason?: string;
+  r_multiple?: Primitive;
+  atr_value?: Primitive;
+  peak_price?: Primitive;
+  peak_drawdown_pct?: Primitive;
 };
 
 export type TradeRoundTrip = {

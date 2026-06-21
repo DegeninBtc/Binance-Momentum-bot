@@ -134,6 +134,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     for record in records:
         group = decision_group(record)
         groups[group] = groups.get(group, 0) + 1
+    future_returns = return_summary(records)
     return {
         "record_count": len(records),
         "entered_count": len(entered_records),
@@ -143,7 +144,18 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "orderbook_block_count": sum(1 for record in records if check_failed(record, "liquidity")),
         "account_risk_block_count": sum(1 for record in records if account_risk_blocked(record)),
         "decision_groups": groups,
-        "future_returns": return_summary(records),
+        "future_returns": future_returns,
+        "label_coverage": {
+            key: {
+                "count": future_returns[key]["count"],
+                "coverage_rate": (
+                    future_returns[key]["count"] / len(records) if records else 0
+                ),
+            }
+            for key in FUTURE_KEYS
+        },
+        "validation_ready": bool(records)
+        and all(future_returns[key]["count"] > 0 for key in FUTURE_KEYS),
         "future_returns_by_decision": {
             "entered": return_summary(entered_records),
             "skipped": return_summary(skipped_records),
